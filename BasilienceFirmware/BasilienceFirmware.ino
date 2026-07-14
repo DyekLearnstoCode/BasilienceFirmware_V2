@@ -10,6 +10,7 @@
 #include "StartupManager.h"
 #include "MixingManager.h"
 #include "SafetyManager.h"
+#include "DebugManager.h"
 
 SensorManager sensorManager;
 ActuatorManager actuatorManager;
@@ -19,6 +20,7 @@ AlertManager alertManager;
 StartupManager startupManager;
 MixingManager mixingManager;
 SafetyManager safetyManager;
+DebugManager debugManager;
 
 void setup()
 {
@@ -32,29 +34,18 @@ void setup()
     alertManager.begin();
     automationManager.begin();
     safetyManager.begin();
+    debugManager.begin();
 }
 
 void loop()
 {
     sensorManager.update();
 
-    Serial.print("Temperature: ");
-    Serial.print(sensors.temperature);
-
-    Serial.print(" °C | Humidity: ");
-    Serial.print(sensors.humidity);
-
-    Serial.print(" % | Water Temp: ");
-    Serial.print(sensors.waterTemp);
-
-    Serial.print(" °C | Water Level: ");
-    Serial.print(sensors.waterLevel);
-
-    Serial.println(" %");
-
     automationManager.update();
+
     alertManager.update();
+
     firebaseManager.update();
 
-    delay(1000);
+    debugManager.update();
 }

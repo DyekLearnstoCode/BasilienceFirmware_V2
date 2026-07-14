@@ -6,14 +6,28 @@ struct SensorData
     float temperature = 0;
     float humidity = 0;
     float waterTemp = 0;
+
+    // ==========================
+    // EC
+    // ==========================
+
     float ec = 0;
     float tds = 0;
     float ecVoltage = 0;
     int ecRaw = 0;
-    int ecRaw = 0;
+
+    // ==========================
+    // pH
+    // ==========================
+
     float ph = 0;
+    int phMilliVolts = 0;
+
+    // ==========================
+    // Water Level
+    // ==========================
+
     float waterLevel = 0;
-    bool ecReady = false;
 };
 
 struct SystemState

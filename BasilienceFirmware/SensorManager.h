@@ -5,6 +5,8 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+#include "AnalogSampler.h"
+
 class SensorManager
 {
 public:
@@ -15,43 +17,35 @@ public:
     void update();
 
 private:
+    // =====================================================
+    // Hardware
+    // =====================================================
+
     DHT dht;
 
     OneWire oneWire;
 
     DallasTemperature waterSensor;
 
+    AnalogSampler ecSampler;
+
+    AnalogSampler phSampler;
+
     // =====================================================
-    // EC Sampling Engine
+    // Sensor Reading Functions
     // =====================================================
 
-    static const int EC_SAMPLE_COUNT = 60;
-
-    int ecSamples[EC_SAMPLE_COUNT];
-
-    int ecSampleIndex;
-
-    bool ecBufferFilled;
-
-    unsigned long lastECSample;
-
-    void updateECSamples();
-
-    int getMedianADC();
     float measureDistanceCM();
-
-    // =====================================================
 
     void readDHT();
 
     void readWaterTemperature();
 
+    void readWaterLevel();
+
     void readEC();
 
     void readPH();
-
-    void readWaterLevel();
-    float measureDistanceCM();
 };
 
 #endif

@@ -1,6 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <Arduino.h>
+
 // ======================================================
 // WiFi
 // ======================================================
@@ -49,7 +51,6 @@
 constexpr float ADC_REFERENCE = 3.3f;
 constexpr int ADC_RESOLUTION = 4095;
 constexpr float EC_FACTOR = 1.106f;
-constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
 
 // ======================================================
 // Sensor Thresholds
@@ -70,6 +71,29 @@ constexpr float LOW_WATER_TEMP = 22.0f;
 
 constexpr float HIGH_AIR_TEMP = 35.0f;
 constexpr float LOW_AIR_TEMP = 28.0f;
+
+// ======================================================
+// EC Sampling
+// ======================================================
+
+constexpr uint8_t EC_SAMPLE_COUNT = 60;
+
+constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
+
+// ======================================================
+// pH Sampling
+// ======================================================
+
+constexpr uint8_t PH_SAMPLE_COUNT = 50;
+
+constexpr unsigned long PH_SAMPLE_INTERVAL = 20;
+
+// ======================================================
+// pH Calibration
+// ======================================================
+
+constexpr float PH_SLOPE = -0.00571715f;
+constexpr float PH_OFFSET = 21.535f;
 
 // ======================================================
 // Timing
@@ -93,5 +117,13 @@ constexpr unsigned long EC_DOSE_COOLDOWN =
 // ======================================================
 
 constexpr int OUT_OF_RANGE_REQUIRED = 3;
+
+// ======================================================
+// Debug
+// ======================================================
+
+constexpr bool DEBUG_ENABLED = true;
+
+constexpr unsigned long DEBUG_INTERVAL = 1000UL;
 
 #endif

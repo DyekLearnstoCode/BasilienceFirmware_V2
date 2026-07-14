@@ -1,92 +1,31 @@
 #include "SensorManager.h"
-#include "Config.h"
-#include "Globals.h"
 
-#include <cstring>
+#include "Globals.h"
+#include "Config.h"
 
 SensorManager::SensorManager()
-    : dht(DHT_PIN, DHTTYPE),
+
+    :
+
+      dht(DHT_PIN, DHTTYPE),
+
       oneWire(WATER_TEMP_PIN),
-      waterSensor(&oneWire)
+
+      waterSensor(&oneWire),
+
+      ecSampler(
+          EC_PIN,
+          EC_SAMPLE_COUNT,
+          EC_SAMPLE_INTERVAL,
+          AnalogSampler::RAW_ADC),
+
+      phSampler(
+          PH_SENSOR_PIN,
+          PH_SAMPLE_COUNT,
+          PH_SAMPLE_INTERVAL,
+          AnalogSampler::MILLIVOLTS)
+
 {
-    ecSampleIndex = 0;
-
-    ecBufferFilled = false;
-
-    lastECSample = 0;
-
-    for (int i = 0; i < EC_SAMPLE_COUNT; i++)
-    {
-        ecSamples[i] = 0;
-    }
-}
-
-float SensorManager::measureDistanceCM()
-{
-    digitalWrite(TRIG_PIN, LOW);
-    delayMicroseconds(2);
-
-    digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(10);
-
-    digitalWrite(TRIG_PIN, LOW);
-
-    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-
-    if (duration == 0)
-        return -1;
-
-    return duration * 0.0343f / 2.0f;
-}
-
-void SensorManager::updateECSamples()
-{
-
-    if (millis() - lastECSample < EC_SAMPLE_INTERVAL)
-        return;
-
-    lastECSample = millis();
-
-    ecSamples[ecSampleIndex] = analogRead(EC_PIN);
-
-    ecSampleIndex++;
-
-    if (ecSampleIndex >= EC_SAMPLE_COUNT)
-    {
-        ecSampleIndex = 0;
-
-        ecBufferFilled = true;
-    }
-}
-
-int SensorManager::getMedianADC()
-{
-    if (!ecBufferFilled)
-        return 0;
-
-    int sorted[EC_SAMPLE_COUNT];
-
-    memcpy(
-        sorted,
-        ecSamples,
-        sizeof(ecSamples));
-
-    for (int i = 0; i < EC_SAMPLE_COUNT - 1; i++)
-    {
-        for (int j = i + 1; j < EC_SAMPLE_COUNT; j++)
-        {
-            if (sorted[j] < sorted[i])
-            {
-                int t = sorted[i];
-
-                sorted[i] = sorted[j];
-
-                sorted[j] = t;
-            }
-        }
-    }
-
-    return sorted[EC_SAMPLE_COUNT / 2];
 }
 
 void SensorManager::begin()
@@ -94,59 +33,124 @@ void SensorManager::begin()
     dht.begin();
 
     waterSensor.begin();
+
+    ecSampler.begin();
+
+    phSampler.begin();
+
     analogReadResolution(12);
+
     analogSetAttenuation(ADC_11db);
+
     pinMode(TRIG_PIN, OUTPUT);
+
     pinMode(ECHO_PIN, INPUT);
 }
 
 void SensorManager::update()
 {
-    updateECSamples();
+    ecSampler.update();
+
+    phSampler.update();
 
     readDHT();
 
     readWaterTemperature();
 
+    readWaterLevel();
+
     readEC();
 
     readPH();
+}
 
-    readWaterLevel();
+float SensorManager::measureDistanceCM()
+{
+    digitalWrite(TRIG_PIN, LOW);
+
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG_PIN, HIGH);
+
+    delayMicroseconds(10);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration =
+        pulseIn(ECHO_PIN, HIGH, 30000);
+
+    if (duration == 0)
+        return -1;
+
+    return duration * 0.0343f / 2.0f;
 }
 
 void SensorManager::readDHT()
 {
-    float humidity = dht.readHumidity();
+    float humidity =
+        dht.readHumidity();
 
-    float temperature = dht.readTemperature();
+    float temperature =
+        dht.readTemperature();
 
     if (isnan(humidity) || isnan(temperature))
         return;
 
-    sensors.humidity = humidity;
+    sensors.humidity =
+        humidity;
 
-    sensors.temperature = temperature;
+    sensors.temperature =
+        temperature;
 }
 
 void SensorManager::readWaterTemperature()
 {
     waterSensor.requestTemperatures();
 
-    float temp = waterSensor.getTempCByIndex(0);
+    float temp =
+        waterSensor.getTempCByIndex(0);
 
     if (temp == DEVICE_DISCONNECTED_C)
         return;
 
-    sensors.waterTemp = temp;
+    sensors.waterTemp =
+        temp;
+}
+
+void SensorManager::readWaterLevel()
+{
+    float distance =
+        measureDistanceCM();
+
+    if (distance < 0)
+        return;
+
+    constexpr float EMPTY_DISTANCE = 30.0f;
+
+    constexpr float FULL_DISTANCE = 5.0f;
+
+    sensors.waterLevel =
+        constrain(
+
+            (EMPTY_DISTANCE - distance)
+
+                /
+
+                (EMPTY_DISTANCE - FULL_DISTANCE)
+
+                * 100.0f,
+
+            0.0f,
+
+            100.0f);
 }
 
 void SensorManager::readEC()
 {
-    if (!ecBufferFilled)
+    if (!ecSampler.ready())
         return;
 
-    float adc = getMedianADC();
+    float adc = ecSampler.median();
 
     sensors.ecRaw = (int)adc;
 
@@ -179,24 +183,20 @@ void SensorManager::readEC()
 
     sensors.tds = ec * 500.0f;
 }
+
 void SensorManager::readPH()
 {
-}
-
-void SensorManager::readWaterLevel()
-{
-    float distance = measureDistanceCM();
-
-    if (distance < 0)
+    if (!phSampler.ready())
         return;
 
-    constexpr float EMPTY_DISTANCE = 30.0f;
+    int millivolts =
+        phSampler.average();
 
-    constexpr float FULL_DISTANCE = 5.0f;
+    sensors.phMilliVolts =
+        millivolts;
 
-    sensors.waterLevel = constrain(
-        (EMPTY_DISTANCE - distance) /
-            (EMPTY_DISTANCE - FULL_DISTANCE) * 100.0f,
-        0.0f,
-        100.0f);
+    sensors.ph =
+        PH_SLOPE *
+            millivolts +
+        PH_OFFSET;
 }
