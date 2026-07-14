@@ -6,6 +6,13 @@
 
 extern ActuatorManager actuatorManager;
 
+void DebugManager::begin()
+{
+    lastPrintTime = 0;
+
+    showSensorPage = true;
+}
+
 void DebugManager::update()
 {
     if (!DEBUG_ENABLED)
@@ -26,19 +33,6 @@ void DebugManager::update()
     }
 
     showSensorPage = !showSensorPage;
-}
-
-void DebugManager::update()
-{
-    if (!DEBUG_ENABLED)
-        return;
-
-    if (millis() - lastPrintTime < DEBUG_INTERVAL)
-        return;
-
-    lastPrintTime = millis();
-
-    printSensors();
 }
 
 void DebugManager::printHeader(const char *title)
@@ -62,15 +56,12 @@ void DebugManager::printFloat(
     uint8_t decimals)
 {
     Serial.print(label);
-
     Serial.print(" : ");
-
     Serial.print(value, decimals);
 
     if (unit != nullptr)
     {
         Serial.print(" ");
-
         Serial.print(unit);
     }
 
@@ -83,15 +74,12 @@ void DebugManager::printInteger(
     const char *unit)
 {
     Serial.print(label);
-
     Serial.print(" : ");
-
     Serial.print(value);
 
     if (unit != nullptr)
     {
         Serial.print(" ");
-
         Serial.print(unit);
     }
 
@@ -103,9 +91,7 @@ void DebugManager::printBool(
     bool value)
 {
     Serial.print(label);
-
     Serial.print(" : ");
-
     Serial.println(value ? "ON" : "OFF");
 }
 
@@ -113,10 +99,49 @@ void DebugManager::printSensors()
 {
     printHeader("SENSOR DATA");
 
+    Serial.print("Current Mode : ");
+
+    switch (systemState.currentMode)
+    {
+        case STARTUP:
+            Serial.println("STARTUP");
+            break;
+
+        case NORMAL:
+            Serial.println("NORMAL");
+            break;
+
+        case REFILLING:
+            Serial.println("REFILLING");
+            break;
+
+        case DOSING_PH:
+            Serial.println("DOSING_PH");
+            break;
+
+        case STABILIZING_PH:
+            Serial.println("STABILIZING_PH");
+            break;
+
+        case DOSING_EC:
+            Serial.println("DOSING_EC");
+            break;
+
+        case STABILIZING_EC:
+            Serial.println("STABILIZING_EC");
+            break;
+
+        case SAFETY_LOCK:
+            Serial.println("SAFETY_LOCK");
+            break;
+    }
+
+    Serial.println();
+
     printFloat(
         "Air Temperature",
         sensors.temperature,
-        "°C",
+        "C",
         2);
 
     printFloat(
@@ -128,7 +153,7 @@ void DebugManager::printSensors()
     printFloat(
         "Water Temperature",
         sensors.waterTemp,
-        "°C",
+        "C",
         2);
 
     printFloat(
@@ -136,12 +161,6 @@ void DebugManager::printSensors()
         sensors.waterLevel,
         "%",
         1);
-
-    printFloat(
-        "EC",
-        sensors.ec,
-        "mS/cm",
-        3);
 
     printInteger(
         "EC ADC",

@@ -32,9 +32,11 @@ struct SensorData
 
 struct SystemState
 {
-    bool manualMode = true;
+    bool manualMode = false;
 
-    bool isMixing = false;
+    SystemMode currentMode = STARTUP;
+
+    unsigned long stateStartTime = 0;
 };
 
 struct AlertState
@@ -50,22 +52,29 @@ struct AlertState
     bool waterTempOutOfRange = false;
 };
 
-enum StartupState
+
+enum SystemMode
 {
-    STARTUP_FOGGING,
+    STARTUP,
 
-    STARTUP_REST,
+    NORMAL,
 
-    NORMAL_OPERATION
+    REFILLING,
+
+    DOSING_PH,
+
+    STABILIZING_PH,
+
+    DOSING_EC,
+
+    STABILIZING_EC,
+
+    SAFETY_LOCK
 };
 
-enum MixingState
+struct ActuatorState
 {
-    MIX_NONE,
-
-    MIX_DOSING,
-
-    MIX_REFILL
+    bool states[ACTUATOR_COUNT] = { false };
 };
 
 enum Actuator
@@ -102,5 +111,6 @@ enum Actuator
 
     ACTUATOR_COUNT
 };
+
 
 #endif

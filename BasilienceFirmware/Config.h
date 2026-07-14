@@ -83,7 +83,6 @@ constexpr float LOW_AIR_TEMP = 28.0f;
 // ======================================================
 
 constexpr uint8_t EC_SAMPLE_COUNT = 60;
-
 constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
 
 // ======================================================
@@ -91,7 +90,6 @@ constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
 // ======================================================
 
 constexpr uint8_t PH_SAMPLE_COUNT = 50;
-
 constexpr unsigned long PH_SAMPLE_INTERVAL = 20;
 
 // ======================================================
@@ -105,18 +103,14 @@ constexpr float PH_OFFSET = 21.535f;
 // Timing
 // ======================================================
 
-constexpr unsigned long STARTUP_FOG_TIME =
+constexpr unsigned long STARTUP_FOGGING_TIME =
     20UL * 60UL * 1000UL;
-
 constexpr unsigned long STARTUP_REST_TIME =
     10UL * 60UL * 1000UL;
-
 constexpr unsigned long MIXING_DURATION =
     60UL * 1000UL;
-
 constexpr unsigned long PH_DOSE_COOLDOWN =
     60000UL;
-
 constexpr unsigned long EC_DOSE_COOLDOWN =
     60000UL;
 
@@ -129,7 +123,13 @@ constexpr int OUT_OF_RANGE_REQUIRED = 3;
 // ======================================================
 
 constexpr bool DEBUG_ENABLED = true;
-
 constexpr unsigned long DEBUG_INTERVAL = 1000UL;
+
+// ======================================================
+// Water Refill
+// ======================================================
+
+constexpr float REFILL_START_LEVEL = REFILL_START_LEVEL;
+constexpr float REFILL_STOP_LEVEL = REFILL_STOP_LEVEL;
 
 #endif
