@@ -1,8 +1,6 @@
 #ifndef DEBUG_MANAGER_H
 #define DEBUG_MANAGER_H
 
-#include <Arduino.h>
-
 class DebugManager
 {
 public:
@@ -13,11 +11,15 @@ public:
 private:
     unsigned long lastPrintTime;
 
+    bool showSensorPage;
+
     // ============================
     // Pages
     // ============================
 
     void printSensors();
+
+    void printActuators();
 
     // ============================
     // Helpers

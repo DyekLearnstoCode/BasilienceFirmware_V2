@@ -1,11 +1,31 @@
 #include "DebugManager.h"
+#include "ActuatorManager.h"
 
 #include "Globals.h"
 #include "Config.h"
 
-void DebugManager::begin()
+extern ActuatorManager actuatorManager;
+
+void DebugManager::update()
 {
-    lastPrintTime = 0;
+    if (!DEBUG_ENABLED)
+        return;
+
+    if (millis() - lastPrintTime < DEBUG_INTERVAL)
+        return;
+
+    lastPrintTime = millis();
+
+    if (showSensorPage)
+    {
+        printSensors();
+    }
+    else
+    {
+        printActuators();
+    }
+
+    showSensorPage = !showSensorPage;
 }
 
 void DebugManager::update()
@@ -156,6 +176,53 @@ void DebugManager::printSensors()
         sensors.ph,
         nullptr,
         2);
+
+    printSeparator();
+}
+
+void DebugManager::printActuators()
+{
+    printHeader("ACTUATOR STATES");
+
+    printBool(
+        "Fogger",
+        actuatorManager.isOn(FOGGER));
+
+    printBool(
+        "Grow Light",
+        actuatorManager.isOn(GROW_LIGHT));
+
+    printBool(
+        "Blower",
+        actuatorManager.isOn(BLOWER));
+
+    printBool(
+        "Solenoid",
+        actuatorManager.isOn(SOLENOID));
+
+    printBool(
+        "Grow Pump",
+        actuatorManager.isOn(GROW_PUMP));
+
+    printBool(
+        "Bloom Pump",
+        actuatorManager.isOn(BLOOM_PUMP));
+
+    printBool(
+        "pH Up Pump",
+        actuatorManager.isOn(PH_UP_PUMP));
+
+    printBool(
+        "pH Down Pump",
+        actuatorManager.isOn(PH_DOWN_PUMP));
+
+    printBool(
+        "Water Heater",
+        actuatorManager.isOn(WATER_HEATER));
+
+    printBool(
+        "Peltier",
+        actuatorManager.isOn(PELTIER));
 
     printSeparator();
 }

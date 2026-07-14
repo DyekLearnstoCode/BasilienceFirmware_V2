@@ -20,29 +20,35 @@
     "https://basilience-database-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 // ======================================================
-// GPIO PINS
+// SSR Outputs
 // ======================================================
 
 #define FOGGER_PIN 26
-#define BLOWER_PIN 27
 #define GROW_LIGHT_PIN 25
-#define NUTRIENT_PUMP_PIN 33
-#define PH_UP_PIN 14
-#define PH_DOWN_PIN 12
-#define CANOPY_FAN_PIN 13
 
-#define DHT_PIN 4
-#define DHTTYPE DHT22
-#define WATER_TEMP_PIN 5
-#define EC_PIN 34
-#define PH_SENSOR_PIN 35
+// ======================================================
+// MOSFET Outputs
+// ======================================================
 
-#define TRIG_PIN 18
-#define ECHO_PIN 19
-
+#define BLOWER_PIN 27
 #define SOLENOID_PIN 15
-#define PELTIER_PIN 16
+
+// ======================================================
+// Peristaltic Pumps
+// ======================================================
+
+#define GROW_PUMP_PIN 32  // Temporary
+#define BLOOM_PUMP_PIN 33 // Temporary
+
+#define PH_UP_PUMP_PIN 14
+#define PH_DOWN_PUMP_PIN 12
+
+// ======================================================
+// Temperature
+// ======================================================
+
 #define WATER_HEATER_PIN 17
+#define PELTIER_PIN 16
 
 // ======================================================
 // EC Sensor Calibration
