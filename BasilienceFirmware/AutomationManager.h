@@ -15,16 +15,22 @@ private:
 
     enum StartupPhase
     {
-        FOGGING_PHASE,
-        REST_PHASE
+        STARTUP_FOG_ON,
+        STARTUP_FOG_OFF
     };
 
     StartupPhase startupPhase;
 
-    void handleStartup();
-    void handleNormal();
+    bool fogCycleOn;
+
     void changeState(SystemMode newMode);
-    void handleRefilling();
+
+    void handleSensorStabilization();
+
+    void handleStartup();
+
+    void handleNormal();
+
     const char* getStateName(SystemMode mode);
 };
 

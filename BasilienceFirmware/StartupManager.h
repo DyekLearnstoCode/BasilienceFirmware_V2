@@ -12,8 +12,7 @@ public:
     void update();
 
 private:
-    StartupState state;
-    unsigned long startTime;
+     unsigned long startTime;
 };
 
 #endif

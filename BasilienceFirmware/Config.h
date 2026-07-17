@@ -51,6 +51,22 @@
 #define PELTIER_PIN 16
 
 // ======================================================
+// Sensor Inputs
+// ======================================================
+
+#define DHT_PIN 4
+#define DHTTYPE DHT22
+
+#define WATER_TEMP_PIN 5
+
+#define EC_PIN 34
+
+#define PH_SENSOR_PIN 35
+
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+
+// ======================================================
 // EC Sensor Calibration
 // ======================================================
 
@@ -103,10 +119,6 @@ constexpr float PH_OFFSET = 21.535f;
 // Timing
 // ======================================================
 
-constexpr unsigned long STARTUP_FOGGING_TIME =
-    20UL * 60UL * 1000UL;
-constexpr unsigned long STARTUP_REST_TIME =
-    10UL * 60UL * 1000UL;
 constexpr unsigned long MIXING_DURATION =
     60UL * 1000UL;
 constexpr unsigned long PH_DOSE_COOLDOWN =
@@ -114,6 +126,29 @@ constexpr unsigned long PH_DOSE_COOLDOWN =
 constexpr unsigned long EC_DOSE_COOLDOWN =
     60000UL;
 
+// ======================================================
+
+constexpr unsigned long SENSOR_STABILIZATION_TIME = 10000UL;
+
+constexpr unsigned long STARTUP_ON_TIME = 10000UL;
+
+constexpr unsigned long STARTUP_OFF_TIME = 5000UL;
+
+constexpr unsigned long NORMAL_FOG_ON_TIME = 5000UL;
+
+constexpr unsigned long NORMAL_FOG_OFF_TIME = 5000UL;
+
+constexpr unsigned long HOT_FOG_ON_TIME =
+    5UL * 60UL * 1000UL;
+
+constexpr unsigned long HOT_FOG_OFF_TIME =
+    2UL * 60UL * 1000UL;
+
+constexpr unsigned long COLD_FOG_ON_TIME =
+    2UL * 60UL * 1000UL;
+
+constexpr unsigned long COLD_FOG_OFF_TIME =
+    5UL * 60UL * 1000UL;
 // ======================================================
 
 constexpr int OUT_OF_RANGE_REQUIRED = 3;
@@ -129,7 +164,8 @@ constexpr unsigned long DEBUG_INTERVAL = 1000UL;
 // Water Refill
 // ======================================================
 
-constexpr float REFILL_START_LEVEL = REFILL_START_LEVEL;
-constexpr float REFILL_STOP_LEVEL = REFILL_STOP_LEVEL;
+constexpr float REFILL_START_LEVEL = 20.0f;
+
+constexpr float REFILL_STOP_LEVEL = 95.0f;
 
 #endif

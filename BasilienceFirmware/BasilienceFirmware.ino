@@ -12,16 +12,6 @@
 #include "SafetyManager.h"
 #include "DebugManager.h"
 
-SensorManager sensorManager;
-ActuatorManager actuatorManager;
-AutomationManager automationManager;
-FirebaseManager firebaseManager;
-AlertManager alertManager;
-StartupManager startupManager;
-MixingManager mixingManager;
-SafetyManager safetyManager;
-DebugManager debugManager;
-
 void setup()
 {
     Serial.begin(115200);

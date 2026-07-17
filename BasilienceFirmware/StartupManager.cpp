@@ -2,7 +2,6 @@
 
 StartupManager::StartupManager()
 {
-    state = STARTUP_FOGGING;
     startTime = 0;
 }
 

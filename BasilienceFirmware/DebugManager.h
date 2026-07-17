@@ -1,6 +1,9 @@
 #ifndef DEBUG_MANAGER_H
 #define DEBUG_MANAGER_H
 
+#include <Types.h>
+#include <Arduino.h>
+
 class DebugManager
 {
 public:
@@ -12,7 +15,7 @@ private:
 
     unsigned long lastPrintTime;
 
-    bool showSensorPage;
+    uint8_t currentPage;
     void printSensors();
     void printActuators();
     void printHeader(const char* title);
@@ -33,6 +36,14 @@ private:
         bool value);
 
     void printSeparator();
+
+    void printSystemStatus();
+
+const char* getModeName(
+    SystemMode mode);
+
+
 };
+
 
 #endif

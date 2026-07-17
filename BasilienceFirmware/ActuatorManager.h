@@ -1,6 +1,6 @@
 #ifndef ACTUATOR_MANAGER_H
 #define ACTUATOR_MANAGER_H
-
+#include <Arduino.h>
 #include "Types.h"
 
 class ActuatorManager

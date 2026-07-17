@@ -1,5 +1,5 @@
-#ifndef ACTUATOR_MANAGER_H
-#define ACTUATOR_MANAGER_H
+#ifndef ALERT_MANAGER_H
+#define ALERT_MANAGER_H
 
 class AlertManager
 {

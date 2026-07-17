@@ -4,13 +4,11 @@
 #include "Globals.h"
 #include "Config.h"
 
-extern ActuatorManager actuatorManager;
-
 void DebugManager::begin()
 {
     lastPrintTime = 0;
 
-    showSensorPage = true;
+    currentPage = 0;
 }
 
 void DebugManager::update()
@@ -23,16 +21,25 @@ void DebugManager::update()
 
     lastPrintTime = millis();
 
-    if (showSensorPage)
+    switch (currentPage)
     {
-        printSensors();
-    }
-    else
-    {
-        printActuators();
+        case 0:
+            printSystemStatus();
+            break;
+
+        case 1:
+            printSensors();
+            break;
+
+        case 2:
+            printActuators();
+            break;
     }
 
-    showSensorPage = !showSensorPage;
+    currentPage++;
+
+    if (currentPage > 2)
+        currentPage = 0;
 }
 
 void DebugManager::printHeader(const char *title)
@@ -98,43 +105,7 @@ void DebugManager::printBool(
 void DebugManager::printSensors()
 {
     printHeader("SENSOR DATA");
-
-    Serial.print("Current Mode : ");
-
-    switch (systemState.currentMode)
-    {
-        case STARTUP:
-            Serial.println("STARTUP");
-            break;
-
-        case NORMAL:
-            Serial.println("NORMAL");
-            break;
-
-        case REFILLING:
-            Serial.println("REFILLING");
-            break;
-
-        case DOSING_PH:
-            Serial.println("DOSING_PH");
-            break;
-
-        case STABILIZING_PH:
-            Serial.println("STABILIZING_PH");
-            break;
-
-        case DOSING_EC:
-            Serial.println("DOSING_EC");
-            break;
-
-        case STABILIZING_EC:
-            Serial.println("STABILIZING_EC");
-            break;
-
-        case SAFETY_LOCK:
-            Serial.println("SAFETY_LOCK");
-            break;
-    }
+   
 
     Serial.println();
 
@@ -242,6 +213,67 @@ void DebugManager::printActuators()
     printBool(
         "Peltier",
         actuatorManager.isOn(PELTIER));
+
+    printSeparator();
+}
+
+const char* DebugManager::getModeName(
+    SystemMode mode)
+{
+    switch(mode)
+    {
+        case SENSOR_STABILIZATION:
+            return "SENSOR_STABILIZATION";
+
+        case STARTUP:
+            return "STARTUP";
+
+        case NORMAL:
+            return "NORMAL";
+
+        case REFILLING:
+            return "REFILLING";
+
+        case DOSING_PH:
+            return "DOSING_PH";
+
+        case STABILIZING_PH:
+            return "STABILIZING_PH";
+
+        case DOSING_EC:
+            return "DOSING_EC";
+
+        case STABILIZING_EC:
+            return "STABILIZING_EC";
+
+        case SAFETY_LOCK:
+            return "SAFETY_LOCK";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+void DebugManager::printSystemStatus()
+{
+    printHeader("SYSTEM STATUS");
+
+    Serial.print("Mode            : ");
+    Serial.println(
+        getModeName(
+            systemState.currentMode));
+
+    printBool(
+        "Manual Mode",
+        systemState.manualMode);
+
+    printBool(
+        "Reservoir Lock",
+        systemState.reservoirLocked);
+
+    printBool(
+        "Fog Cycle",
+        actuatorManager.isOn(FOGGER));
 
     printSeparator();
 }

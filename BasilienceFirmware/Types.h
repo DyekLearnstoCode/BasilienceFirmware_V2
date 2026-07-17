@@ -30,51 +30,17 @@ struct SensorData
     float waterLevel = 0;
 };
 
-struct SystemState
-{
-    bool manualMode = false;
-
-    SystemMode currentMode = STARTUP;
-
-    unsigned long stateStartTime = 0;
-};
-
-struct AlertState
-{
-    bool lowWater = false;
-
-    bool highTemperature = false;
-
-    bool ecLow = false;
-
-    bool phOutOfRange = false;
-
-    bool waterTempOutOfRange = false;
-};
-
-
 enum SystemMode
 {
+    SENSOR_STABILIZATION,
     STARTUP,
-
     NORMAL,
-
     REFILLING,
-
     DOSING_PH,
-
     STABILIZING_PH,
-
     DOSING_EC,
-
     STABILIZING_EC,
-
     SAFETY_LOCK
-};
-
-struct ActuatorState
-{
-    bool states[ACTUATOR_COUNT] = { false };
 };
 
 enum Actuator
@@ -112,5 +78,34 @@ enum Actuator
     ACTUATOR_COUNT
 };
 
+struct SystemState
+{
+    bool manualMode = false;
+
+    bool reservoirLocked = false;
+
+    SystemMode currentMode =
+        SENSOR_STABILIZATION;
+
+    unsigned long stateStartTime = 0;
+};
+
+struct AlertState
+{
+    bool lowWater = false;
+
+    bool highTemperature = false;
+
+    bool ecLow = false;
+
+    bool phOutOfRange = false;
+
+    bool waterTempOutOfRange = false;
+};
+
+struct ActuatorState
+{
+    bool states[ACTUATOR_COUNT] = { false };
+};
 
 #endif

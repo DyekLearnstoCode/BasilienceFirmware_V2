@@ -3,18 +3,17 @@
 #include "Config.h"
 #include "Globals.h"
 
-#include "ActuatorManager.h"
-
-extern ActuatorManager actuatorManager;
-
-
 void AutomationManager::begin()
 {
-    startupPhase = FOGGING_PHASE;
+    startupPhase = STARTUP_FOG_ON;
 
-    systemState.currentMode = STARTUP;
+    fogCycleOn = true;
 
-    systemState.stateStartTime = millis();
+    systemState.currentMode =
+        SENSOR_STABILIZATION;
+
+    systemState.stateStartTime =
+        millis();
 }
 
 void AutomationManager::update()
@@ -23,22 +22,22 @@ void AutomationManager::update()
         return;
 
     switch (systemState.currentMode)
-{
-    case STARTUP:
-        handleStartup();
-        break;
+    {
+        case SENSOR_STABILIZATION:
+            handleSensorStabilization();
+            break;
 
-    case NORMAL:
-        handleNormal();
-        break;
+        case STARTUP:
+            handleStartup();
+            break;
 
-    case REFILLING:
-        handleRefilling();
-        break;
+        case NORMAL:
+            handleNormal();
+            break;
 
-    default:
-        break;
-}
+        default:
+            break;
+    }
 }
 
 void AutomationManager::changeState(SystemMode newMode)
@@ -67,38 +66,60 @@ void AutomationManager::changeState(SystemMode newMode)
         millis();
 }
 
+void AutomationManager::handleSensorStabilization()
+{
+    actuatorManager.turnOff(FOGGER);
+
+    actuatorManager.turnOff(BLOWER);
+
+    if (millis() -
+        systemState.stateStartTime >=
+        SENSOR_STABILIZATION_TIME)
+    {
+        changeState(STARTUP);
+    }
+}
+
 void AutomationManager::handleStartup()
 {
     switch (startupPhase)
     {
-        case FOGGING_PHASE:
+        case STARTUP_FOG_ON:
         {
             actuatorManager.turnOn(FOGGER);
 
             actuatorManager.turnOn(BLOWER);
 
-            if (millis() - systemState.stateStartTime >=
-                STARTUP_FOGGING_TIME)
+            if (millis() -
+                systemState.stateStartTime >=
+                STARTUP_ON_TIME)
             {
                 actuatorManager.turnOff(FOGGER);
 
-                startupPhase = REST_PHASE;
+                actuatorManager.turnOff(BLOWER);
 
-                systemState.stateStartTime = millis();
+                startupPhase =
+                    STARTUP_FOG_OFF;
+
+                systemState.stateStartTime =
+                    millis();
             }
 
             break;
         }
 
-        case REST_PHASE:
+        case STARTUP_FOG_OFF:
         {
             actuatorManager.turnOff(FOGGER);
 
-            actuatorManager.turnOn(BLOWER);
+            actuatorManager.turnOff(BLOWER);
 
-            if (millis() - systemState.stateStartTime >=
-                STARTUP_REST_TIME)
+            if (millis() -
+                systemState.stateStartTime >=
+                STARTUP_OFF_TIME)
             {
+                fogCycleOn = true;
+
                 changeState(NORMAL);
             }
 
@@ -109,23 +130,64 @@ void AutomationManager::handleStartup()
 
 void AutomationManager::handleNormal()
 {
-    actuatorManager.turnOn(BLOWER);
+    unsigned long elapsed =
+        millis() -
+        systemState.stateStartTime;
 
-    if (sensors.waterLevel < 20.0f)
+    unsigned long fogOnTime =
+        NORMAL_FOG_ON_TIME;
+
+    unsigned long fogOffTime =
+        NORMAL_FOG_OFF_TIME;
+
+    // ====================================
+    // Adaptive Fogging
+    // ====================================
+
+    if (sensors.temperature > 30.0f)
     {
-        changeState(REFILLING);
+        fogOnTime = HOT_FOG_ON_TIME;
+
+        fogOffTime = HOT_FOG_OFF_TIME;
     }
-}
-
-void AutomationManager::handleRefilling()
-{
-    actuatorManager.turnOn(SOLENOID);
-
-    if (sensors.waterLevel >= 80.0f)
+    else if (sensors.temperature < 20.0f)
     {
-        actuatorManager.turnOff(SOLENOID);
+        fogOnTime = COLD_FOG_ON_TIME;
 
-        changeState(NORMAL);
+        fogOffTime = COLD_FOG_OFF_TIME;
+    }
+
+    // ====================================
+    // Fog Cycle
+    // ====================================
+
+    if (fogCycleOn)
+    {
+        actuatorManager.turnOn(FOGGER);
+
+        actuatorManager.turnOn(BLOWER);
+
+        if (elapsed >= fogOnTime)
+        {
+            fogCycleOn = false;
+
+            systemState.stateStartTime =
+                millis();
+        }
+    }
+    else
+    {
+        actuatorManager.turnOff(FOGGER);
+
+        actuatorManager.turnOff(BLOWER);
+
+        if (elapsed >= fogOffTime)
+        {
+            fogCycleOn = true;
+
+            systemState.stateStartTime =
+                millis();
+        }
     }
 }
 
@@ -133,6 +195,9 @@ const char* AutomationManager::getStateName(SystemMode mode)
 {
     switch (mode)
     {
+        case SENSOR_STABILIZATION:
+            return "SENSOR_STABILIZATION";
+
         case STARTUP:
             return "STARTUP";
 
