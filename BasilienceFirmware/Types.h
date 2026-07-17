@@ -88,6 +88,8 @@ struct SystemState
         SENSOR_STABILIZATION;
 
     unsigned long stateStartTime = 0;
+
+    bool startupCompleted = false;
 };
 
 struct AlertState

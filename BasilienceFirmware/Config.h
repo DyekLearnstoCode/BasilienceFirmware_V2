@@ -7,8 +7,11 @@
 // WiFi
 // ======================================================
 
-#define WIFI_SSID "EVITH WIFI"
-#define WIFI_PASSWORD "Ronald123"
+//#define WIFI_SSID "EVITH WIFI"
+//#define WIFI_PASSWORD "Ronald123"
+
+#define WIFI_SSID "Deduyo's_Wifi_2.4G"
+#define WIFI_PASSWORD "p@ssw0rd"
 
 // ======================================================
 // Firebase
@@ -166,6 +169,6 @@ constexpr unsigned long DEBUG_INTERVAL = 1000UL;
 
 constexpr float REFILL_START_LEVEL = 20.0f;
 
-constexpr float REFILL_STOP_LEVEL = 95.0f;
+constexpr float REFILL_STOP_LEVEL = 75.0f;
 
 #endif

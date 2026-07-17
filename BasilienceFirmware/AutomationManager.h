@@ -3,35 +3,35 @@
 
 #include "Types.h"
 
-class AutomationManager
-{
+class AutomationManager {
 public:
-
-    void begin();
-
-    void update();
+  void begin();
+  void update();
 
 private:
+  enum StartupPhase {
+    STARTUP_FOG_ON,
+    STARTUP_FOG_OFF
+  };
 
-    enum StartupPhase
-    {
-        STARTUP_FOG_ON,
-        STARTUP_FOG_OFF
-    };
+  StartupPhase startupPhase;
 
-    StartupPhase startupPhase;
+  bool fogCycleOn;
 
-    bool fogCycleOn;
+  void changeState(SystemMode newMode);
 
-    void changeState(SystemMode newMode);
+  void handleSensorStabilization();
 
-    void handleSensorStabilization();
+  void handleStartup();
 
-    void handleStartup();
+  void handleNormal();
 
-    void handleNormal();
+  const char* getStateName(SystemMode mode);
 
-    const char* getStateName(SystemMode mode);
+  void validateSystem();
+
+  void updateAlerts();
+
+  void handleRefilling();
 };
-
 #endif

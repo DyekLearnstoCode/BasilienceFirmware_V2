@@ -22,6 +22,10 @@ private:
     bool actuatorStates[ACTUATOR_COUNT];
 
     uint8_t getPin(Actuator actuator) const;
+
+    void validateSystem();
+
+    void updateAlerts();
 };
 
 #endif

@@ -16,6 +16,21 @@ void AutomationManager::begin()
         millis();
 }
 
+void AutomationManager::validateSystem()
+{
+    updateAlerts();
+
+    if (sensors.waterLevel <
+        REFILL_START_LEVEL)
+    {
+        changeState(REFILLING);
+
+        return;
+    }
+
+    changeState(STARTUP);
+}
+
 void AutomationManager::update()
 {
     if (systemState.manualMode)
@@ -35,9 +50,38 @@ void AutomationManager::update()
             handleNormal();
             break;
 
+         case REFILLING:
+    handleRefilling();
+    break;   
+
         default:
             break;
     }
+}
+
+void AutomationManager::updateAlerts()
+{
+    alertState.lowWater =
+        sensors.waterLevel <
+        REFILL_START_LEVEL;
+
+    alertState.ecLow =
+        sensors.ec <
+        MIN_EC;
+
+    alertState.phOutOfRange =
+        sensors.ph < MIN_PH ||
+        sensors.ph > MAX_PH;
+
+    alertState.waterTempOutOfRange =
+        sensors.waterTemp <
+        LOW_WATER_TEMP ||
+        sensors.waterTemp >
+        HIGH_WATER_TEMP;
+
+    alertState.highTemperature =
+        sensors.temperature >
+        HIGH_AIR_TEMP;
 }
 
 void AutomationManager::changeState(SystemMode newMode)
@@ -76,7 +120,7 @@ void AutomationManager::handleSensorStabilization()
         systemState.stateStartTime >=
         SENSOR_STABILIZATION_TIME)
     {
-        changeState(STARTUP);
+        validateSystem();
     }
 }
 
@@ -188,6 +232,20 @@ void AutomationManager::handleNormal()
             systemState.stateStartTime =
                 millis();
         }
+    }
+}
+
+void AutomationManager::handleRefilling()
+{
+    actuatorManager.turnOn(SOLENOID);
+
+    if (sensors.waterLevel >=
+        REFILL_STOP_LEVEL)
+    {
+        actuatorManager.turnOff(
+            SOLENOID);
+
+        changeState(STARTUP);
     }
 }
 

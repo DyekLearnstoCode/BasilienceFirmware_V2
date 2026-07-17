@@ -17,13 +17,13 @@ void setup()
     Serial.begin(115200);
 
     actuatorManager.begin();
+
     sensorManager.begin();
+
     firebaseManager.begin();
-    startupManager.begin();
-    mixingManager.begin();
-    alertManager.begin();
+
     automationManager.begin();
-    safetyManager.begin();
+
     debugManager.begin();
 }
 
@@ -32,8 +32,6 @@ void loop()
     sensorManager.update();
 
     automationManager.update();
-
-    alertManager.update();
 
     firebaseManager.update();
 
