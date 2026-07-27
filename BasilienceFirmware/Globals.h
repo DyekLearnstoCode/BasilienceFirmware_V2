@@ -2,6 +2,7 @@
 #define GLOBALS_H
 
 #include "Types.h"
+#include "RTCManager.h"
 
 #include "ActuatorManager.h"
 #include "SensorManager.h"
@@ -21,6 +22,7 @@ extern SensorManager sensorManager;
 extern FirebaseManager firebaseManager;
 extern AutomationManager automationManager;
 extern DebugManager debugManager;
+extern RTCManager rtcManager;
 
 
 #endif

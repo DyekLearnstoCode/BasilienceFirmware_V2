@@ -4,6 +4,7 @@
 #include <Types.h>
 #include <Arduino.h>
 
+
 class DebugManager
 {
 public:
@@ -39,7 +40,10 @@ private:
 
     void printSystemStatus();
 
-const char* getModeName(
+    void printAlerts();
+    void printRTC();
+
+    const char* getModeName(
     SystemMode mode);
 
 

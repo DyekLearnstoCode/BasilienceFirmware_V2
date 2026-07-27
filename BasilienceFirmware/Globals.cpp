@@ -19,3 +19,5 @@ SensorManager sensorManager;
 FirebaseManager firebaseManager;
 AutomationManager automationManager;
 DebugManager debugManager;
+
+RTCManager rtcManager;

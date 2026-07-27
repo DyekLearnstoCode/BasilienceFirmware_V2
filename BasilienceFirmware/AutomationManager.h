@@ -25,6 +25,7 @@ private:
   void handleStartup();
 
   void handleNormal();
+  void updateGrowLightSchedule();
 
   const char* getStateName(SystemMode mode);
 
@@ -33,5 +34,19 @@ private:
   void updateAlerts();
 
   void handleRefilling();
+  void handleSafetyLock();
+
+  void handleDosingPH();
+
+  void handleStabilizingPH();
+
+  void handleDosingEC();
+
+  void handleStabilizingEC();
+
+  void completeCurrentOperation();
+
+  void syncRTCFromFirebase();
 };
+
 #endif

@@ -19,6 +19,7 @@ void setup()
     actuatorManager.begin();
 
     sensorManager.begin();
+    rtcManager.begin();
 
     firebaseManager.begin();
 
@@ -30,6 +31,7 @@ void setup()
 void loop()
 {
     sensorManager.update();
+    rtcManager.update();
 
     automationManager.update();
 

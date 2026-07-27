@@ -3,6 +3,7 @@
 
 #include "Globals.h"
 #include "Config.h"
+#include "RTCManager.h"
 
 void DebugManager::begin()
 {
@@ -32,13 +33,21 @@ void DebugManager::update()
             break;
 
         case 2:
+            printAlerts();
+            break;
+
+        case 3:
             printActuators();
+            break;
+
+        case 4:
+            printRTC();
             break;
     }
 
     currentPage++;
 
-    if (currentPage > 2)
+    if (currentPage > 4)
         currentPage = 0;
 }
 
@@ -62,18 +71,20 @@ void DebugManager::printFloat(
     const char *unit,
     uint8_t decimals)
 {
-    Serial.print(label);
-    Serial.print(" : ");
-    Serial.print(value, decimals);
+        Serial.print(label);
+        Serial.print(" : ");
+        Serial.print(value, decimals);
 
-    if (unit != nullptr)
-    {
-        Serial.print(" ");
-        Serial.print(unit);
-    }
+        if (unit != nullptr)
+        {
+            Serial.print(" ");
+            Serial.print(unit);
+        }
 
-    Serial.println();
+        Serial.println();
 }
+
+
 
 void DebugManager::printInteger(
     const char *label,
@@ -256,6 +267,7 @@ const char* DebugManager::getModeName(
 
 void DebugManager::printSystemStatus()
 {
+
     printHeader("SYSTEM STATUS");
 
     Serial.print("Mode            : ");
@@ -268,12 +280,162 @@ void DebugManager::printSystemStatus()
         systemState.manualMode);
 
     printBool(
+    "WiFi Connected",
+    systemState.wifiConnected);
+
+    printBool(
+    "Firebase Connected",
+    systemState.firebaseConnected);
+
+    printBool(
         "Reservoir Lock",
         systemState.reservoirLocked);
 
     printBool(
         "Fog Cycle",
         actuatorManager.isOn(FOGGER));
+
+    Serial.print("pH Direction    : ");
+
+    switch(systemState.phDirection)
+    {
+        case PH_NONE:
+            Serial.println("NONE");
+            break;
+
+        case PH_UP:
+            Serial.println("UP");
+            break;
+
+        case PH_DOWN:
+            Serial.println("DOWN");
+            break;
+    }
+
+    Serial.print("EC Dose Time    : ");
+    Serial.print(systemState.ecDoseTime / 1000);
+    Serial.println(" sec");
+
+    Serial.print("PH Attempts     : ");
+    Serial.println(systemState.phAttempts);
+
+    Serial.print("EC Attempts     : ");
+    Serial.println(systemState.ecAttempts);
+
+    printBool(
+    "Safety Lock",
+    systemState.currentMode ==
+    SAFETY_LOCK);
+
+
+    Serial.print("Min PH          : ");
+    Serial.println(systemState.minPH);
+
+    Serial.print("Max PH          : ");
+    Serial.println(systemState.maxPH);
+
+    Serial.print("Min EC          : ");
+    Serial.println(systemState.minEC);
+
+    Serial.print("Light ON        : ");
+    Serial.print(systemState.lightOnHour);
+    Serial.print(":");
+    Serial.println(systemState.lightOnMinute);
+
+    Serial.print("Light OFF       : ");
+    Serial.print(systemState.lightOffHour);
+    Serial.print(":");
+    Serial.println(systemState.lightOffMinute);
+
+    Serial.print("RTC Time        : ");
+
+    Serial.print(
+        rtcManager.getHour());
+
+    Serial.print(":");
+
+    Serial.print(
+        rtcManager.getMinute());
+
+    Serial.print(":");
+
+    Serial.println(
+        rtcManager.getSecond());
+
+        printSeparator();
+    }
+
+void DebugManager::printAlerts()
+{
+    printHeader("ALERT STATUS");
+
+    printBool(
+        "Low Water",
+        alertState.lowWater);
+
+    printBool(
+        "EC Low",
+        alertState.ecLow);
+
+    printBool(
+        "pH Out Of Range",
+        alertState.phOutOfRange);
+
+    printBool(
+        "Water Temp OOR",
+        alertState.waterTempOutOfRange);
+
+    printBool(
+        "High Air Temp",
+        alertState.highTemperature);
+
+    printBool(
+        "Sensor Fault",
+        alertState.sensorFault);
+
+    printSeparator();
+}
+
+void DebugManager::printRTC()
+{
+    printHeader("RTC STATUS");
+
+    Serial.print("Current Time : ");
+
+    if(rtcManager.getHour() < 10)
+        Serial.print("0");
+
+    Serial.print(rtcManager.getHour());
+
+    Serial.print(":");
+
+    if(rtcManager.getMinute() < 10)
+        Serial.print("0");
+
+    Serial.print(rtcManager.getMinute());
+
+    Serial.print(":");
+
+    if(rtcManager.getSecond() < 10)
+        Serial.print("0");
+
+    Serial.println(rtcManager.getSecond());
+
+    Serial.print("Light ON     : ");
+
+    Serial.print(systemState.lightOnHour);
+
+    Serial.print(":");
+
+    Serial.println(systemState.lightOnMinute);
+
+    Serial.print("Light OFF    : ");
+
+    Serial.print(systemState.lightOffHour);
+
+    Serial.print(":");
+
+    Serial.println(systemState.lightOffMinute);
 
     printSeparator();
 }

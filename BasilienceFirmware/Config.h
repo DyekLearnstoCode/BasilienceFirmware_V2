@@ -3,6 +3,14 @@
 
 #include <Arduino.h>
 
+#define DEVICE_ID "basilience_001"
+#define FIRMWARE_VERSION "2.0.0"
+#define DEVICE_NAME "Basilience Controller"
+
+#define OPERATION_TIMEOUT_MS 300000UL
+
+#define HIGH_AIR_TEMP 30.0f
+
 // ======================================================
 // WiFi
 // ======================================================
@@ -69,6 +77,9 @@
 #define TRIG_PIN 18
 #define ECHO_PIN 19
 
+#define RTC_SDA_PIN 21
+#define RTC_SCL_PIN 22
+
 // ======================================================
 // EC Sensor Calibration
 // ======================================================
@@ -92,7 +103,7 @@ constexpr float MIN_EC = 1.2f;
 constexpr float LOW_WATER_LEVEL = 20.0f;
 
 constexpr float HIGH_WATER_TEMP = 24.0f;
-constexpr float LOW_WATER_TEMP = 22.0f;
+constexpr float COOLER_OFF_TEMP = 22.5f;
 
 constexpr float HIGH_AIR_TEMP = 35.0f;
 constexpr float LOW_AIR_TEMP = 28.0f;
@@ -152,6 +163,15 @@ constexpr unsigned long COLD_FOG_ON_TIME =
 
 constexpr unsigned long COLD_FOG_OFF_TIME =
     5UL * 60UL * 1000UL;
+
+constexpr unsigned long PH_STABILIZATION_TIME = 10000UL;
+constexpr unsigned long EC_STABILIZATION_TIME = 10000UL;
+
+constexpr unsigned long PH_DOSING_TIME = 5000UL;
+constexpr unsigned long EC_DOSING_TIME = 5000UL;
+
+constexpr uint8_t MAX_PH_ATTEMPTS = 3;
+constexpr uint8_t MAX_EC_ATTEMPTS = 3;
 // ======================================================
 
 constexpr int OUT_OF_RANGE_REQUIRED = 3;
@@ -170,5 +190,6 @@ constexpr unsigned long DEBUG_INTERVAL = 1000UL;
 constexpr float REFILL_START_LEVEL = 20.0f;
 
 constexpr float REFILL_STOP_LEVEL = 75.0f;
+
 
 #endif
