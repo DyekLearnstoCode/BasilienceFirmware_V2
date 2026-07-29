@@ -24,8 +24,6 @@ private:
     uint8_t getPin(Actuator actuator) const;
 
     void validateSystem();
-
-    void updateAlerts();
 };
 
 #endif

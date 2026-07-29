@@ -10,11 +10,39 @@ void SafetyManager::update()
 {
 }
 
+const char* SafetyManager::getSafetyReason(
+    SafetyResult result) const
+{
+    switch(result)
+    {
+        case SafetyResult::SAFE:
+            return "Safe";
+
+        case SafetyResult::LOW_WATER:
+            return "Low water";
+
+        case SafetyResult::SENSOR_FAULT:
+            return "Sensor fault";
+
+        case SafetyResult::HIGH_WATER_TEMP:
+            return "High water temperature";
+
+        case SafetyResult::SAFETY_LOCKED:
+            return "Safety lock";
+
+        case SafetyResult::RESERVOIR_LOCK:
+            return "Reservoir locked";
+
+        default:
+            return "Unknown";
+    }
+}
+
 SafetyResult SafetyManager::canDosePH() const
 {
     if(systemState.safetyLock)
     {
-        return SafetyResult::SAFETY_LOCK;
+        return SafetyResult::SAFETY_LOCKED;
     }
 
     if(systemState.reservoirLocked)
@@ -39,7 +67,7 @@ SafetyResult SafetyManager::canDoseEC() const
 {
     if(systemState.safetyLock)
     {
-        return SafetyResult::SAFETY_LOCK;
+        return SafetyResult::SAFETY_LOCKED;
     }
 
     if(systemState.reservoirLocked)
@@ -64,7 +92,7 @@ SafetyResult SafetyManager::canRefill() const
 {
     if(systemState.safetyLock)
     {
-        return SafetyResult::SAFETY_LOCK;
+        return SafetyResult::SAFETY_LOCKED;
     }
 
     if(alertState.sensorFault)
@@ -79,7 +107,7 @@ SafetyResult SafetyManager::canFog() const
 {
     if(systemState.safetyLock)
     {
-        return SafetyResult::SAFETY_LOCK;
+        return SafetyResult::SAFETY_LOCKED;
     }
 
     if(alertState.lowWater)
@@ -99,7 +127,7 @@ SafetyResult SafetyManager::canCool() const
 {
     if(systemState.safetyLock)
     {
-        return SafetyResult::SAFETY_LOCK;
+        return SafetyResult::SAFETY_LOCKED;
     }
 
     if(alertState.sensorFault)

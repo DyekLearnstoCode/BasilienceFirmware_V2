@@ -16,127 +16,66 @@ void AutomationManager::begin()
         millis();
 }
 
-void AutomationManager::validateSystem()
-{
-    updateAlerts();
-
-
-    if (alertState.lowWater)
-    {
-        changeState(REFILLING);
-        return;
-    }
-
-
-    changeState(STARTUP);
-}
-
 void AutomationManager::update()
 {
+    //--------------------------------------------------
+    // Operation lifecycle
+    //--------------------------------------------------
+
     if(systemState.operationRequest.state ==
        RequestState::ACCEPTED)
     {
         systemState.operationRequest.state =
-        RequestState::RUNNING;
+            RequestState::RUNNING;
 
         systemState.operationRequest.startedTimestamp =
             millis();
 
         systemState.operationRequest.lastUpdatedTimestamp =
             systemState.operationRequest.startedTimestamp;
-        
+
         return;
     }
 
     if(systemState.operationRequest.state ==
        RequestState::RUNNING)
     {
-        OperationRequest& request =
-            systemState.operationRequest;
-
-        switch(request.operation)
-        {
-            case OperationType::REFILL:
-                if(request.action ==
-                   OperationAction::START)
-                {
-                    changeState(
-                        REFILLING);
-                }
-                break;
-
-            case OperationType::PH_UP:
-                if(request.action ==
-                   OperationAction::START)
-                {
-                    systemState.phDirection =
-                        PH_UP;
-
-                    changeState(
-                        DOSING_PH);
-                }
-                break;
-
-            case OperationType::PH_DOWN:
-                if(request.action ==
-                   OperationAction::START)
-                {
-                    systemState.phDirection =
-                        PH_DOWN;
-
-                    changeState(
-                        DOSING_PH);
-                }
-                break;
-
-            case OperationType::GROW_PUMP:
-            case OperationType::BLOOM_PUMP:
-                if(request.action ==
-                   OperationAction::START)
-                {
-                    changeState(
-                        DOSING_EC);
-                }
-                break;
-
-            case OperationType::RESET_SAFETY:
-                if(request.action ==
-                   OperationAction::START &&
-                   systemState.currentMode ==
-                   SAFETY_LOCK)
-                {
-                    changeState(
-                        STARTUP);
-                }
-                break;
-
-            default:
-                break;
-        }
-
+        processOperationRequest();
         return;
     }
 
+    //--------------------------------------------------
+    // RTC synchronization
+    //--------------------------------------------------
+
     if(systemState.syncRTC)
     {
-        systemState.syncRTC =
-            false;
+        systemState.syncRTC = false;
 
         syncRTCFromFirebase();
 
         return;
     }
 
-    if (systemState.manualMode)
+    //--------------------------------------------------
+    // Manual mode
+    //--------------------------------------------------
+
+    if(systemState.manualMode)
+    {
         return;
+    }
+
+    //--------------------------------------------------
+    // Safety reset
+    //--------------------------------------------------
 
     if(systemState.resetSafetyLock)
     {
-        systemState.resetSafetyLock =
-            false;
+        systemState.resetSafetyLock = false;
 
         if(systemState.currentMode ==
-        SAFETY_LOCK)
+           SAFETY_LOCK)
         {
             Serial.println(
                 "SAFETY LOCK RESET");
@@ -148,7 +87,17 @@ void AutomationManager::update()
         }
     }
 
-    switch (systemState.currentMode)
+    //--------------------------------------------------
+    // State Machine
+    //--------------------------------------------------
+
+    processCurrentState();
+
+} //Core Framework
+
+void AutomationManager::processCurrentState()
+{
+    switch(systemState.currentMode)
     {
         case SENSOR_STABILIZATION:
             handleSensorStabilization();
@@ -191,10 +140,180 @@ void AutomationManager::update()
     }
 }
 
+//Operation Request Processing
+void AutomationManager::processOperationRequest()
+{
+    switch(systemState.operationRequest.operation)
+    {
+        case OperationType::REFILL:
+            processRefillOperation();
+            break;
+
+        case OperationType::PH_UP:
+            processPHUpOperation();
+            break;
+
+        case OperationType::PH_DOWN:
+            processPHDownOperation();
+            break;
+
+
+        case OperationType::RESET_SAFETY:
+            processResetSafetyOperation();
+            break;
+
+        case OperationType::EC_CORRECTION:
+        processECCorrectionOperation();
+        break;
+
+        default:
+            break;
+    }
+}
+
+//Operation Helpers
+
+//Refill Operation
+void AutomationManager::processRefillOperation()
+{
+    if(systemState.operationRequest.action !=
+       OperationAction::START)
+    {
+        return;
+    }
+
+    SafetyResult result =
+        safetyManager.canRefill();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return;
+    }
+
+    changeState(
+        REFILLING);
+}
+
+//PH Up Operation
+void AutomationManager::processPHUpOperation()
+{
+    if(systemState.operationRequest.action !=
+       OperationAction::START)
+    {
+        return;
+    }
+
+    SafetyResult result =
+        safetyManager.canDosePH();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return;
+    }
+
+    systemState.phDirection =
+        PH_UP;
+
+        systemState.correctionMode =
+    CorrectionMode::MANUAL;
+
+    systemState.firstCorrectionCycle = true;
+    systemState.phAttempts = 0;
+    changeState(
+        DOSING_PH);
+}
+
+//PH Down Operation
+void AutomationManager::processPHDownOperation()
+{
+    if(systemState.operationRequest.action !=
+       OperationAction::START)
+    {
+        return;
+    }
+
+    SafetyResult result =
+        safetyManager.canDosePH();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return;
+    }
+
+    systemState.phDirection =
+        PH_DOWN;
+
+    systemState.correctionMode =
+    CorrectionMode::MANUAL;
+
+    systemState.firstCorrectionCycle = true;
+    systemState.phAttempts = 0;
+
+    changeState(
+        DOSING_PH);
+}
+
+//reset Safety Lock Operation
+void AutomationManager::processResetSafetyOperation()
+{
+    if(systemState.operationRequest.action !=
+       OperationAction::START)
+    {
+        return;
+    }
+
+    if(systemState.currentMode ==
+       SAFETY_LOCK)
+    {
+        changeState(
+            STARTUP);
+    }
+}
+
+//System Validation
+void AutomationManager::validateSystem()
+{
+    alertManager.update();
+
+    if(alertState.lowWater)
+    {
+        SafetyResult result =
+            safetyManager.canRefill();
+
+        if(result != SafetyResult::SAFE)
+        {
+            failCurrentOperation(
+                safetyManager.getSafetyReason(result));
+
+            return;
+        }
+
+        changeState(
+            REFILLING);
+
+        return;
+    }
+
+    changeState(
+        STARTUP);
+}
+
+
+//Operation Completion
 void AutomationManager::completeCurrentOperation()
 {
-    if (systemState.operationRequest.state !=
-        RequestState::RUNNING)
+
+    if(systemState.operationRequest.state !=
+       RequestState::RUNNING)
     {
         return;
     }
@@ -207,44 +326,55 @@ void AutomationManager::completeCurrentOperation()
 
     systemState.operationRequest.lastUpdatedTimestamp =
         systemState.operationRequest.completedTimestamp;
+
+        systemState.correctionMode =
+    CorrectionMode::NONE;
+
+    systemState.firstCorrectionCycle = true;
 }
 
-void AutomationManager::updateAlerts()
+
+//Operation Failure
+void AutomationManager::failCurrentOperation(const String& reason)
 {
-    alertState.lowWater =
-        sensors.waterLevel <
-        REFILL_START_LEVEL;
+    if(systemState.operationRequest.state !=
+       RequestState::RUNNING)
+    {
+        return;
+    }
 
-    alertState.ecLow =
-    sensors.ec <
-    systemState.minEC;
+    systemState.operationRequest.state =
+        RequestState::FAILED;
 
-    alertState.phOutOfRange =
-    sensors.ph < systemState.minPH ||
-    sensors.ph > systemState.maxPH;
+    strncpy(
+        systemState.operationRequest.reason,
+        reason.c_str(),
+        sizeof(systemState.operationRequest.reason) - 1);
 
-    alertState.waterTempOutOfRange =
-        sensors.waterTemp <
-        COOLER_OFF_TEMP ||
-        sensors.waterTemp >
-        HIGH_WATER_TEMP;
+    systemState.operationRequest.reason[
+        sizeof(systemState.operationRequest.reason) - 1] = '\0';
 
-    alertState.highTemperature =
-        sensors.temperature >
-        HIGH_AIR_TEMP;
+    systemState.operationRequest.completedTimestamp =
+        millis();
 
-    alertState.sensorFault =
-    sensors.temperature == 0 ||
-    sensors.humidity == 0 ||
-    sensors.waterTemp == 0;
+    systemState.operationRequest.lastUpdatedTimestamp =
+        systemState.operationRequest.completedTimestamp;
+
+        systemState.correctionMode =
+    CorrectionMode::NONE;
+
+    systemState.firstCorrectionCycle = true;
+
 }
 
+//RTC Synchronization
 void AutomationManager::syncRTCFromFirebase()
 {
     Serial.println(
         "RTC SYNC REQUESTED");
 }
 
+//State Change
 void AutomationManager::changeState(SystemMode newMode)
 {
     SystemMode oldMode =
@@ -255,25 +385,12 @@ void AutomationManager::changeState(SystemMode newMode)
     Serial.println("STATE CHANGE");
     Serial.println("================================");
 
-    // ====================================
-    // Dosing Information
-    // ====================================
-
     if(newMode == DOSING_PH)
     {
         if(systemState.phDirection == PH_UP)
         {
             Serial.println(
                 "PH UP CORRECTION");
-
-                    Serial.print(
-            "Dose Time : ");
-
-        Serial.print(
-            systemState.phDoseTime / 1000);
-
-        Serial.println(
-            " sec");
         }
         else
         {
@@ -281,27 +398,38 @@ void AutomationManager::changeState(SystemMode newMode)
                 "PH DOWN CORRECTION");
         }
 
-        if(newMode == DOSING_EC)
-        {
-            Serial.println(
-                "EC CORRECTION");
+        Serial.print(
+            "Dose Time : ");
 
-            Serial.print(
-                "Dose Time : ");
+        Serial.print(
+            systemState.phDoseTime / 1000);
 
-            Serial.print(
-                systemState.ecDoseTime / 1000);
+        Serial.println(
+            " sec");
+    }
 
-            Serial.println(
-                " sec");
-        }
+    if(newMode == DOSING_EC)
+    {
+        Serial.println(
+            "EC CORRECTION");
+
+        Serial.print(
+            "Dose Time : ");
+
+        Serial.print(
+            systemState.ecDoseTime / 1000);
+
+        Serial.println(
+            " sec");
     }
 
     Serial.print("FROM : ");
-    Serial.println(getStateName(oldMode));
+    Serial.println(
+        getStateName(oldMode));
 
     Serial.print("TO   : ");
-    Serial.println(getStateName(newMode));
+    Serial.println(
+        getStateName(newMode));
 
     if(newMode == SAFETY_LOCK)
     {
@@ -312,6 +440,13 @@ void AutomationManager::changeState(SystemMode newMode)
     Serial.println("================================");
     Serial.println();
 
+    if(newMode == STARTUP)
+{
+    startupPhase = STARTUP_FOG_ON;
+
+    fogCycleOn = true;
+}
+
     systemState.currentMode =
         newMode;
 
@@ -319,39 +454,42 @@ void AutomationManager::changeState(SystemMode newMode)
         millis();
 }
 
+//sensor stabilization
 void AutomationManager::handleSensorStabilization()
 {
     actuatorManager.turnOff(FOGGER);
 
     actuatorManager.turnOff(BLOWER);
 
-    if (millis() -
-        systemState.stateStartTime >=
-        SENSOR_STABILIZATION_TIME)
+    if(millis() -
+       systemState.stateStartTime >=
+       SENSOR_STABILIZATION_TIME)
     {
         validateSystem();
     }
 }
 
+
+//Startup
 void AutomationManager::handleStartup()
 {
     if(systemState.reservoirLocked)
-    return;
+    {
+        return;
+    }
 
-    switch (startupPhase)
+    switch(startupPhase)
     {
         case STARTUP_FOG_ON:
         {
             actuatorManager.turnOn(FOGGER);
-
             actuatorManager.turnOn(BLOWER);
 
-            if (millis() -
-                systemState.stateStartTime >=
-                STARTUP_ON_TIME)
+            if(millis() -
+               systemState.stateStartTime >=
+               STARTUP_ON_TIME)
             {
                 actuatorManager.turnOff(FOGGER);
-
                 actuatorManager.turnOff(BLOWER);
 
                 startupPhase =
@@ -367,16 +505,16 @@ void AutomationManager::handleStartup()
         case STARTUP_FOG_OFF:
         {
             actuatorManager.turnOff(FOGGER);
-
             actuatorManager.turnOff(BLOWER);
 
-            if (millis() -
-                systemState.stateStartTime >=
-                STARTUP_OFF_TIME)
+            if(millis() -
+               systemState.stateStartTime >=
+               STARTUP_OFF_TIME)
             {
                 fogCycleOn = true;
 
-                changeState(NORMAL);
+                changeState(
+                    NORMAL);
             }
 
             break;
@@ -384,199 +522,257 @@ void AutomationManager::handleStartup()
     }
 }
 
-void AutomationManager::updateGrowLightSchedule()
-{
-    uint8_t currentHour =
-        rtcManager.getHour();
-
-    uint8_t currentMinute =
-        rtcManager.getMinute();
-
-    int currentTime =
-        currentHour * 60 +
-        currentMinute;
-
-    int lightOnTime =
-        systemState.lightOnHour * 60 +
-        systemState.lightOnMinute;
-
-    int lightOffTime =
-        systemState.lightOffHour * 60 +
-        systemState.lightOffMinute;
-
-    bool lightShouldBeOn = false;
-
-    if(lightOnTime < lightOffTime)
-    {
-        lightShouldBeOn =
-            currentTime >= lightOnTime &&
-            currentTime < lightOffTime;
-    }
-    else
-    {
-        lightShouldBeOn =
-            currentTime >= lightOnTime ||
-            currentTime < lightOffTime;
-    }
-
-    if(lightShouldBeOn)
-    {
-        actuatorManager.turnOn(
-            GROW_LIGHT);
-    }
-    else
-    {
-        actuatorManager.turnOff(
-            GROW_LIGHT);
-    }
-}
-
+//Normal Operation
 void AutomationManager::handleNormal()
 {
     updateGrowLightSchedule();
 
-    if(systemState.reservoirLocked)
+    alertManager.update();
+
+    if(!validateNormalOperation())
+    {
+        return;
+    }
+
+    updateCooling();
+
+    if(processRefillRequest())
+    {
+        return;
+    }
+
+    if(processPHCorrection())
+    {
+        return;
+    }
+
+    if(processECCorrection())
+    {
+        return;
+    }
+
+    processFogCycle();
+}
+
+//safety Lock Handling
+bool AutomationManager::validateNormalOperation()
+{
+    SafetyResult result =
+        safetyManager.canFog();
+
+    if(result != SafetyResult::SAFE)
     {
         actuatorManager.turnOff(FOGGER);
         actuatorManager.turnOff(BLOWER);
-        return;
+
+        Serial.println(
+            safetyManager.getSafetyReason(result));
+
+        return false;
     }
 
-    updateAlerts();
+    return true;
+}
 
-    // ====================================
-    // Force Refill Command
-    // ====================================
+//Cooling Handling
+void AutomationManager::updateCooling()
+{
+    SafetyResult result =
+        safetyManager.canCool();
 
-    if(systemState.forceRefill)
-    {
-        systemState.forceRefill = false;
-
-        changeState(
-            REFILLING);
-
-        return;
-    }
-
-    if(alertState.sensorFault)
-    {
-        return;
-    }
-
-    //grow light scheduling
-    int currentTime =
-    rtcManager.getHour() * 60 +
-    rtcManager.getMinute();
-
-    int lightOnTime =
-        systemState.lightOnHour * 60 +
-        systemState.lightOnMinute;
-
-    int lightOffTime =
-        systemState.lightOffHour * 60 +
-        systemState.lightOffMinute;
-
-    if(currentTime >= lightOnTime &&
-    currentTime < lightOffTime)
-    {
-        actuatorManager.turnOn(
-            GROW_LIGHT);
-    }
-    else
+    if(result != SafetyResult::SAFE)
     {
         actuatorManager.turnOff(
-            GROW_LIGHT);
+            PELTIER);
+
+        return;
     }
-    
-    // Water Temperature Control
+
     if(sensors.waterTemp >
-    HIGH_WATER_TEMP)
+       systemState.highWaterTemp)
     {
         actuatorManager.turnOn(
             PELTIER);
     }
 
     if(sensors.waterTemp <
-    COOLER_OFF_TEMP)
+       systemState.coolerOffTemp)
     {
         actuatorManager.turnOff(
             PELTIER);
     }
+}
 
-    //ph control
-    if(alertState.phOutOfRange)
+//force refill request
+bool AutomationManager::processRefillRequest()
+{
+    if(!systemState.forceRefill)
     {
-        float error;
+        return false;
+    }
 
-        if(sensors.ph < MIN_PH)
-        {
-            systemState.phDirection =
-                PH_UP;
+    systemState.forceRefill =
+        false;
 
-            error =
-                MIN_PH -
-                sensors.ph;
-        }
-        else
-        {
-            systemState.phDirection =
-                PH_DOWN;
+    changeState(
+        REFILLING);
 
-            error =
-                sensors.ph -
-                MAX_PH;
-        }
+    return true;
+}
 
-        if(error < 0.3f)
-        {
-            systemState.phDoseTime =
-                15000UL;
-        }
-        else if(error < 1.0f)
-        {
-            systemState.phDoseTime =
-                30000UL;
-        }
-        else
-        {
-            systemState.phDoseTime =
-                60000UL;
-        }
+//PH Correction Handling
+bool AutomationManager::processPHCorrection()
+{
+    if(!alertState.phOutOfRange)
+    {
+        return false;
+    }
 
-        changeState(DOSING_PH);
+    float error;
+
+    if(sensors.ph <
+       systemState.minPH)
+    {
+        systemState.phDirection =
+            PH_UP;
+
+        error =
+            systemState.minPH -
+            sensors.ph;
+    }
+    else
+    {
+        systemState.phDirection =
+            PH_DOWN;
+
+        error =
+            sensors.ph -
+            systemState.maxPH;
+    }
+
+    if(error < 0.3f)
+    {
+        systemState.phDoseTime =
+            15000UL;
+    }
+    else if(error < 1.0f)
+    {
+        systemState.phDoseTime =
+            30000UL;
+    }
+    else
+    {
+        systemState.phDoseTime =
+            60000UL;
+    }
+
+    SafetyResult result =
+        safetyManager.canDosePH();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return true;
+    }
+
+    systemState.correctionMode =
+    CorrectionMode::AUTOMATIC;
+
+    systemState.firstCorrectionCycle = true;
+
+    systemState.phAttempts = 0;
+
+    changeState(
+        DOSING_PH);
+
+    return true;
+}
+
+//EC Correction Handling
+bool AutomationManager::processECCorrection()
+{
+    if(!alertState.ecLow)
+    {
+        return false;
+    }
+
+    float error =
+        systemState.minEC -
+        sensors.ec;
+
+    if(error < 0.2f)
+    {
+        systemState.ecDoseTime =
+            15000UL;
+    }
+    else if(error < 0.5f)
+    {
+        systemState.ecDoseTime =
+            30000UL;
+    }
+    else
+    {
+        systemState.ecDoseTime =
+            60000UL;
+    }
+
+    SafetyResult result =
+        safetyManager.canDoseEC();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return true;
+    }
+
+    systemState.correctionMode =
+    CorrectionMode::AUTOMATIC;
+
+    systemState.firstCorrectionCycle = true;
+    systemState.ecAttempts = 0;
+
+    changeState(
+        DOSING_EC);
+
+    return true;
+}
+
+void AutomationManager::processECCorrectionOperation()
+{
+    if(systemState.operationRequest.action !=
+       OperationAction::START)
+    {
+        return;
+    }
+
+    SafetyResult result =
+        safetyManager.canDoseEC();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
 
         return;
     }
 
-    //ec control
-    if(alertState.ecLow)
-    {
-        float error =
-            MIN_EC -
-            sensors.ec;
+    systemState.correctionMode =
+        CorrectionMode::MANUAL;
 
-        if(error < 0.2f)
-        {
-            systemState.ecDoseTime =
-                15000UL;
-        }
-        else if(error < 0.5f)
-        {
-            systemState.ecDoseTime =
-                30000UL;
-        }
-        else
-        {
-            systemState.ecDoseTime =
-                60000UL;
-        }
+        systemState.firstCorrectionCycle = true;
+        systemState.ecAttempts = 0;
 
-        changeState(DOSING_EC);
+    changeState(
+        DOSING_EC);
+}
 
-        return;
-    }
-
-    //fogging control
+//Fog Cycle Handling
+void AutomationManager::processFogCycle()
+{
     unsigned long elapsed =
         millis() -
         systemState.stateStartTime;
@@ -587,80 +783,232 @@ void AutomationManager::handleNormal()
     unsigned long fogOffTime =
         NORMAL_FOG_OFF_TIME;
 
-    // ====================================
-    // Adaptive Fogging
-    // ====================================
-
-    if (sensors.temperature > 30.0f)
+    if(sensors.temperature >
+       systemState.hotFogTemperature)
     {
-        fogOnTime = HOT_FOG_ON_TIME;
-        fogOffTime = HOT_FOG_OFF_TIME;
+        fogOnTime =
+            HOT_FOG_ON_TIME;
+
+        fogOffTime =
+            HOT_FOG_OFF_TIME;
     }
-    else if (sensors.temperature < 20.0f)
+    else if(sensors.temperature <
+            systemState.coldFogTemperature)
     {
-        fogOnTime = COLD_FOG_ON_TIME;
-        fogOffTime = COLD_FOG_OFF_TIME;
+        fogOnTime =
+            COLD_FOG_ON_TIME;
+
+        fogOffTime =
+            COLD_FOG_OFF_TIME;
     }
 
-    // ====================================
-    // Fog Cycle
-    // ====================================
-
-    if (fogCycleOn)
+    if(fogCycleOn)
     {
-        actuatorManager.turnOn(FOGGER);
-        actuatorManager.turnOn(BLOWER);
+        actuatorManager.turnOn(
+            FOGGER);
 
-        if (elapsed >= fogOnTime)
+        actuatorManager.turnOn(
+            BLOWER);
+
+        if(elapsed >= fogOnTime)
         {
             fogCycleOn = false;
-            systemState.stateStartTime = millis();
+
+            systemState.stateStartTime =
+                millis();
         }
     }
     else
     {
-        actuatorManager.turnOff(FOGGER);
-        actuatorManager.turnOff(BLOWER);
+        actuatorManager.turnOff(
+            FOGGER);
 
-        if (elapsed >= fogOffTime)
+        actuatorManager.turnOff(
+            BLOWER);
+
+        if(elapsed >= fogOffTime)
         {
             fogCycleOn = true;
-            systemState.stateStartTime = millis();
+
+            systemState.stateStartTime =
+                millis();
         }
     }
 }
 
+//Grow Light Schedule Handling
+void AutomationManager::updateGrowLightSchedule()
+{
+    bool lightEnabled =
+        isWithinSchedule(
+            systemState.lightOnHour,
+            systemState.lightOnMinute,
+            systemState.lightOffHour,
+            systemState.lightOffMinute);
+
+    if(lightEnabled)
+    {
+        actuatorManager.turnOn(
+            GROW_LIGHT);
+    }
+    else
+    {
+        actuatorManager.turnOff(
+            GROW_LIGHT);
+    }
+}
+//Get Current Time in Minutes
+int AutomationManager::getCurrentMinutes() const
+{
+    return
+        rtcManager.getHour() * 60 +
+        rtcManager.getMinute();
+}
+//Schedule Validation
+bool AutomationManager::isWithinSchedule(
+    uint8_t startHour,
+    uint8_t startMinute,
+    uint8_t endHour,
+    uint8_t endMinute) const
+{
+    const int current =
+        getCurrentMinutes();
+
+    const int start =
+        startHour * 60 +
+        startMinute;
+
+    const int end =
+        endHour * 60 +
+        endMinute;
+
+    // Normal schedule
+    if(start < end)
+    {
+        return
+            current >= start &&
+            current < end;
+    }
+
+    // Overnight schedule
+    return
+        current >= start ||
+        current < end;
+}
+
+//Refilling Handling
+void AutomationManager::handleRefilling()
+{
+    alertManager.update();
+
+    SafetyResult result =
+        safetyManager.canRefill();
+
+    if(result != SafetyResult::SAFE)
+    {
+        abortCurrentOperation(result);
+        return;
+    }
+
+    systemState.reservoirLocked = true;
+
+    actuatorManager.turnOn(
+        SOLENOID);
+
+    if(sensors.waterLevel >=
+       systemState.refillStopLevel)
+    {
+        actuatorManager.turnOff(
+            SOLENOID);
+
+        systemState.reservoirLocked = false;
+
+        completeCurrentOperation();
+
+        changeState(
+            STARTUP);
+
+    }
+}
+
+//handle ph dosing
 void AutomationManager::handleDosingPH()
 {
+    alertManager.update();
+
+    SafetyResult result =
+        safetyManager.canDosePH();
+
+    if(result != SafetyResult::SAFE)
+    {
+        abortCurrentOperation(result);
+        return;
+    }
+
     systemState.reservoirLocked = true;
 
     if(systemState.phDirection == PH_UP)
     {
         actuatorManager.turnOn(PH_UP_PUMP);
-
+        actuatorManager.turnOff(PH_DOWN_PUMP);
     }
-    else if(systemState.phDirection == PH_DOWN)
+    else
     {
         actuatorManager.turnOn(PH_DOWN_PUMP);
+        actuatorManager.turnOff(PH_UP_PUMP);
     }
 
-    if(millis() -
-       systemState.stateStartTime >=
-       systemState.phDoseTime)
+    bool stopDosing = false;
+
+    if(systemState.correctionMode ==
+       CorrectionMode::MANUAL &&
+       systemState.firstCorrectionCycle)
     {
-        actuatorManager.turnOff(
-            PH_UP_PUMP);
+        if(!alertState.phOutOfRange)
+        {
+            stopDosing = true;
+        }
 
-        actuatorManager.turnOff(
-            PH_DOWN_PUMP);
+        if(millis() -
+           systemState.stateStartTime >=
+           systemState.phDoseTime)
+        {
+            stopDosing = true;
+        }
+    }
+    else
+    {
+        if(millis() -
+           systemState.stateStartTime >=
+           systemState.phDoseTime)
+        {
+            stopDosing = true;
+        }
+    }
 
-        changeState(
-            STABILIZING_PH);
+    if(stopDosing)
+    {
+        actuatorManager.turnOff(PH_UP_PUMP);
+        actuatorManager.turnOff(PH_DOWN_PUMP);
+
+        changeState(STABILIZING_PH);
     }
 }
 
+//handle ph stabilization
 void AutomationManager::handleStabilizingPH()
 {
+    alertManager.update();
+
+    SafetyResult result =
+        safetyManager.canDosePH();
+
+    if(result != SafetyResult::SAFE)
+    {
+        abortCurrentOperation(result);
+        return;
+    }
+
     actuatorManager.turnOff(
         PH_UP_PUMP);
 
@@ -671,63 +1019,115 @@ void AutomationManager::handleStabilizingPH()
        systemState.stateStartTime >=
        PH_STABILIZATION_TIME)
     {
-        updateAlerts();
-
         if(alertState.phOutOfRange)
-    {
-        systemState.phAttempts++;
-
-        if(systemState.phAttempts >=
-        MAX_PH_ATTEMPTS)
         {
+            systemState.phAttempts++;
+
+            if(systemState.phAttempts >=
+            MAX_PH_ATTEMPTS)
+            {
+                failCurrentOperation(
+                    "Maximum pH correction attempts reached.");
+
+                changeState(
+                    SAFETY_LOCK);
+
+                return;
+            }
+
+
+            systemState.firstCorrectionCycle = false;
+
             changeState(
-                SAFETY_LOCK);
+                DOSING_PH);
 
             return;
         }
 
-        changeState(
-            DOSING_PH);
-
-        return;
-    }
         systemState.phAttempts = 0;
+
         systemState.phDirection = PH_NONE;
 
         systemState.reservoirLocked = false;
 
         completeCurrentOperation();
 
-        changeState(NORMAL);
+        changeState(
+            NORMAL);
     }
 }
 
+//handle ec dosing
 void AutomationManager::handleDosingEC()
 {
-      systemState.reservoirLocked = true;
+    alertManager.update();
+
+    SafetyResult result =
+        safetyManager.canDoseEC();
+
+    if(result != SafetyResult::SAFE)
+    {
+        abortCurrentOperation(result);
+        return;
+    }
+
+    systemState.reservoirLocked = true;
 
     actuatorManager.turnOn(GROW_PUMP);
-
     actuatorManager.turnOn(BLOOM_PUMP);
 
-    if(millis() -
-       systemState.stateStartTime >=
-       systemState.ecDoseTime)
+    bool stopDosing = false;
+
+    if(systemState.correctionMode ==
+       CorrectionMode::MANUAL &&
+       systemState.firstCorrectionCycle)
     {
-        actuatorManager.turnOff(
-            GROW_PUMP);
+        if(!alertState.ecLow)
+        {
+            stopDosing = true;
+        }
 
-        actuatorManager.turnOff(
-            BLOOM_PUMP);
+        if(millis() -
+           systemState.stateStartTime >=
+           systemState.ecDoseTime)
+        {
+            stopDosing = true;
+        }
+    }
+    else
+    {
+        if(millis() -
+           systemState.stateStartTime >=
+           systemState.ecDoseTime)
+        {
+            stopDosing = true;
+        }
+    }
 
-        changeState(
-            STABILIZING_EC);
+    if(stopDosing)
+    {
+        actuatorManager.turnOff(GROW_PUMP);
+        actuatorManager.turnOff(BLOOM_PUMP);
+
+        changeState(STABILIZING_EC);
     }
 }
 
+//handle ec stabilization
 void AutomationManager::handleStabilizingEC()
 {
-   actuatorManager.turnOff(
+    alertManager.update();
+
+    SafetyResult result =
+        safetyManager.canDoseEC();
+
+    if(result != SafetyResult::SAFE)
+    {
+        abortCurrentOperation(result);
+        return;
+    }
+
+    actuatorManager.turnOff(
         GROW_PUMP);
 
     actuatorManager.turnOff(
@@ -737,19 +1137,44 @@ void AutomationManager::handleStabilizingEC()
        systemState.stateStartTime >=
        EC_STABILIZATION_TIME)
     {
-        updateAlerts();
+        alertManager.update();
 
         if(alertState.ecLow)
         {
             systemState.ecAttempts++;
 
             if(systemState.ecAttempts >=
-               MAX_EC_ATTEMPTS)
+            MAX_EC_ATTEMPTS)
             {
+                failCurrentOperation(
+                    "Maximum EC correction attempts reached.");
+
                 changeState(
                     SAFETY_LOCK);
 
                 return;
+            }
+
+            systemState.firstCorrectionCycle = false;
+
+            float error =
+                systemState.minEC -
+                sensors.ec;
+
+            if(error < 0.2f)
+            {
+                systemState.ecDoseTime =
+                    15000UL;
+            }
+            else if(error < 0.5f)
+            {
+                systemState.ecDoseTime =
+                    30000UL;
+            }
+            else
+            {
+                systemState.ecDoseTime =
+                    60000UL;
             }
 
             changeState(
@@ -764,38 +1189,23 @@ void AutomationManager::handleStabilizingEC()
 
         completeCurrentOperation();
 
-        changeState(NORMAL);
+        changeState(
+            NORMAL);
     }
 }
 
-void AutomationManager::handleRefilling()
-{
-    systemState.reservoirLocked = true;
-
-    actuatorManager.turnOn(SOLENOID);
-
-    if (sensors.waterLevel >=
-        REFILL_STOP_LEVEL)
-    {
-        actuatorManager.turnOff(SOLENOID);
-
-        systemState.reservoirLocked = false;
-        completeCurrentOperation();
-        changeState(STARTUP);
-    }
-}
-
+//handle safety lock
 void AutomationManager::handleSafetyLock()
 {
     actuatorManager.turnOffAll();
 
-    systemState.reservoirLocked =
-        true;
+    systemState.reservoirLocked = true;
 }
 
+//get state name
 const char* AutomationManager::getStateName(SystemMode mode)
 {
-    switch (mode)
+    switch(mode)
     {
         case SENSOR_STABILIZATION:
             return "SENSOR_STABILIZATION";
@@ -827,4 +1237,20 @@ const char* AutomationManager::getStateName(SystemMode mode)
         default:
             return "UNKNOWN";
     }
+}
+
+bool AutomationManager::abortCurrentOperation(
+    SafetyResult result)
+{
+    actuatorManager.turnOffAll();
+
+    systemState.reservoirLocked = true;
+
+    failCurrentOperation(
+        safetyManager.getSafetyReason(result));
+
+    changeState(
+        SAFETY_LOCK);
+
+    return true;
 }

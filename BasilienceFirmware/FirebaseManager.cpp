@@ -1,350 +1,178 @@
-
-#include <Firebase_ESP_Client.h>
-#include <WiFi.h>
-#include "Config.h"
+#include "FirebaseManager.h"
 #include "Globals.h"
+#include "Arduino.h"
 
 namespace
 {
 
-    OperationType toOperationType(const String& value)
-    {
-        if (value == "PH_UP")
-            return OperationType::PH_UP;
+constexpr unsigned long COMMAND_READ_INTERVAL  = 5000;
+constexpr unsigned long SETTINGS_READ_INTERVAL = 60000;
+constexpr unsigned long UPLOAD_INTERVAL        = 10000;
+constexpr unsigned long DEVICE_INFO_INTERVAL   = 60000;
 
-        if (value == "PH_DOWN")
-            return OperationType::PH_DOWN;
+//==================================================
+// Firebase Operation Conversions
+//==================================================
 
-        if (value == "GROW_PUMP")
-            return OperationType::GROW_PUMP;
+OperationType toOperationType(const String& value)
+{
+    if(value == "REFILL")
+        return OperationType::REFILL;
 
-        if (value == "BLOOM_PUMP")
-            return OperationType::BLOOM_PUMP;
+    if(value == "PH_UP")
+        return OperationType::PH_UP;
 
-        if (value == "REFILL")
-            return OperationType::REFILL;
+    if(value == "PH_DOWN")
+        return OperationType::PH_DOWN;
 
-        if (value == "FOGGER")
-            return OperationType::FOGGER;
+    if(value == "EC_CORRECTION")
+        return OperationType::EC_CORRECTION;
 
-        if (value == "CANOPY_FAN")
-            return OperationType::CANOPY_FAN;
+    if(value == "RESET_SAFETY")
+        return OperationType::RESET_SAFETY;
 
-        if (value == "PELTIER")
-            return OperationType::PELTIER;
-
-        if (value == "GROW_LIGHT")
-            return OperationType::GROW_LIGHT;
-
-        if (value == "RESTART_ESP")
-            return OperationType::RESTART_ESP;
-
-        if (value == "RESET_SAFETY")
-            return OperationType::RESET_SAFETY;
-
-        return OperationType::NONE;
-    }
-
-    OperationAction toOperationAction(const String& value)
-    {
-        if (value == "START")
-            return OperationAction::START;
-
-        if (value == "STOP")
-            return OperationAction::STOP;
-
-        if (value == "ENABLE")
-            return OperationAction::ENABLE;
-
-        if (value == "DISABLE")
-            return OperationAction::DISABLE;
-
-        if (value == "EXECUTE")
-            return OperationAction::EXECUTE;
-
-        return OperationAction::NONE;
-    }
-
-    RequestState toRequestState(const String& value)
-    {
-        if (value == "ACCEPTED")
-            return RequestState::ACCEPTED;
-
-        if (value == "PENDING")
-            return RequestState::PENDING;
-
-        if (value == "RUNNING")
-            return RequestState::RUNNING;
-
-        if (value == "COMPLETED")
-            return RequestState::COMPLETED;
-
-        if (value == "REJECTED")
-            return RequestState::REJECTED;
-
-        if (value == "FAILED")
-            return RequestState::FAILED;
-
-        return RequestState::IDLE;
-    }
-
-    RequestSource toRequestSource(const String& value)
-    {
-        if (value == "MANUAL")
-            return RequestSource::MANUAL;
-
-        if (value == "AUTOMATIC")
-            return RequestSource::AUTOMATIC;
-
-        return RequestSource::NONE;
-    }
-
-    const char* operationToString(OperationType operation)
-        {
-            switch(operation)
-            {
-                case OperationType::PH_UP:
-                    return "PH_UP";
-
-                case OperationType::PH_DOWN:
-                    return "PH_DOWN";
-
-                case OperationType::GROW_PUMP:
-                    return "GROW_PUMP";
-
-                case OperationType::BLOOM_PUMP:
-                    return "BLOOM_PUMP";
-
-                case OperationType::REFILL:
-                    return "REFILL";
-
-                case OperationType::FOGGER:
-                    return "FOGGER";
-
-                case OperationType::CANOPY_FAN:
-                    return "CANOPY_FAN";
-
-                case OperationType::PELTIER:
-                    return "PELTIER";
-
-                case OperationType::GROW_LIGHT:
-                    return "GROW_LIGHT";
-
-                case OperationType::RESTART_ESP:
-                    return "RESTART_ESP";
-
-                case OperationType::RESET_SAFETY:
-                    return "RESET_SAFETY";
-
-                default:
-                    return "NONE";
-            }
-        }
-
-        const char* actionToString(
-            OperationAction action)
-        {
-            switch(action)
-            {
-                case OperationAction::START:
-                    return "START";
-
-                case OperationAction::STOP:
-                    return "STOP";
-
-                case OperationAction::ENABLE:
-                    return "ENABLE";
-
-                case OperationAction::DISABLE:
-                    return "DISABLE";
-
-                case OperationAction::EXECUTE:
-                    return "EXECUTE";
-
-                default:
-                    return "NONE";
-            }
-        }
-
-        const char* requestStateToString(
-            RequestState state)
-        {
-            switch(state)
-            {
-                case RequestState::ACCEPTED:
-                    return "ACCEPTED";
-
-                case RequestState::RUNNING:
-                    return "RUNNING";
-
-                case RequestState::COMPLETED:
-                    return "COMPLETED";
-
-                case RequestState::REJECTED:
-                    return "REJECTED";
-
-                case RequestState::FAILED:
-                    return "FAILED";
-
-                case RequestState::PENDING:
-                    return "PENDING";
-
-                default:
-                    return "IDLE";
-            }
-        }
-
+    return OperationType::NONE;
 }
 
-bool FirebaseManager::hasActiveOperation() const
+OperationAction toOperationAction(const String& value)
 {
-    switch (systemState.operationRequest.state)
+    if(value == "START")
+        return OperationAction::START;
+
+    if(value == "STOP")
+        return OperationAction::STOP;
+
+    if(value == "ENABLE")
+        return OperationAction::ENABLE;
+
+    if(value == "DISABLE")
+        return OperationAction::DISABLE;
+
+    if(value == "EXECUTE")
+        return OperationAction::EXECUTE;
+
+    return OperationAction::NONE;
+}
+
+RequestState toRequestState(const String& value)
+{
+    if(value == "PENDING")
+        return RequestState::PENDING;
+
+    if(value == "ACCEPTED")
+        return RequestState::ACCEPTED;
+
+    if(value == "RUNNING")
+        return RequestState::RUNNING;
+
+    if(value == "COMPLETED")
+        return RequestState::COMPLETED;
+
+    if(value == "REJECTED")
+        return RequestState::REJECTED;
+
+    if(value == "FAILED")
+        return RequestState::FAILED;
+
+    return RequestState::IDLE;
+}
+
+RequestSource toRequestSource(const String& value)
+{
+    if(value == "MANUAL")
+        return RequestSource::MANUAL;
+
+    if(value == "AUTOMATIC")
+        return RequestSource::AUTOMATIC;
+
+    return RequestSource::NONE;
+}
+
+//==================================================
+// Firebase Operation Serialization
+//==================================================
+
+const char* operationToString(OperationType operation)
+{
+    switch(operation)
     {
-        case RequestState::IDLE:
-        case RequestState::COMPLETED:
-        case RequestState::FAILED:
-        case RequestState::REJECTED:
-            return false;
+        case OperationType::REFILL:
+            return "REFILL";
+
+        case OperationType::PH_UP:
+            return "PH_UP";
+
+        case OperationType::PH_DOWN:
+            return "PH_DOWN";
+
+        case OperationType::EC_CORRECTION:
+            return "EC_CORRECTION";
+
+        case OperationType::RESET_SAFETY:
+            return "RESET_SAFETY";
 
         default:
-            return true;
+            return "NONE";
     }
 }
 
-bool FirebaseManager::isDuplicateRequest(uint16_t requestId) const
+const char* actionToString(OperationAction action)
 {
-    return requestId ==
-           systemState.lastProcessedRequestId;
-}
-
-void FirebaseManager::createOperationRequest(
-    uint16_t requestId,
-    OperationType operation,
-    OperationAction action,
-    RequestSource source)
+    switch(action)
     {
-        OperationRequest& request =
-            systemState.operationRequest;
+        case OperationAction::START:
+            return "START";
 
-        request.requestId =
-            requestId;
+        case OperationAction::STOP:
+            return "STOP";
 
-        request.operation =
-            operation;
+        case OperationAction::ENABLE:
+            return "ENABLE";
 
-        request.action =
-            action;
+        case OperationAction::DISABLE:
+            return "DISABLE";
 
-        request.source =
-            source;
+        case OperationAction::EXECUTE:
+            return "EXECUTE";
 
-        request.state =
-            RequestState::ACCEPTED;
-
-        request.reason[0] =
-            '\0';
-
-        unsigned long now = millis();
-
-        request.requestTimestamp = now;
-        request.acceptedTimestamp = now;
-        request.startedTimestamp = 0;
-        request.completedTimestamp = 0;
-        request.lastUpdatedTimestamp = now;
-
-        systemState.lastProcessedRequestId =
-            requestId;
+        default:
+            return "NONE";
+    }
 }
 
-bool FirebaseManager::validateOperationRequest(OperationType operation,OperationAction action, String& reason)
+const char* requestStateToString(RequestState state)
 {
-        if(operation ==
-        OperationType::NONE)
-        {
-            reason =
-                "Invalid operation";
+    switch(state)
+    {
+        case RequestState::PENDING:
+            return "PENDING";
 
-            return false;
-        }
+        case RequestState::ACCEPTED:
+            return "ACCEPTED";
 
-        if(action ==
-        OperationAction::NONE)
-        {
-            reason =
-                "Invalid action";
+        case RequestState::RUNNING:
+            return "RUNNING";
 
-            return false;
-        }
+        case RequestState::COMPLETED:
+            return "COMPLETED";
 
-        if(hasActiveOperation())
-        {
-            reason =
-                "Operation already active";
+        case RequestState::REJECTED:
+            return "REJECTED";
 
-            return false;
-        }
+        case RequestState::FAILED:
+            return "FAILED";
 
-        return true;
+        default:
+            return "IDLE";
+    }
 }
 
-void FirebaseManager::rejectOperationRequest(
-    uint16_t requestId,
-    const char* reason)
-{
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
+} // namespace
 
-    FirebaseJson operationJson;
 
-    operationJson.set(
-        "requestId",
-        requestId);
-
-    operationJson.set(
-        "operation",
-        "NONE");
-
-    operationJson.set(
-        "action",
-        "NONE");
-
-    operationJson.set(
-        "state",
-        "REJECTED");
-
-    operationJson.set(
-        "reason",
-        reason);
-
-    operationJson.set(
-        "requestTimestamp",
-        0);
-
-    operationJson.set(
-        "acceptedTimestamp",
-        0);
-
-    operationJson.set(
-        "startedTimestamp",
-        0);
-
-    operationJson.set(
-        "completedTimestamp",
-        0);
-
-    operationJson.set(
-        "lastUpdatedTimestamp",
-        millis());
-
-    operationJson.set(
-        "protocolVersion",
-        1);
-
-    writeJson(
-        root + "/operations/current",
-        operationJson);
-}
+//==================================================
+// Initialization
+//==================================================
 
 void FirebaseManager::begin()
 {
@@ -355,38 +183,31 @@ void FirebaseManager::begin()
         WIFI_SSID,
         WIFI_PASSWORD);
 
-    while(WiFi.status() !=
-          WL_CONNECTED)
+    while(WiFi.status() != WL_CONNECTED)
     {
         delay(500);
-
         Serial.print(".");
     }
 
     Serial.println();
-    Serial.println(
-        "WiFi Connected");
+    Serial.println("WiFi Connected");
 
-    systemState.wifiConnected =
-    true;
+    systemState.wifiConnected = true;
 
-    Serial.print(
-        "IP Address: ");
-
-    Serial.println(
-        WiFi.localIP());
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
 
     config.api_key =
-    API_KEY;
+        API_KEY;
 
     config.database_url =
         DATABASE_URL;
 
-    if (Firebase.signUp(
-            &config,
-            &auth,
-            "",
-            ""))
+    if(Firebase.signUp(
+        &config,
+        &auth,
+        "",
+        ""))
     {
         Serial.println(
             "Firebase SignUp OK");
@@ -404,74 +225,86 @@ void FirebaseManager::begin()
         &config,
         &auth);
 
-    Firebase.reconnectWiFi(
-        true);
+    Firebase.reconnectWiFi(true);
 
-    systemState.firebaseConnected =
-    true;
+    systemState.firebaseConnected = true;
 
     initializeDatabase();
 
-    Serial.println(
-        "Firebase Started");
+    readSettings();
 
-        
+    syncRTC();
+
+    systemState.settingsLoaded = true;
+
+    systemState.syncRTC = true;
+
+    systemState.currentMode = NORMAL;
+
+        Serial.println(
+            "Firebase Started");
 }
 
 void FirebaseManager::initializeDatabase()
 {
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
 
     FirebaseJson json;
-    FirebaseJsonData data;
 
-    // =====================================================
+    //--------------------------------------------------
     // Settings
-    // =====================================================
-    if (!Firebase.RTDB.getJSON(
-            &fbdo,
-            root + "/settings"))
+    //--------------------------------------------------
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/settings"))
     {
         json.clear();
 
-        json.set("lightOnHour", systemState.lightOnHour);
-        json.set("lightOnMinute", systemState.lightOnMinute);
-        json.set("lightOffHour", systemState.lightOffHour);
-        json.set("lightOffMinute", systemState.lightOffMinute);
+        json.set("lightOnHour",
+            systemState.lightOnHour);
 
-        json.set("minPH", systemState.minPH);
-        json.set("maxPH", systemState.maxPH);
-        json.set("minEC", systemState.minEC);
+        json.set("lightOnMinute",
+            systemState.lightOnMinute);
 
-        json.set(
-            "refillStartLevel",
+        json.set("lightOffHour",
+            systemState.lightOffHour);
+
+        json.set("lightOffMinute",
+            systemState.lightOffMinute);
+
+        json.set("minPH",
+            systemState.minPH);
+
+        json.set("maxPH",
+            systemState.maxPH);
+
+        json.set("minEC",
+            systemState.minEC);
+
+        json.set("refillStartLevel",
             systemState.refillStartLevel);
 
-        json.set(
-            "refillStopLevel",
+        json.set("refillStopLevel",
             systemState.refillStopLevel);
 
-        json.set(
-            "highWaterTemp",
+        json.set("highWaterTemp",
             systemState.highWaterTemp);
 
-        json.set(
-            "coolerOffTemp",
+        json.set("coolerOffTemp",
             systemState.coolerOffTemp);
 
         writeJson(
-        root + "/settings",
-        json);
+            deviceRoot() + "/settings",
+            json);
     }
 
-    // =====================================================
+    //--------------------------------------------------
     // Commands
-    // =====================================================
-    if (!Firebase.RTDB.getJSON(
-            &fbdo,
-            root + "/commands/current"))
+    //--------------------------------------------------
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/commands/current"))
     {
         json.clear();
 
@@ -482,16 +315,17 @@ void FirebaseManager::initializeDatabase()
         json.set("protocolVersion", 1);
 
         writeJson(
-            root + "/commands/current",
+            deviceRoot() + "/commands/current",
             json);
     }
 
-    // =====================================================
-    // Operations
-    // =====================================================
-    if (!Firebase.RTDB.getJSON(
-            &fbdo,
-            root + "/operations/current"))
+    //--------------------------------------------------
+    // Current Operation
+    //--------------------------------------------------
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/operations/current"))
     {
         json.clear();
 
@@ -508,28 +342,31 @@ void FirebaseManager::initializeDatabase()
         json.set("protocolVersion", 1);
 
         writeJson(
-            root + "/operations/current",
+            deviceRoot() + "/operations/current",
             json);
     }
 
-    // =====================================================
+    //--------------------------------------------------
     // RTC
-    // =====================================================
-    if (!Firebase.RTDB.getJSON(
-            &fbdo,
-            root + "/rtc"))
+    //--------------------------------------------------
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/rtc"))
     {
         json.clear();
 
         json.set(
-    "month",
-    rtcManager.getMonth());
+            "month",
+            rtcManager.getMonth());
+
         json.set(
-    "day",
-    rtcManager.getDay());
+            "day",
+            rtcManager.getDay());
+
         json.set(
-    "year",
-    rtcManager.getYear());
+            "year",
+            rtcManager.getYear());
 
         json.set(
             "hour",
@@ -544,232 +381,51 @@ void FirebaseManager::initializeDatabase()
             rtcManager.getSecond());
 
         writeJson(
-            root + "/rtc",
+            deviceRoot() + "/rtc",
             json);
     }
 }
 
-bool FirebaseManager::writeJson(
-    const String& path,
-    FirebaseJson& json)
-{
-    bool success =
-        Firebase.RTDB.setJSON(
-            &fbdo,
-            path,
-            &json);
-
-    if(!success)
-    {
-        Serial.print(
-            "Firebase Write Failed: ");
-
-        Serial.println(
-            fbdo.errorReason());
-    }
-
-    return success;
-}
-
-bool FirebaseManager::writeCurrentOperation()
-{
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
-
-    OperationRequest& request =
-        systemState.operationRequest;
-
-    FirebaseJson operationJson;
-
-    operationJson.set(
-        "requestId",
-        request.requestId);
-
-    operationJson.set(
-        "operation",
-        operationToString(
-            request.operation));
-
-    operationJson.set(
-        "action",
-        actionToString(
-            request.action));
-
-    operationJson.set(
-        "state",
-        requestStateToString(
-            request.state));
-
-    operationJson.set(
-        "reason",
-        request.reason);
-
-    operationJson.set(
-        "requestTimestamp",
-        request.requestTimestamp);
-
-    operationJson.set(
-        "acceptedTimestamp",
-        request.acceptedTimestamp);
-
-    operationJson.set(
-        "startedTimestamp",
-        request.startedTimestamp);
-
-    operationJson.set(
-        "completedTimestamp",
-        request.completedTimestamp);
-
-    operationJson.set(
-        "lastUpdatedTimestamp",
-        request.lastUpdatedTimestamp);
-
-    operationJson.set(
-        "protocolVersion",
-        1);
-
-    return writeJson(
-    root + "/operations/current",
-    operationJson);
-}
-
-bool FirebaseManager::archiveCurrentOperation()
-{
-    OperationRequest& request =
-        systemState.operationRequest;
-
-    FirebaseJson operationJson;
-
-    operationJson.set(
-        "requestId",
-        request.requestId);
-
-    operationJson.set(
-        "operation",
-        operationToString(
-            request.operation));
-
-    operationJson.set(
-        "action",
-        actionToString(
-            request.action));
-
-    operationJson.set(
-        "state",
-        requestStateToString(
-            request.state));
-
-    operationJson.set(
-        "reason",
-        request.reason);
-
-    operationJson.set(
-        "requestTimestamp",
-        request.requestTimestamp);
-
-    operationJson.set(
-        "acceptedTimestamp",
-        request.acceptedTimestamp);
-
-    operationJson.set(
-        "startedTimestamp",
-        request.startedTimestamp);
-
-    operationJson.set(
-        "completedTimestamp",
-        request.completedTimestamp);
-
-    operationJson.set(
-        "lastUpdatedTimestamp",
-        request.lastUpdatedTimestamp);
-
-    operationJson.set(
-        "protocolVersion",
-        1);
-
-    String path =
-        "/devices/" +
-        String(DEVICE_ID) +
-        "/operations/history/" +
-        String(request.requestId);
-
-    return writeJson(
-        path,
-        operationJson);
-}
-
-void FirebaseManager::resetCurrentOperation()
-{
-    uint32_t lastProcessedId =
-        systemState.lastProcessedRequestId;
-
-    systemState.operationRequest =
-        OperationRequest{};
-
-    systemState.operationRequest.state =
-        RequestState::IDLE;
-
-    systemState.lastProcessedRequestId =
-        lastProcessedId;
-
-    lastPublishedOperationState =
-        RequestState::IDLE;
-}
-
-void FirebaseManager::updateOperationState(
-    RequestState newState)
-{
-    OperationRequest& request =
-        systemState.operationRequest;
-
-    unsigned long now =
-        millis();
-
-    request.state =
-        newState;
-
-    switch(newState)
-    {
-        case RequestState::ACCEPTED:
-            request.acceptedTimestamp =
-                now;
-            break;
-
-        case RequestState::RUNNING:
-            request.startedTimestamp =
-                now;
-            break;
-
-        case RequestState::COMPLETED:
-            request.completedTimestamp =
-                now;
-            break;
-
-        default:
-            break;
-    }
-
-    request.lastUpdatedTimestamp =
-        now;
-}
+//==================================================
+// Main Update
+//==================================================
 
 void FirebaseManager::update()
 {
+    //--------------------------------------------------
+    // Connection Status
+    //--------------------------------------------------
+
     systemState.firebaseConnected =
         Firebase.ready();
 
-    if (!Firebase.ready())
-        return;
-
-    if (millis() - lastSettingsRead >= 60000)
+    if(!Firebase.ready())
     {
-        lastSettingsRead = millis();
+        return;
+    }
+
+    //--------------------------------------------------
+    // Settings Synchronization
+    //--------------------------------------------------
+
+    if(millis() - lastSettingsRead >=
+       SETTINGS_READ_INTERVAL)
+    {
+        lastSettingsRead =
+            millis();
 
         readSettings();
     }
 
+    //--------------------------------------------------
+    // Command Processing
+    //--------------------------------------------------
+
     readCommands();
+
+    //--------------------------------------------------
+    // Device Uploads
+    //--------------------------------------------------
 
     writeDeviceInfo();
 
@@ -783,150 +439,180 @@ void FirebaseManager::update()
 
     writeActuators();
 
-    // ====================================
-    // Publish Operation State Changes
-    // ====================================
+    //--------------------------------------------------
+    // Operation State Synchronization
+    //--------------------------------------------------
 
-    if(systemState.operationRequest.state !=
-    lastPublishedOperationState)
-    {
-        writeCurrentOperation();
-
-        lastPublishedOperationState =
-            systemState.operationRequest.state;
-
-        RequestState state =
-            systemState.operationRequest.state;
-
-        if(state == RequestState::COMPLETED ||
-        state == RequestState::FAILED ||
-        state == RequestState::REJECTED)
-        {
-            if(archiveCurrentOperation())
-            {
-                resetCurrentOperation();
-            }
-        }
-    }
-}
-
-void FirebaseManager::readSettings()
-{
-     FirebaseJsonData data;
-     
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
-
-    String path =
-        root +
-        "/settings";
-
-    if(!Firebase.RTDB.getJSON(
-        &fbdo,
-        path))
+    if(systemState.operationRequest.state ==
+       lastPublishedOperationState)
     {
         return;
     }
 
-    fbdo.jsonObject().get(
-        data,
-        "lightOnHour");
+    writeCurrentOperation();
 
-    systemState.lightOnHour =
-        data.intValue;
+    lastPublishedOperationState =
+        systemState.operationRequest.state;
 
-    fbdo.jsonObject().get(
-        data,
-        "lightOnMinute");
+    RequestState state =
+        systemState.operationRequest.state;
 
-    systemState.lightOnMinute =
-        data.intValue;
+    if(state != RequestState::COMPLETED &&
+       state != RequestState::FAILED &&
+       state != RequestState::REJECTED)
+    {
+        return;
+    }
 
-    fbdo.jsonObject().get(
-        data,
-        "lightOffHour");
-
-    systemState.lightOffHour =
-        data.intValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "lightOffMinute");
-
-    systemState.lightOffMinute =
-        data.intValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "minPH");
-
-    systemState.minPH =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "maxPH");
-
-    systemState.maxPH =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "minEC");
-
-    systemState.minEC =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-    data,
-    "refillStartLevel");
-
-    systemState.refillStartLevel =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "refillStopLevel");
-
-    systemState.refillStopLevel =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "highWaterTemp");
-
-    systemState.highWaterTemp =
-        data.floatValue;
-
-    fbdo.jsonObject().get(
-        data,
-        "coolerOffTemp");
-
-    systemState.coolerOffTemp =
-        data.floatValue;
+    if(archiveCurrentOperation())
+    {
+        resetCurrentOperation();
+    }
 }
+
+//==================================================
+// Settings Synchronization
+//==================================================
+
+void FirebaseManager::readSettings()
+{
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/settings"))
+    {
+        return;
+    }
+
+    FirebaseJsonData data;
+
+    //--------------------------------------------------
+    // Grow Light
+    //--------------------------------------------------
+
+    fbdo.jsonObject().get(data, "lightOnHour");
+    systemState.lightOnHour = data.intValue;
+
+    fbdo.jsonObject().get(data, "lightOnMinute");
+    systemState.lightOnMinute = data.intValue;
+
+    fbdo.jsonObject().get(data, "lightOffHour");
+    systemState.lightOffHour = data.intValue;
+
+    fbdo.jsonObject().get(data, "lightOffMinute");
+    systemState.lightOffMinute = data.intValue;
+
+    //--------------------------------------------------
+    // pH
+    //--------------------------------------------------
+
+    fbdo.jsonObject().get(data, "minPH");
+    systemState.minPH = data.floatValue;
+
+    fbdo.jsonObject().get(data, "maxPH");
+    systemState.maxPH = data.floatValue;
+
+    //--------------------------------------------------
+    // EC
+    //--------------------------------------------------
+
+    fbdo.jsonObject().get(data, "minEC");
+    systemState.minEC = data.floatValue;
+
+    //--------------------------------------------------
+    // Reservoir
+    //--------------------------------------------------
+
+    fbdo.jsonObject().get(data, "refillStartLevel");
+    systemState.refillStartLevel = data.floatValue;
+
+    fbdo.jsonObject().get(data, "refillStopLevel");
+    systemState.refillStopLevel = data.floatValue;
+
+    //--------------------------------------------------
+    // Cooling
+    //--------------------------------------------------
+
+    fbdo.jsonObject().get(data, "highWaterTemp");
+    systemState.highWaterTemp = data.floatValue;
+
+    fbdo.jsonObject().get(data, "coolerOffTemp");
+    systemState.coolerOffTemp = data.floatValue;
+}
+//==================================================
+// Time Synchronization
+//==================================================
+void FirebaseManager::syncRTC()
+{
+
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/rtc"))
+    {
+        Serial.println(
+            "RTC SYNC FAILED");
+
+        return;
+    }
+
+    FirebaseJsonData data;
+
+    uint16_t year = 0;
+    uint8_t month = 0;
+    uint8_t day = 0;
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t second = 0;
+
+    fbdo.jsonObject().get(data, "year");
+    year = data.intValue;
+
+    fbdo.jsonObject().get(data, "month");
+    month = data.intValue;
+
+    fbdo.jsonObject().get(data, "day");
+    day = data.intValue;
+
+    fbdo.jsonObject().get(data, "hour");
+    hour = data.intValue;
+
+    fbdo.jsonObject().get(data, "minute");
+    minute = data.intValue;
+
+    fbdo.jsonObject().get(data, "second");
+    second = data.intValue;
+
+    rtcManager.setDateTime(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second);
+
+    Serial.println(
+        "RTC SYNC SUCCESS");
+}
+
+//==================================================
+// Operation Protocol
+//==================================================
 
 void FirebaseManager::readCommands()
 {
     static unsigned long lastCommandRead = 0;
 
-    if (millis() - lastCommandRead < 5000)
+    if(millis() - lastCommandRead < COMMAND_READ_INTERVAL)
+    {
         return;
+    }
 
     lastCommandRead = millis();
 
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
 
-    String path =
-        root +
-        "/commands/current";
-
-    if (!Firebase.RTDB.getJSON(
-            &fbdo,
-            path))
+    if(!Firebase.RTDB.getJSON(
+        &fbdo,
+        deviceRoot() + "/commands/current"))
     {
         return;
     }
@@ -955,48 +641,66 @@ void FirebaseManager::readCommands()
     fbdo.jsonObject().get(data, "protocolVersion");
     protocolVersion = data.intValue;
 
-    if (protocolVersion != 1)
+    //--------------------------------------------------
+    // Protocol Validation
+    //--------------------------------------------------
+
+    if(protocolVersion != 1)
     {
         rejectOperationRequest(
             requestId,
             "Unsupported protocol version.");
+
         return;
     }
 
-    if (requestTimestamp == 0)
+    if(requestTimestamp == 0)
     {
         rejectOperationRequest(
             requestId,
             "Invalid request timestamp.");
+
         return;
     }
 
     OperationType operation =
-        toOperationType(operationString);
+        toOperationType(
+            operationString);
 
-    if (operation == OperationType::NONE)
+    if(operation == OperationType::NONE)
     {
         rejectOperationRequest(
             requestId,
             "Invalid operation.");
+
         return;
     }
 
     OperationAction action =
-        toOperationAction(actionString);
+        toOperationAction(
+            actionString);
 
-    if (action == OperationAction::NONE)
+    if(action == OperationAction::NONE)
     {
         rejectOperationRequest(
             requestId,
             "Invalid action.");
+
         return;
     }
 
-    if (isDuplicateRequest(requestId))
+    //--------------------------------------------------
+    // Duplicate Request
+    //--------------------------------------------------
+
+    if(isDuplicateRequest(requestId))
     {
         return;
     }
+
+    //--------------------------------------------------
+    // Runtime Validation
+    //--------------------------------------------------
 
     String reason;
 
@@ -1012,273 +716,671 @@ void FirebaseManager::readCommands()
         return;
     }
 
+    //--------------------------------------------------
+    // Accept Request
+    //--------------------------------------------------
+
     createOperationRequest(
         requestId,
         operation,
         action,
         RequestSource::MANUAL);
 }
-
-void FirebaseManager::syncRTC()
+//==================================================
+// Operation Protocol Helpers
+//==================================================    
+bool FirebaseManager::hasActiveOperation() const
 {
-
-     String root =
-        "/devices/" +
-        String(DEVICE_ID);
-
-    String path =
-        root +
-        "/rtc";
-
-    FirebaseJsonData data;
-
-    if(!Firebase.RTDB.getJSON(
-        &fbdo,
-        path))
+    switch(systemState.operationRequest.state)
     {
-        Serial.println(
-            "RTC SYNC FAILED");
+        case RequestState::IDLE:
 
-        return;
+        case RequestState::COMPLETED:
+
+        case RequestState::FAILED:
+
+        case RequestState::REJECTED:
+
+            return false;
+
+        default:
+
+            return true;
+    }
+}
+
+bool FirebaseManager::isDuplicateRequest(uint16_t requestId) const
+{
+    return requestId ==
+           systemState.lastProcessedRequestId;
+}
+
+bool FirebaseManager::validateOperationRequest(
+    OperationType operation,
+    OperationAction action,
+    String& reason)
+{
+    //--------------------------------------------------
+    // Operation
+    //--------------------------------------------------
+
+    if(operation ==
+       OperationType::NONE)
+    {
+        reason =
+            "Invalid operation";
+
+        return false;
     }
 
-    uint16_t year;
-    uint8_t month;
-    uint8_t day;
-    uint8_t hour;
-    uint8_t minute;
-    uint8_t second;
+    //--------------------------------------------------
+    // Action
+    //--------------------------------------------------
 
-    fbdo.jsonObject().get(
-        data,
-        "year");
-    year = data.intValue;
+    if(action ==
+       OperationAction::NONE)
+    {
+        reason =
+            "Invalid action";
 
-    fbdo.jsonObject().get(
-        data,
-        "month");
-    month = data.intValue;
+        return false;
+    }
 
-    fbdo.jsonObject().get(
-        data,
-        "day");
-    day = data.intValue;
+    //--------------------------------------------------
+    // Existing Operation
+    //--------------------------------------------------
 
-    fbdo.jsonObject().get(
-        data,
-        "hour");
-    hour = data.intValue;
+    if(hasActiveOperation())
+    {
+        reason =
+            "Operation already active";
 
-    fbdo.jsonObject().get(
-        data,
-        "minute");
-    minute = data.intValue;
+        return false;
+    }
 
-    fbdo.jsonObject().get(
-        data,
-        "second");
-    second = data.intValue;
-
-    rtcManager.setDateTime(
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second);
-
-    Serial.println(
-        "RTC SYNC SUCCESS");
+    return true;
 }
+
+void FirebaseManager::createOperationRequest(
+    uint16_t requestId,
+    OperationType operation,
+    OperationAction action,
+    RequestSource source)
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    request.requestId =
+        requestId;
+
+    request.operation =
+        operation;
+
+    request.action =
+        action;
+
+    request.source =
+        source;
+
+    //--------------------------------------------------
+    // State
+    //--------------------------------------------------
+
+    request.state =
+        RequestState::ACCEPTED;
+
+    request.reason[0] =
+        '\0';
+
+    //--------------------------------------------------
+    // Timestamps
+    //--------------------------------------------------
+
+    unsigned long now =
+        millis();
+
+    request.requestTimestamp =
+        now;
+
+    request.acceptedTimestamp =
+        now;
+
+    request.startedTimestamp =
+        0;
+
+    request.completedTimestamp =
+        0;
+
+    request.lastUpdatedTimestamp =
+        now;
+
+    //--------------------------------------------------
+    // Bookkeeping
+    //--------------------------------------------------
+
+    systemState.lastProcessedRequestId =
+        requestId;
+}
+
+void FirebaseManager::rejectOperationRequest(
+    uint16_t requestId,
+    const char* reason)
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    request.requestId = requestId;
+    request.operation = OperationType::NONE;
+    request.action = OperationAction::NONE;
+    request.source = RequestSource::MANUAL;
+
+    //--------------------------------------------------
+    // State
+    //--------------------------------------------------
+
+    request.state = RequestState::REJECTED;
+
+    strncpy(
+        request.reason,
+        reason,
+        sizeof(request.reason) - 1);
+
+    request.reason[sizeof(request.reason) - 1] = '\0';
+
+    //--------------------------------------------------
+    // Timestamps
+    //--------------------------------------------------
+
+    unsigned long now = millis();
+
+    request.requestTimestamp = now;
+    request.acceptedTimestamp = 0;
+    request.startedTimestamp = 0;
+    request.completedTimestamp = now;
+    request.lastUpdatedTimestamp = now;
+
+    //--------------------------------------------------
+    // Bookkeeping
+    //--------------------------------------------------
+
+    systemState.lastProcessedRequestId = requestId;
+}
+
+
+bool FirebaseManager::writeCurrentOperation()
+{
+
+    FirebaseJson json;
+
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    json.set(
+        "requestId",
+        request.requestId);
+
+    json.set(
+        "operation",
+        operationToString(request.operation));
+
+    json.set(
+        "action",
+        actionToString(request.action));
+
+    json.set(
+        "source",
+        request.source == RequestSource::MANUAL ?
+        "MANUAL" :
+        "AUTOMATIC");
+
+    //--------------------------------------------------
+    // State
+    //--------------------------------------------------
+
+    json.set(
+        "state",
+        requestStateToString(request.state));
+
+    json.set(
+        "reason",
+        request.reason);
+
+    //--------------------------------------------------
+    // Timestamps
+    //--------------------------------------------------
+
+    json.set(
+        "requestTimestamp",
+        request.requestTimestamp);
+
+    json.set(
+        "acceptedTimestamp",
+        request.acceptedTimestamp);
+
+    json.set(
+        "startedTimestamp",
+        request.startedTimestamp);
+
+    json.set(
+        "completedTimestamp",
+        request.completedTimestamp);
+
+    json.set(
+        "lastUpdatedTimestamp",
+        request.lastUpdatedTimestamp);
+
+    //--------------------------------------------------
+    // Protocol
+    //--------------------------------------------------
+
+    json.set(
+        "protocolVersion",
+        1);
+
+    return writeJson(
+        deviceRoot() + "/operations/current",
+        json);
+}
+
+bool FirebaseManager::archiveCurrentOperation()
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    FirebaseJson json;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    json.set(
+        "requestId",
+        request.requestId);
+
+    json.set(
+        "operation",
+        operationToString(request.operation));
+
+    json.set(
+        "action",
+        actionToString(request.action));
+
+    json.set(
+        "source",
+        request.source == RequestSource::MANUAL ?
+        "MANUAL" :
+        "AUTOMATIC");
+
+    //--------------------------------------------------
+    // Result
+    //--------------------------------------------------
+
+    json.set(
+        "state",
+        requestStateToString(request.state));
+
+    json.set(
+        "reason",
+        request.reason);
+
+    //--------------------------------------------------
+    // Timeline
+    //--------------------------------------------------
+
+    json.set(
+        "requestTimestamp",
+        request.requestTimestamp);
+
+    json.set(
+        "acceptedTimestamp",
+        request.acceptedTimestamp);
+
+    json.set(
+        "startedTimestamp",
+        request.startedTimestamp);
+
+    json.set(
+        "completedTimestamp",
+        request.completedTimestamp);
+
+    json.set(
+        "lastUpdatedTimestamp",
+        request.lastUpdatedTimestamp);
+
+    //--------------------------------------------------
+    // Protocol
+    //--------------------------------------------------
+
+    json.set(
+        "protocolVersion",
+        1);
+
+    String path =
+        deviceRoot() +
+        "/operations/history/" +
+        String(request.requestId);
+
+    return writeJson(
+        path,
+        json);
+}
+
+void FirebaseManager::updateOperationState(
+    RequestState state,
+    const char* reason)
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    unsigned long now = millis();
+
+    request.state = state;
+    request.lastUpdatedTimestamp = now;
+
+    if(reason != nullptr)
+    {
+        strncpy(
+            request.reason,
+            reason,
+            sizeof(request.reason) - 1);
+
+        request.reason[
+            sizeof(request.reason) - 1] = '\0';
+    }
+
+    if(state == RequestState::RUNNING &&
+       request.startedTimestamp == 0)
+    {
+        request.startedTimestamp = now;
+    }
+
+    if(state == RequestState::COMPLETED ||
+       state == RequestState::FAILED ||
+       state == RequestState::REJECTED)
+    {
+        request.completedTimestamp = now;
+    }
+}
+
+void FirebaseManager::resetCurrentOperation()
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    request.requestId = 0;
+    request.operation = OperationType::NONE;
+    request.action = OperationAction::NONE;
+    request.source = RequestSource::NONE;
+
+    //--------------------------------------------------
+    // State
+    //--------------------------------------------------
+
+    request.state = RequestState::IDLE;
+
+    request.reason[0] = '\0';
+
+    //--------------------------------------------------
+    // Timestamps
+    //--------------------------------------------------
+
+    request.requestTimestamp = 0;
+    request.acceptedTimestamp = 0;
+    request.startedTimestamp = 0;
+    request.completedTimestamp = 0;
+    request.lastUpdatedTimestamp = 0;
+}
+
+//==================================================
+// Device Uploads
+//==================================================
 
 void FirebaseManager::writeSensors()
 {
     static unsigned long lastSensorUpload = 0;
 
-    if(millis() - lastSensorUpload < 10000)
+    if(millis() - lastSensorUpload < UPLOAD_INTERVAL)
+    {
         return;
+    }
 
     lastSensorUpload = millis();
 
-    FirebaseJson sensorJson;
+    FirebaseJson json;
 
-    sensorJson.set(
+    //--------------------------------------------------
+    // Environment
+    //--------------------------------------------------
+
+    json.set(
         "airTemperature",
         sensors.temperature);
 
-    sensorJson.set(
+    json.set(
         "humidity",
         sensors.humidity);
 
-    sensorJson.set(
+    //--------------------------------------------------
+    // Reservoir
+    //--------------------------------------------------
+
+    json.set(
         "waterTemperature",
         sensors.waterTemp);
 
-    sensorJson.set(
+    json.set(
         "waterLevel",
         sensors.waterLevel);
 
-    sensorJson.set(
+    //--------------------------------------------------
+    // Nutrient
+    //--------------------------------------------------
+
+    json.set(
         "ec",
         sensors.ec);
 
-    sensorJson.set(
+    json.set(
         "tds",
         sensors.tds);
 
-    sensorJson.set(
+    json.set(
         "ph",
         sensors.ph);
 
-    sensorJson.set(
-    "timestamp",
-    millis());
+    //--------------------------------------------------
+    // Metadata
+    //--------------------------------------------------
 
-    String root =
-    "/devices/" +
-    String(DEVICE_ID);
+    json.set(
+        "timestamp",
+        millis());
 
-    writeJson(
-        root + "/sensors",
-        sensorJson);
-        {
-            Serial.println(
-                "Sensors Uploaded");
-        }
+    if(writeJson(
+        deviceRoot() + "/sensors",
+        json))
+    {
+        Serial.println(
+            "Sensors Uploaded");
+    }
 }
 
 void FirebaseManager::writeStatus()
 {
     static unsigned long lastStatusUpload = 0;
 
-    if(millis() - lastStatusUpload < 10000)
-        return;
-
-    lastStatusUpload = millis();
-
-    FirebaseJson statusJson;
-
-    statusJson.set(
-    "currentMode",
-    (int)systemState.currentMode);
-
-    statusJson.set(
-        "manualMode",
-        systemState.manualMode);
-
-    statusJson.set(
-        "reservoirLocked",
-        systemState.reservoirLocked);
-
-    statusJson.set(
-    "safetyLock",
-    systemState.safetyLock);
-
-    statusJson.set(
-        "wifiConnected",
-        systemState.wifiConnected);
-
-    statusJson.set(
-        "firebaseConnected",
-        systemState.firebaseConnected);
-
-    String root =
-    "/devices/" +
-    String(DEVICE_ID);
-
-    writeJson(
-        root + "/status",
-        statusJson);
-        {
-            Serial.println(
-                "Status Uploaded");
-        }
-}
-
-void FirebaseManager::writeTelemetry()
-{
-    static unsigned long
-        lastTelemetryUpload = 0;
-
-    if(millis() -
-       lastTelemetryUpload <
-       10000)
+    if(millis() - lastStatusUpload < UPLOAD_INTERVAL)
     {
         return;
     }
 
-    lastTelemetryUpload =
-        millis();
+    lastStatusUpload = millis();
 
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
+    FirebaseJson json;
 
-    FirebaseJson telemetryJson;
+    //--------------------------------------------------
+    // System
+    //--------------------------------------------------
 
-    telemetryJson.set(
+    json.set(
+        "currentMode",
+        (int)systemState.currentMode);
+
+    json.set(
+        "manualMode",
+        systemState.manualMode);
+
+    //--------------------------------------------------
+    // Safety
+    //--------------------------------------------------
+
+    json.set(
+        "reservoirLocked",
+        systemState.reservoirLocked);
+
+    json.set(
+        "safetyLock",
+        systemState.safetyLock);
+
+    //--------------------------------------------------
+    // Connectivity
+    //--------------------------------------------------
+
+    json.set(
+        "wifiConnected",
+        systemState.wifiConnected);
+
+    json.set(
+        "firebaseConnected",
+        systemState.firebaseConnected);
+
+    if(writeJson(
+        deviceRoot() + "/status",
+        json))
+    {
+        Serial.println(
+            "Status Uploaded");
+    }
+}
+
+void FirebaseManager::writeTelemetry()
+{
+    static unsigned long lastTelemetryUpload = 0;
+
+    if(millis() - lastTelemetryUpload < UPLOAD_INTERVAL)
+    {
+        return;
+    }
+
+    lastTelemetryUpload = millis();
+
+    FirebaseJson json;
+
+    //--------------------------------------------------
+    // pH
+    //--------------------------------------------------
+
+    json.set(
         "phAttempts",
         systemState.phAttempts);
 
-    telemetryJson.set(
-        "ecAttempts",
-        systemState.ecAttempts);
-
-    telemetryJson.set(
+    json.set(
         "phDoseTime",
         systemState.phDoseTime);
 
-    telemetryJson.set(
+    //--------------------------------------------------
+    // EC
+    //--------------------------------------------------
+
+    json.set(
+        "ecAttempts",
+        systemState.ecAttempts);
+
+    json.set(
         "ecDoseTime",
         systemState.ecDoseTime);
 
-    writeJson(
-        root + "/telemetry",
-        telemetryJson);
+    if(writeJson(
+        deviceRoot() + "/telemetry",
+        json))
+    {
+        Serial.println(
+            "Telemetry Uploaded");
+    }
 }
 
 void FirebaseManager::writeAlerts()
 {
-    String root =
-    "/devices/" +
-    String(DEVICE_ID);
-
     static unsigned long lastAlertUpload = 0;
 
-    if(millis() - lastAlertUpload < 10000)
+    if(millis() - lastAlertUpload < UPLOAD_INTERVAL)
+    {
         return;
+    }
 
     lastAlertUpload = millis();
 
-    FirebaseJson alertJson;
+    FirebaseJson json;
 
-    alertJson.set(
+    //--------------------------------------------------
+    // Water
+    //--------------------------------------------------
+
+    json.set(
         "lowWater",
         alertState.lowWater);
 
-    alertJson.set(
+    //--------------------------------------------------
+    // Nutrient
+    //--------------------------------------------------
+
+    json.set(
         "ecLow",
         alertState.ecLow);
 
-    alertJson.set(
+    json.set(
         "phOutOfRange",
         alertState.phOutOfRange);
 
-    alertJson.set(
+    //--------------------------------------------------
+    // Temperature
+    //--------------------------------------------------
+
+    json.set(
         "waterTempOutOfRange",
         alertState.waterTempOutOfRange);
 
-    alertJson.set(
+    json.set(
         "highTemperature",
         alertState.highTemperature);
 
-    alertJson.set(
+    //--------------------------------------------------
+    // System
+    //--------------------------------------------------
+
+    json.set(
         "sensorFault",
         alertState.sensorFault);
 
-        if(writeJson(
-        root + "/alerts",
-        alertJson))
+    if(writeJson(
+        deviceRoot() + "/alerts",
+        json))
     {
         Serial.println(
             "Alerts Uploaded");
@@ -1287,133 +1389,79 @@ void FirebaseManager::writeAlerts()
 
 void FirebaseManager::writeActuators()
 {
-    String root =
-    "/devices/" +
-    String(DEVICE_ID);
-    
     ActuatorTelemetry current;
 
+    //--------------------------------------------------
+    // Read Current State
+    //--------------------------------------------------
+
     current.fogger =
-        actuatorManager.isOn(
-            FOGGER);
+        actuatorManager.isOn(FOGGER);
 
     current.growLight =
-        actuatorManager.isOn(
-            GROW_LIGHT);
+        actuatorManager.isOn(GROW_LIGHT);
 
     current.blower =
-        actuatorManager.isOn(
-            BLOWER);
+        actuatorManager.isOn(BLOWER);
 
     current.solenoid =
-        actuatorManager.isOn(
-            SOLENOID);
+        actuatorManager.isOn(SOLENOID);
 
     current.growPump =
-        actuatorManager.isOn(
-            GROW_PUMP);
+        actuatorManager.isOn(GROW_PUMP);
 
     current.bloomPump =
-        actuatorManager.isOn(
-            BLOOM_PUMP);
+        actuatorManager.isOn(BLOOM_PUMP);
 
     current.phUpPump =
-        actuatorManager.isOn(
-            PH_UP_PUMP);
+        actuatorManager.isOn(PH_UP_PUMP);
 
     current.phDownPump =
-        actuatorManager.isOn(
-            PH_DOWN_PUMP);
+        actuatorManager.isOn(PH_DOWN_PUMP);
 
     current.peltier =
-        actuatorManager.isOn(
-            PELTIER);
+        actuatorManager.isOn(PELTIER);
 
-    bool changed = false;
+    //--------------------------------------------------
+    // Detect Changes
+    //--------------------------------------------------
 
-    if(current.fogger !=
-       lastActuatorState.fogger)
-        changed = true;
-
-    if(current.growLight !=
-       lastActuatorState.growLight)
-        changed = true;
-
-    if(current.blower !=
-       lastActuatorState.blower)
-        changed = true;
-
-    if(current.solenoid !=
-       lastActuatorState.solenoid)
-        changed = true;
-
-    if(current.growPump !=
-       lastActuatorState.growPump)
-        changed = true;
-
-    if(current.bloomPump !=
-       lastActuatorState.bloomPump)
-        changed = true;
-
-    if(current.phUpPump !=
-       lastActuatorState.phUpPump)
-        changed = true;
-
-    if(current.phDownPump !=
-       lastActuatorState.phDownPump)
-        changed = true;
-
-    if(current.peltier !=
-       lastActuatorState.peltier)
-        changed = true;
+    bool changed =
+        current.fogger     != lastActuatorState.fogger     ||
+        current.growLight  != lastActuatorState.growLight  ||
+        current.blower     != lastActuatorState.blower     ||
+        current.solenoid   != lastActuatorState.solenoid   ||
+        current.growPump   != lastActuatorState.growPump   ||
+        current.bloomPump  != lastActuatorState.bloomPump  ||
+        current.phUpPump   != lastActuatorState.phUpPump   ||
+        current.phDownPump != lastActuatorState.phDownPump ||
+        current.peltier    != lastActuatorState.peltier;
 
     if(!changed)
+    {
         return;
+    }
+    FirebaseJson json;
 
-    FirebaseJson actuatorJson;
+    //--------------------------------------------------
+    // Actuator States
+    //--------------------------------------------------
 
-    actuatorJson.set(
-        "fogger",
-        current.fogger);
-
-    actuatorJson.set(
-        "growLight",
-        current.growLight);
-
-    actuatorJson.set(
-        "blower",
-        current.blower);
-
-    actuatorJson.set(
-        "solenoid",
-        current.solenoid);
-
-    actuatorJson.set(
-        "growPump",
-        current.growPump);
-
-    actuatorJson.set(
-        "bloomPump",
-        current.bloomPump);
-
-    actuatorJson.set(
-        "phUpPump",
-        current.phUpPump);
-
-    actuatorJson.set(
-        "phDownPump",
-        current.phDownPump);
-
-    actuatorJson.set(
-        "peltier",
-        current.peltier);
+    json.set("fogger", current.fogger);
+    json.set("growLight", current.growLight);
+    json.set("blower", current.blower);
+    json.set("solenoid", current.solenoid);
+    json.set("growPump", current.growPump);
+    json.set("bloomPump", current.bloomPump);
+    json.set("phUpPump", current.phUpPump);
+    json.set("phDownPump", current.phDownPump);
+    json.set("peltier", current.peltier);
 
     if(writeJson(
-        root + "/actuators",
-        actuatorJson))
+        deviceRoot() + "/actuators",
+        json))
     {
-        lastActuatorState =
-            current;
+        lastActuatorState = current;
 
         Serial.println(
             "Actuator State Changed");
@@ -1422,43 +1470,76 @@ void FirebaseManager::writeActuators()
 
 void FirebaseManager::writeDeviceInfo()
 {
-    static unsigned long
-    lastDeviceInfoUpload = 0;
+    static unsigned long lastDeviceInfoUpload = 0;
 
     if(lastDeviceInfoUpload != 0 &&
-    millis() -
-    lastDeviceInfoUpload <
-    60000)
+       millis() - lastDeviceInfoUpload < DEVICE_INFO_INTERVAL)
     {
         return;
     }
 
-    lastDeviceInfoUpload =
-        millis();
+    lastDeviceInfoUpload = millis();
 
-    String root =
-        "/devices/" +
-        String(DEVICE_ID);
+    FirebaseJson json;
 
-    FirebaseJson infoJson;
+    //--------------------------------------------------
+    // Device
+    //--------------------------------------------------
 
-    infoJson.set(
+    json.set(
         "deviceName",
         DEVICE_NAME);
 
-    infoJson.set(
+    json.set(
         "firmwareVersion",
         FIRMWARE_VERSION);
 
-    infoJson.set(
-    "online",
-    systemState.firebaseConnected);
+    //--------------------------------------------------
+    // Status
+    //--------------------------------------------------
 
-    infoJson.set(
+    json.set(
+        "online",
+        systemState.firebaseConnected);
+
+    json.set(
         "lastSeen",
         millis());
 
-    writeJson(
-        root + "/deviceInfo",
-        infoJson);
+    if(writeJson(
+        deviceRoot() + "/deviceInfo",
+        json))
+    {
+        Serial.println(
+            "Device Info Uploaded");
+    }
+}
+
+//==================================================
+// Utilities
+//==================================================
+
+bool FirebaseManager::writeJson(
+    const String& path,
+    FirebaseJson& json)
+{
+    bool success =
+        Firebase.RTDB.setJSON(
+            &fbdo,
+            path,
+            &json);
+
+    if(!success)
+    {
+        Serial.print("Firebase Write Failed: ");
+        Serial.println(path);
+        Serial.println(fbdo.errorReason());
+    }
+
+    return success;
+}
+
+String FirebaseManager::deviceRoot() const
+{
+    return "/devices/" + String(DEVICE_ID);
 }

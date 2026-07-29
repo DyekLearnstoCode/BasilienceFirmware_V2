@@ -34,10 +34,6 @@ void SensorManager::begin()
 
     waterSensor.begin();
 
-    ecSampler.begin();
-
-    phSampler.begin();
-
     analogReadResolution(12);
 
     analogSetAttenuation(ADC_11db);
@@ -45,6 +41,10 @@ void SensorManager::begin()
     pinMode(TRIG_PIN, OUTPUT);
 
     pinMode(ECHO_PIN, INPUT);
+
+    ecSampler.begin();
+
+    phSampler.begin();
 }
 
 void SensorManager::update()

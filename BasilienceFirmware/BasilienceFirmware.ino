@@ -26,6 +26,7 @@ void setup()
     automationManager.begin();
 
     debugManager.begin();
+    safetyManager.begin();
 }
 
 void loop()

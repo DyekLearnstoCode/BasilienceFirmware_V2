@@ -21,3 +21,5 @@ AutomationManager automationManager;
 DebugManager debugManager;
 
 RTCManager rtcManager;
+AlertManager alertManager;
+SafetyManager safetyManager;

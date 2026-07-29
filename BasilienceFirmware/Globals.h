@@ -9,6 +9,8 @@
 #include "FirebaseManager.h"
 #include "AutomationManager.h"
 #include "DebugManager.h"
+#include "AlertManager.h"
+#include "SafetyManager.h"
 
 // ======================================================
 // Shared Data
@@ -23,6 +25,7 @@ extern FirebaseManager firebaseManager;
 extern AutomationManager automationManager;
 extern DebugManager debugManager;
 extern RTCManager rtcManager;
-
+extern AlertManager alertManager;
+extern SafetyManager safetyManager;
 
 #endif

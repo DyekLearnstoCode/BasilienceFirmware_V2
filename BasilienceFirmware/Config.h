@@ -9,8 +9,6 @@
 
 #define OPERATION_TIMEOUT_MS 300000UL
 
-#define HIGH_AIR_TEMP 30.0f
-
 // ======================================================
 // WiFi
 // ======================================================
@@ -108,6 +106,9 @@ constexpr float COOLER_OFF_TEMP = 22.5f;
 constexpr float HIGH_AIR_TEMP = 35.0f;
 constexpr float LOW_AIR_TEMP = 28.0f;
 
+constexpr float HOT_FOG_TEMPERATURE = 30.0f;
+constexpr float COLD_FOG_TEMPERATURE = 20.0f;
+
 // ======================================================
 // EC Sampling
 // ======================================================
@@ -191,5 +192,5 @@ constexpr float REFILL_START_LEVEL = 20.0f;
 
 constexpr float REFILL_STOP_LEVEL = 75.0f;
 
-
+constexpr unsigned long MANUAL_PUMP_RUNTIME = 5000UL;
 #endif

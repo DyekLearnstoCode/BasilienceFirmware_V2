@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 
+#include "Types.h"
+
 class FirebaseManager
 {
 public:
@@ -14,8 +16,11 @@ public:
 
 private:
 
-    void initializeDatabase();
+    //==================================================
+    // Firebase
+    //==================================================
 
+    
     FirebaseData fbdo;
 
     FirebaseAuth auth;
@@ -24,13 +29,42 @@ private:
 
     FirebaseJson json;
 
+    //==================================================
+    // Runtime
+    //==================================================
+
     unsigned long lastSettingsRead = 0;
+
+    RequestState lastPublishedOperationState =
+        RequestState::IDLE;
+
+    ActuatorTelemetry lastActuatorState;
+
+    //==================================================
+    // Initialization
+    //==================================================
+
+    void initializeDatabase();
+
+    bool writeJson(
+        const String& path,
+        FirebaseJson& json);
+    
+    String deviceRoot() const;
+
+    //==================================================
+    // Synchronization
+    //==================================================
 
     void readSettings();
 
     void syncRTC();
 
     void readCommands();
+
+    //==================================================
+    // Operation Protocol
+    //==================================================
 
     bool hasActiveOperation() const;
 
@@ -53,14 +87,18 @@ private:
         const char* reason);
 
     bool writeCurrentOperation();
-    bool archiveCurrentOperation();
-    
-    bool writeJson(
-    const String& path,
-    FirebaseJson& json);
 
-    RequestState lastPublishedOperationState =
-        RequestState::IDLE;
+    bool archiveCurrentOperation();
+
+    void resetCurrentOperation();
+
+    void updateOperationState(
+    RequestState state,
+    const char* reason = nullptr);
+
+    //==================================================
+    // Uploads
+    //==================================================
 
     void writeSensors();
 
@@ -68,18 +106,11 @@ private:
 
     void writeTelemetry();
 
-    void writeDeviceInfo();
-
     void writeAlerts();
 
     void writeActuators();
-    void resetCurrentOperation();
-    void updateOperationState(
-    RequestState newState);
 
-    
-
-    ActuatorTelemetry lastActuatorState;
+    void writeDeviceInfo();
 };
 
 #endif
