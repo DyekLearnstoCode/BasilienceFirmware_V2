@@ -176,49 +176,23 @@ const char* requestStateToString(RequestState state)
 
 void FirebaseManager::begin()
 {
-    Serial.println();
-    Serial.println("Connecting WiFi...");
 
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD);
+    config.api_key = API_KEY;
 
-    while(WiFi.status() != WL_CONNECTED)
+    config.database_url = DATABASE_URL;
+
+    if (Firebase.signUp(
+            &config,
+            &auth,
+            "",
+            ""))
     {
-        delay(500);
-        Serial.print(".");
-    }
-
-    Serial.println();
-    Serial.println("WiFi Connected");
-
-    systemState.wifiConnected = true;
-
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-
-    config.api_key =
-        API_KEY;
-
-    config.database_url =
-        DATABASE_URL;
-
-    if(Firebase.signUp(
-        &config,
-        &auth,
-        "",
-        ""))
-    {
-        Serial.println(
-            "Firebase SignUp OK");
+        Serial.println("Firebase SignUp OK");
     }
     else
     {
-        Serial.print(
-            "Firebase SignUp Failed: ");
-
-        Serial.println(
-            config.signer.signupError.message.c_str());
+        Serial.print("Firebase SignUp Failed: ");
+        Serial.println(config.signer.signupError.message.c_str());
     }
 
     Firebase.begin(
@@ -226,6 +200,23 @@ void FirebaseManager::begin()
         &auth);
 
     Firebase.reconnectWiFi(true);
+
+        loadDeviceId();
+
+Serial.print("Loaded Device ID: [");
+Serial.print(deviceId);
+Serial.println("]");
+
+    if (deviceId.isEmpty())
+    {
+        provisionDevice();
+
+        if (deviceId.isEmpty())
+        {
+            Serial.println("Provisioning failed.");
+            return;
+        }
+    }
 
     systemState.firebaseConnected = true;
 
@@ -241,10 +232,8 @@ void FirebaseManager::begin()
 
     systemState.currentMode = NORMAL;
 
-        Serial.println(
-            "Firebase Started");
+    Serial.println("Firebase Started");
 }
-
 void FirebaseManager::initializeDatabase()
 {
 
@@ -422,6 +411,7 @@ void FirebaseManager::update()
     //--------------------------------------------------
 
     readCommands();
+    readActuatorCommands();
 
     //--------------------------------------------------
     // Device Uploads
@@ -538,6 +528,43 @@ void FirebaseManager::readSettings()
 
     fbdo.jsonObject().get(data, "coolerOffTemp");
     systemState.coolerOffTemp = data.floatValue;
+}
+
+
+String FirebaseManager::getMacAddress()
+{
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    mac.toUpperCase();
+    return mac;
+}
+
+void FirebaseManager::provisionDevice()
+{
+    String mac = getMacAddress();
+    String path = "/provisioning/" + mac + "/deviceToken";
+
+    Serial.println("Checking provisioning...");
+
+    FirebaseData fbdo;
+
+    if (Firebase.RTDB.getString(&fbdo, path))
+    {
+        deviceId = fbdo.stringData();
+
+        if (!deviceId.isEmpty())
+        {
+            saveDeviceId(deviceId);
+
+            Serial.print("Provisioned Device ID: ");
+            Serial.println(deviceId);
+        }
+    }
+    else
+    {
+        Serial.print("Provisioning lookup failed: ");
+        Serial.println(fbdo.errorReason());
+    }
 }
 //==================================================
 // Time Synchronization
@@ -720,12 +747,79 @@ void FirebaseManager::readCommands()
     // Accept Request
     //--------------------------------------------------
 
-    createOperationRequest(
-        requestId,
-        operation,
-        action,
-        RequestSource::MANUAL);
+    automationManager.createOperationRequest(
+    requestId,
+    operation,
+    action,
+    RequestSource::MANUAL);
 }
+
+void FirebaseManager::readActuatorCommands()
+{
+    static unsigned long lastCommandRead = 0;
+    if(millis() - lastCommandRead < COMMAND_READ_INTERVAL) return;
+    lastCommandRead = millis();
+
+    if(!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands")) return;
+    
+    FirebaseJsonData jsonData;
+    
+    // Check for manualMode flag
+    fbdo.jsonObject().get(jsonData, "manualMode");
+    if (jsonData.success)
+    {
+        systemState.manualMode = jsonData.boolValue;
+    }
+
+    
+    for (int i = 0; i < ACTUATOR_COUNT; i++)
+    {
+        Actuator a = (Actuator)i;
+        String name = getActuatorName(a);
+        
+        bool hasCommand = false;
+        bool state = false;
+        String source = "";
+        double timestamp = 0;
+
+        fbdo.jsonObject().get(jsonData, name + "/state");
+        if (jsonData.success)
+        {
+            state = jsonData.boolValue;
+            hasCommand = true;
+        }
+
+        fbdo.jsonObject().get(jsonData, name + "/source");
+        if (jsonData.success)
+        {
+            source = jsonData.stringValue;
+        }
+
+        fbdo.jsonObject().get(jsonData, name + "/timestamp");
+        if (jsonData.success)
+        {
+            timestamp = jsonData.doubleValue;
+        }
+
+        uint8_t speed = 100;
+        fbdo.jsonObject().get(jsonData, name + "/speed");
+        if (jsonData.success)
+        {
+            speed = jsonData.intValue;
+        }
+
+        if (hasCommand)
+        {
+            static double lastTimestamps[ACTUATOR_COUNT] = {0};
+            if (timestamp > lastTimestamps[i])
+            {
+                lastTimestamps[i] = timestamp;
+                actuatorManager.requestCommand(a, state, source, timestamp, speed);
+            }
+        }
+    }
+}
+
 //==================================================
 // Operation Protocol Helpers
 //==================================================    
@@ -799,71 +893,6 @@ bool FirebaseManager::validateOperationRequest(
     }
 
     return true;
-}
-
-void FirebaseManager::createOperationRequest(
-    uint16_t requestId,
-    OperationType operation,
-    OperationAction action,
-    RequestSource source)
-{
-    OperationRequest& request =
-        systemState.operationRequest;
-
-    //--------------------------------------------------
-    // Identity
-    //--------------------------------------------------
-
-    request.requestId =
-        requestId;
-
-    request.operation =
-        operation;
-
-    request.action =
-        action;
-
-    request.source =
-        source;
-
-    //--------------------------------------------------
-    // State
-    //--------------------------------------------------
-
-    request.state =
-        RequestState::ACCEPTED;
-
-    request.reason[0] =
-        '\0';
-
-    //--------------------------------------------------
-    // Timestamps
-    //--------------------------------------------------
-
-    unsigned long now =
-        millis();
-
-    request.requestTimestamp =
-        now;
-
-    request.acceptedTimestamp =
-        now;
-
-    request.startedTimestamp =
-        0;
-
-    request.completedTimestamp =
-        0;
-
-    request.lastUpdatedTimestamp =
-        now;
-
-    //--------------------------------------------------
-    // Bookkeeping
-    //--------------------------------------------------
-
-    systemState.lastProcessedRequestId =
-        requestId;
 }
 
 void FirebaseManager::rejectOperationRequest(
@@ -1389,82 +1418,43 @@ void FirebaseManager::writeAlerts()
 
 void FirebaseManager::writeActuators()
 {
-    ActuatorTelemetry current;
+    FirebaseJson json;
+    bool changed = false;
 
-    //--------------------------------------------------
-    // Read Current State
-    //--------------------------------------------------
+    static ActuatorStatus lastStatus[ACTUATOR_COUNT];
 
-    current.fogger =
-        actuatorManager.isOn(FOGGER);
+    for (int i = 0; i < ACTUATOR_COUNT; i++)
+    {
+        Actuator a = (Actuator)i;
+        ActuatorStatus current = actuatorManager.getStatus(a);
 
-    current.growLight =
-        actuatorManager.isOn(GROW_LIGHT);
+        if (current.state != lastStatus[i].state || 
+            current.running != lastStatus[i].running || 
+            current.speed != lastStatus[i].speed ||
+            current.reason != lastStatus[i].reason)
+        {
+            changed = true;
+            lastStatus[i] = current;
+        }
 
-    current.blower =
-        actuatorManager.isOn(BLOWER);
+        String name = getActuatorName(a);
+        
+        json.set(name + "/running", current.running);
+        json.set(name + "/state", (int)current.state);
+        json.set(name + "/speed", current.speed);
+        json.set(name + "/startedAt", current.startedAt);
+        json.set(name + "/source", current.source);
+        json.set(name + "/reason", current.reason);
+    }
 
-    current.solenoid =
-        actuatorManager.isOn(SOLENOID);
-
-    current.growPump =
-        actuatorManager.isOn(GROW_PUMP);
-
-    current.bloomPump =
-        actuatorManager.isOn(BLOOM_PUMP);
-
-    current.phUpPump =
-        actuatorManager.isOn(PH_UP_PUMP);
-
-    current.phDownPump =
-        actuatorManager.isOn(PH_DOWN_PUMP);
-
-    current.peltier =
-        actuatorManager.isOn(PELTIER);
-
-    //--------------------------------------------------
-    // Detect Changes
-    //--------------------------------------------------
-
-    bool changed =
-        current.fogger     != lastActuatorState.fogger     ||
-        current.growLight  != lastActuatorState.growLight  ||
-        current.blower     != lastActuatorState.blower     ||
-        current.solenoid   != lastActuatorState.solenoid   ||
-        current.growPump   != lastActuatorState.growPump   ||
-        current.bloomPump  != lastActuatorState.bloomPump  ||
-        current.phUpPump   != lastActuatorState.phUpPump   ||
-        current.phDownPump != lastActuatorState.phDownPump ||
-        current.peltier    != lastActuatorState.peltier;
-
-    if(!changed)
+    if (!changed)
     {
         return;
     }
-    FirebaseJson json;
 
-    //--------------------------------------------------
-    // Actuator States
-    //--------------------------------------------------
-
-    json.set("fogger", current.fogger);
-    json.set("growLight", current.growLight);
-    json.set("blower", current.blower);
-    json.set("solenoid", current.solenoid);
-    json.set("growPump", current.growPump);
-    json.set("bloomPump", current.bloomPump);
-    json.set("phUpPump", current.phUpPump);
-    json.set("phDownPump", current.phDownPump);
-    json.set("peltier", current.peltier);
-
-    if(writeJson(
-        deviceRoot() + "/actuators",
-        json))
+    if (writeJson(deviceRoot() + "/actuatorStatus", json))
     {
-        lastActuatorState = current;
-
-        Serial.println(
-            "Actuator State Changed");
+        Serial.println("Actuator Status Uploaded");
     }
 }
 
@@ -1539,7 +1529,35 @@ bool FirebaseManager::writeJson(
     return success;
 }
 
+void FirebaseManager::loadDeviceId()
+{
+    preferences.begin("device", false);
+
+    deviceId = preferences.getString("device_id", "");
+
+    preferences.end();
+}
+
+bool FirebaseManager::saveDeviceId(const String& id)
+{
+    preferences.begin("device", false);
+
+    preferences.putString("device_id", id);
+
+    preferences.end();
+
+    deviceId = id;
+
+    return true;
+}
+
+const String& FirebaseManager::getDeviceId() const
+{
+    return deviceId;
+}
+
 String FirebaseManager::deviceRoot() const
 {
-    return "/devices/" + String(DEVICE_ID);
+    return "/devices/" + deviceId;
 }
+

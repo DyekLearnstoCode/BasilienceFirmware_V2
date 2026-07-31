@@ -3,6 +3,7 @@
 
 #include "Types.h"
 #include "RTCManager.h"
+#include "WiFiManager.h"
 
 #include "ActuatorManager.h"
 #include "SensorManager.h"
@@ -27,5 +28,6 @@ extern DebugManager debugManager;
 extern RTCManager rtcManager;
 extern AlertManager alertManager;
 extern SafetyManager safetyManager;
+extern WiFiManager wifiManager;
 
 #endif

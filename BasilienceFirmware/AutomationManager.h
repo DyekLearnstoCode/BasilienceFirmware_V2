@@ -9,6 +9,12 @@ public:
     void begin();
     void update();
 
+        void createOperationRequest(
+        uint16_t requestId,
+        OperationType operation,
+        OperationAction action,
+        RequestSource source);
+
 private:
 
     //==================================================
@@ -45,8 +51,6 @@ private:
     const char* getStateName(
         SystemMode mode);
 
-
-
     //==================================================
     // Manual Operations
     //==================================================
@@ -74,6 +78,8 @@ private:
     bool validateNormalOperation();
 
     void updateCooling();
+
+    void handleCanopyClimate();
 
     bool processRefillRequest();
 

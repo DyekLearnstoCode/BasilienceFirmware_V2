@@ -457,9 +457,9 @@ void AutomationManager::changeState(SystemMode newMode)
 //sensor stabilization
 void AutomationManager::handleSensorStabilization()
 {
-    actuatorManager.turnOff(FOGGER);
+    actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
 
-    actuatorManager.turnOff(BLOWER);
+    actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
     if(millis() -
        systemState.stateStartTime >=
@@ -482,15 +482,15 @@ void AutomationManager::handleStartup()
     {
         case STARTUP_FOG_ON:
         {
-            actuatorManager.turnOn(FOGGER);
-            actuatorManager.turnOn(BLOWER);
+            actuatorManager.requestCommand(FOGGER, true, "automatic", millis());
+            actuatorManager.requestCommand(BLOWER, true, "automatic", millis());
 
             if(millis() -
                systemState.stateStartTime >=
                STARTUP_ON_TIME)
             {
-                actuatorManager.turnOff(FOGGER);
-                actuatorManager.turnOff(BLOWER);
+                actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+                actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
                 startupPhase =
                     STARTUP_FOG_OFF;
@@ -504,8 +504,8 @@ void AutomationManager::handleStartup()
 
         case STARTUP_FOG_OFF:
         {
-            actuatorManager.turnOff(FOGGER);
-            actuatorManager.turnOff(BLOWER);
+            actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+            actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
             if(millis() -
                systemState.stateStartTime >=
@@ -536,6 +536,8 @@ void AutomationManager::handleNormal()
 
     updateCooling();
 
+    handleCanopyClimate();
+
     if(processRefillRequest())
     {
         return;
@@ -562,8 +564,8 @@ bool AutomationManager::validateNormalOperation()
 
     if(result != SafetyResult::SAFE)
     {
-        actuatorManager.turnOff(FOGGER);
-        actuatorManager.turnOff(BLOWER);
+        actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+        actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
         Serial.println(
             safetyManager.getSafetyReason(result));
@@ -582,8 +584,8 @@ void AutomationManager::updateCooling()
 
     if(result != SafetyResult::SAFE)
     {
-        actuatorManager.turnOff(
-            PELTIER);
+        actuatorManager.requestCommand(
+            PELTIER, false, "automatic", millis());
 
         return;
     }
@@ -591,15 +593,15 @@ void AutomationManager::updateCooling()
     if(sensors.waterTemp >
        systemState.highWaterTemp)
     {
-        actuatorManager.turnOn(
-            PELTIER);
+        actuatorManager.requestCommand(
+            PELTIER, true, "automatic", millis());
     }
 
     if(sensors.waterTemp <
        systemState.coolerOffTemp)
     {
-        actuatorManager.turnOff(
-            PELTIER);
+        actuatorManager.requestCommand(
+            PELTIER, false, "automatic", millis());
     }
 }
 
@@ -804,11 +806,11 @@ void AutomationManager::processFogCycle()
 
     if(fogCycleOn)
     {
-        actuatorManager.turnOn(
-            FOGGER);
+        actuatorManager.requestCommand(
+            FOGGER, true, "automatic", millis());
 
-        actuatorManager.turnOn(
-            BLOWER);
+        actuatorManager.requestCommand(
+            BLOWER, true, "automatic", millis());
 
         if(elapsed >= fogOnTime)
         {
@@ -820,11 +822,11 @@ void AutomationManager::processFogCycle()
     }
     else
     {
-        actuatorManager.turnOff(
-            FOGGER);
+        actuatorManager.requestCommand(
+            FOGGER, false, "automatic", millis());
 
-        actuatorManager.turnOff(
-            BLOWER);
+        actuatorManager.requestCommand(
+            BLOWER, false, "automatic", millis());
 
         if(elapsed >= fogOffTime)
         {
@@ -848,13 +850,13 @@ void AutomationManager::updateGrowLightSchedule()
 
     if(lightEnabled)
     {
-        actuatorManager.turnOn(
-            GROW_LIGHT);
+        actuatorManager.requestCommand(
+            GROW_LIGHT, true, "automatic", millis());
     }
     else
     {
-        actuatorManager.turnOff(
-            GROW_LIGHT);
+        actuatorManager.requestCommand(
+            GROW_LIGHT, false, "automatic", millis());
     }
 }
 //Get Current Time in Minutes
@@ -912,14 +914,14 @@ void AutomationManager::handleRefilling()
 
     systemState.reservoirLocked = true;
 
-    actuatorManager.turnOn(
-        SOLENOID);
+    actuatorManager.requestCommand(
+        SOLENOID, true, "automatic", millis());
 
     if(sensors.waterLevel >=
        systemState.refillStopLevel)
     {
-        actuatorManager.turnOff(
-            SOLENOID);
+        actuatorManager.requestCommand(
+            SOLENOID, false, "automatic", millis());
 
         systemState.reservoirLocked = false;
 
@@ -949,13 +951,13 @@ void AutomationManager::handleDosingPH()
 
     if(systemState.phDirection == PH_UP)
     {
-        actuatorManager.turnOn(PH_UP_PUMP);
-        actuatorManager.turnOff(PH_DOWN_PUMP);
+        actuatorManager.requestCommand(PH_UP_PUMP, true, "automatic", millis());
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
     }
     else
     {
-        actuatorManager.turnOn(PH_DOWN_PUMP);
-        actuatorManager.turnOff(PH_UP_PUMP);
+        actuatorManager.requestCommand(PH_DOWN_PUMP, true, "automatic", millis());
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
     }
 
     bool stopDosing = false;
@@ -988,8 +990,8 @@ void AutomationManager::handleDosingPH()
 
     if(stopDosing)
     {
-        actuatorManager.turnOff(PH_UP_PUMP);
-        actuatorManager.turnOff(PH_DOWN_PUMP);
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
 
         changeState(STABILIZING_PH);
     }
@@ -1009,11 +1011,11 @@ void AutomationManager::handleStabilizingPH()
         return;
     }
 
-    actuatorManager.turnOff(
-        PH_UP_PUMP);
+    actuatorManager.requestCommand(
+        PH_UP_PUMP, false, "automatic", millis());
 
-    actuatorManager.turnOff(
-        PH_DOWN_PUMP);
+    actuatorManager.requestCommand(
+        PH_DOWN_PUMP, false, "automatic", millis());
 
     if(millis() -
        systemState.stateStartTime >=
@@ -1073,8 +1075,8 @@ void AutomationManager::handleDosingEC()
 
     systemState.reservoirLocked = true;
 
-    actuatorManager.turnOn(GROW_PUMP);
-    actuatorManager.turnOn(BLOOM_PUMP);
+    actuatorManager.requestCommand(GROW_PUMP, true, "automatic", millis());
+    actuatorManager.requestCommand(BLOOM_PUMP, true, "automatic", millis());
 
     bool stopDosing = false;
 
@@ -1106,8 +1108,8 @@ void AutomationManager::handleDosingEC()
 
     if(stopDosing)
     {
-        actuatorManager.turnOff(GROW_PUMP);
-        actuatorManager.turnOff(BLOOM_PUMP);
+        actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
 
         changeState(STABILIZING_EC);
     }
@@ -1127,11 +1129,11 @@ void AutomationManager::handleStabilizingEC()
         return;
     }
 
-    actuatorManager.turnOff(
-        GROW_PUMP);
+    actuatorManager.requestCommand(
+        GROW_PUMP, false, "automatic", millis());
 
-    actuatorManager.turnOff(
-        BLOOM_PUMP);
+    actuatorManager.requestCommand(
+        BLOOM_PUMP, false, "automatic", millis());
 
     if(millis() -
        systemState.stateStartTime >=
@@ -1253,4 +1255,107 @@ bool AutomationManager::abortCurrentOperation(
         SAFETY_LOCK);
 
     return true;
+}
+
+void AutomationManager::createOperationRequest(
+    uint16_t requestId,
+    OperationType operation,
+    OperationAction action,
+    RequestSource source)
+{
+    OperationRequest& request =
+        systemState.operationRequest;
+
+    //--------------------------------------------------
+    // Identity
+    //--------------------------------------------------
+
+    request.requestId =
+        requestId;
+
+    request.operation =
+        operation;
+
+    request.action =
+        action;
+
+    request.source =
+        source;
+
+    //--------------------------------------------------
+    // State
+    //--------------------------------------------------
+
+    request.state =
+        RequestState::ACCEPTED;
+
+    request.reason[0] =
+        '\0';
+
+    //--------------------------------------------------
+    // Timestamps
+    //--------------------------------------------------
+
+    unsigned long now =
+        millis();
+
+    request.requestTimestamp =
+        now;
+
+    request.acceptedTimestamp =
+        now;
+
+    request.startedTimestamp =
+        0;
+
+    request.completedTimestamp =
+        0;
+
+    request.lastUpdatedTimestamp =
+        now;
+
+    //--------------------------------------------------
+    // Bookkeeping
+    //--------------------------------------------------
+
+    systemState.lastProcessedRequestId =
+        requestId;
+}
+//Canopy Climate Control
+void AutomationManager::handleCanopyClimate()
+{
+    float temp = sensors.temperature;
+    float humidity = sensors.humidity;
+
+    uint8_t speed = 50; // Default minimum 50%
+
+    // If sensors are failing, default to 100% for safety
+    if (isnan(temp) || isnan(humidity))
+    {
+        speed = 100;
+    }
+    else
+    {
+        if (temp <= 22.0f)
+        {
+            speed = 50;
+        }
+        else if (temp >= 30.0f)
+        {
+            speed = 100;
+        }
+        else
+        {
+            // Linearly scale from 50% at 22C to 100% at 30C
+            speed = 50 + (uint8_t)((temp - 22.0f) * 6.25f);
+        }
+
+        // Override for high humidity
+        if (humidity > MAX_HUMIDITY)
+        {
+            speed = 100;
+        }
+    }
+
+    actuatorManager.requestCommand(CANOPY_FAN, true, "automatic", millis(), speed);
 }

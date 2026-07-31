@@ -23,3 +23,4 @@ DebugManager debugManager;
 RTCManager rtcManager;
 AlertManager alertManager;
 SafetyManager safetyManager;
+WiFiManager wifiManager;

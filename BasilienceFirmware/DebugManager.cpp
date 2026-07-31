@@ -218,8 +218,8 @@ void DebugManager::printActuators()
         actuatorManager.isOn(PH_DOWN_PUMP));
 
     printBool(
-        "Water Heater",
-        actuatorManager.isOn(WATER_HEATER));
+        "Canopy Fan",
+        actuatorManager.isOn(CANOPY_FAN));
 
     printBool(
         "Peltier",

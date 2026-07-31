@@ -3,6 +3,7 @@
 
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
+#include <Preferences.h>
 
 #include "Types.h"
 
@@ -28,6 +29,8 @@ private:
     FirebaseConfig config;
 
     FirebaseJson json;
+    Preferences preferences;
+    String deviceId;
 
     //==================================================
     // Runtime
@@ -37,8 +40,6 @@ private:
 
     RequestState lastPublishedOperationState =
         RequestState::IDLE;
-
-    ActuatorTelemetry lastActuatorState;
 
     //==================================================
     // Initialization
@@ -51,6 +52,9 @@ private:
         FirebaseJson& json);
     
     String deviceRoot() const;
+    void loadDeviceId();
+    bool saveDeviceId(const String& id);
+    const String& getDeviceId() const;
 
     //==================================================
     // Synchronization
@@ -61,6 +65,10 @@ private:
     void syncRTC();
 
     void readCommands();
+    void readActuatorCommands();
+
+    void provisionDevice();
+    String getMacAddress();
 
     //==================================================
     // Operation Protocol
@@ -75,12 +83,6 @@ private:
         OperationType operation,
         OperationAction action,
         String& reason);
-
-    void createOperationRequest(
-        uint16_t requestId,
-        OperationType operation,
-        OperationAction action,
-        RequestSource source);
 
     void rejectOperationRequest(
         uint16_t requestId,

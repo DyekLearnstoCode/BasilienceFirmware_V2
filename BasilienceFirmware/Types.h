@@ -12,22 +12,22 @@
 
 struct SensorData
 {
-    float temperature = 0;
-    float humidity = 0;
-    float waterTemp = 0;
+    float temperature = NAN;
+    float humidity    = NAN;
+    float waterTemp   = NAN;
 
     // Electrical Conductivity
-    float ec = 0;
-    float tds = 0;
-    float ecVoltage = 0;
-    int ecRaw = 0;
+    float ec        = NAN;
+    float tds       = NAN;
+    float ecVoltage = NAN;
+    int   ecRaw     = 0;
 
     // pH
-    float ph = 0;
-    int phMilliVolts = 0;
+    float ph          = NAN;
+    int   phMilliVolts = 0;
 
     // Water Level
-    float waterLevel = 0;
+    float waterLevel = 0; // 0 is valid (empty tank) — kept as-is
 };
 
 
@@ -96,10 +96,58 @@ enum Actuator
     PH_DOWN_PUMP,
 
     // Temperature
-    WATER_HEATER,
+    CANOPY_FAN,
     PELTIER,
 
     ACTUATOR_COUNT
+};
+
+inline const char* getActuatorName(Actuator a)
+{
+    switch(a)
+    {
+        case FOGGER: return "fogger";
+        case GROW_LIGHT: return "growLight";
+        case BLOWER: return "blower";
+        case SOLENOID: return "solenoid";
+        case GROW_PUMP: return "growPump";
+        case BLOOM_PUMP: return "bloomPump";
+        case PH_UP_PUMP: return "phUpPump";
+        case PH_DOWN_PUMP: return "phDownPump";
+        case CANOPY_FAN: return "canopyFan";
+        case PELTIER: return "peltier";
+        default: return "unknown";
+    }
+}
+
+enum class ActuatorCommandState
+{
+    OFF,
+    COMMAND_RECEIVED,
+    VALIDATING,
+    REJECTED,
+    ACTIVATING,
+    RUNNING,
+    STOPPING
+};
+
+struct ActuatorCommand
+{
+    bool isPending = false;
+    bool targetState = false;
+    uint8_t speed = 100;
+    String source = "";
+    uint32_t timestamp = 0;
+};
+
+struct ActuatorStatus
+{
+    ActuatorCommandState state = ActuatorCommandState::OFF;
+    bool running = false;
+    uint8_t speed = 100;
+    uint32_t startedAt = 0;
+    String source = "";
+    String reason = "";
 };
 
 //==================================================
@@ -172,9 +220,10 @@ struct OperationRequest
     uint16_t requestId = 0;
 
     OperationType operation = OperationType::NONE;
-    OperationAction action = OperationAction::NONE;
     RequestSource source = RequestSource::NONE;
+    OperationAction action = OperationAction::NONE;
     RequestState state = RequestState::IDLE;
+
 
     char reason[64] = "";
 
@@ -183,6 +232,15 @@ struct OperationRequest
     unsigned long startedTimestamp = 0;
     unsigned long completedTimestamp = 0;
     unsigned long lastUpdatedTimestamp = 0;
+    
+};
+
+
+enum class OperationSource
+{
+    NONE,
+    MANUAL,
+    AUTOMATIC
 };
 
 //==================================================

@@ -28,10 +28,11 @@ AnalogSampler::AnalogSampler(
 
 void AnalogSampler::begin()
 {
-    memset(
-        samples,
-        0,
-        sizeof(samples));
+    memset(samples, 0, sizeof(samples));
+
+    sampleIndex = 0;
+    bufferFilled = false;
+    lastSampleTime = 0;
 }
 
 void AnalogSampler::update()

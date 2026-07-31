@@ -2,10 +2,7 @@
 #define CONFIG_H
 
 #include <Arduino.h>
-
-#define DEVICE_ID "basilience_001"
-#define FIRMWARE_VERSION "2.0.0"
-#define DEVICE_NAME "Basilience Controller"
+#include "Version.h"
 
 #define OPERATION_TIMEOUT_MS 300000UL
 
@@ -32,59 +29,52 @@
 // SSR Outputs
 // ======================================================
 
-#define FOGGER_PIN 26
-#define GROW_LIGHT_PIN 25
+constexpr uint8_t FOGGER_PIN = 26;
+constexpr uint8_t GROW_LIGHT_PIN = 25;
 
 // ======================================================
 // MOSFET Outputs
 // ======================================================
 
-#define BLOWER_PIN 27
-#define SOLENOID_PIN 15
+constexpr uint8_t BLOWER_PIN = 27;
+constexpr uint8_t SOLENOID_PIN = 15;
 
 // ======================================================
 // Peristaltic Pumps
 // ======================================================
 
-#define GROW_PUMP_PIN 32  // Temporary
-#define BLOOM_PUMP_PIN 33 // Temporary
+constexpr uint8_t GROW_PUMP_PIN = 32;
+constexpr uint8_t BLOOM_PUMP_PIN = 33;
 
-#define PH_UP_PUMP_PIN 14
-#define PH_DOWN_PUMP_PIN 12
+constexpr uint8_t PH_UP_PUMP_PIN = 14;
+constexpr uint8_t PH_DOWN_PUMP_PIN = 12;
 
 // ======================================================
 // Temperature
 // ======================================================
 
-#define WATER_HEATER_PIN 17
-#define PELTIER_PIN 16
+constexpr uint8_t CANOPY_FAN_PIN = 17;
+constexpr uint8_t PELTIER_PIN = 16;
 
 // ======================================================
 // Sensor Inputs
 // ======================================================
 
-#define DHT_PIN 4
+constexpr uint8_t DHT_PIN = 4;
 #define DHTTYPE DHT22
 
-#define WATER_TEMP_PIN 5
+constexpr uint8_t WATER_TEMP_PIN = 5;
 
-#define EC_PIN 34
+constexpr uint8_t EC_PIN = 34;
 
-#define PH_SENSOR_PIN 35
+constexpr uint8_t PH_SENSOR_PIN = 35;
 
-#define TRIG_PIN 18
-#define ECHO_PIN 19
+constexpr uint8_t TRIG_PIN = 18;
+constexpr uint8_t ECHO_PIN = 19;
 
-#define RTC_SDA_PIN 21
-#define RTC_SCL_PIN 22
+constexpr uint8_t RTC_SDA_PIN = 21;
+constexpr uint8_t RTC_SCL_PIN = 22;
 
-// ======================================================
-// EC Sensor Calibration
-// ======================================================
-
-constexpr float ADC_REFERENCE = 3.3f;
-constexpr int ADC_RESOLUTION = 4095;
-constexpr float EC_FACTOR = 1.106f;
 
 // ======================================================
 // Sensor Thresholds
@@ -113,22 +103,15 @@ constexpr float COLD_FOG_TEMPERATURE = 20.0f;
 // EC Sampling
 // ======================================================
 
-constexpr uint8_t EC_SAMPLE_COUNT = 60;
+constexpr uint8_t EC_SAMPLE_COUNT = 61;
 constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
 
 // ======================================================
 // pH Sampling
 // ======================================================
 
-constexpr uint8_t PH_SAMPLE_COUNT = 50;
+constexpr uint8_t PH_SAMPLE_COUNT = 51;
 constexpr unsigned long PH_SAMPLE_INTERVAL = 20;
-
-// ======================================================
-// pH Calibration
-// ======================================================
-
-constexpr float PH_SLOPE = -0.00571715f;
-constexpr float PH_OFFSET = 21.535f;
 
 // ======================================================
 // Timing
@@ -181,7 +164,7 @@ constexpr int OUT_OF_RANGE_REQUIRED = 3;
 // Debug
 // ======================================================
 
-constexpr bool DEBUG_ENABLED = true;
+constexpr bool DEBUG_ENABLED = false;
 constexpr unsigned long DEBUG_INTERVAL = 1000UL;
 
 // ======================================================

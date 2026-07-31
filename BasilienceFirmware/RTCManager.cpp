@@ -26,6 +26,11 @@ void RTCManager::update()
 {
 }
 
+bool RTCManager::isConnected()
+{
+    return connected;
+}
+
 uint8_t RTCManager::getHour()
 {
     if(!connected)

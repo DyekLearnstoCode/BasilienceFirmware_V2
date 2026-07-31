@@ -14,14 +14,18 @@
 
 void setup()
 {
-    Serial.begin(115200);
 
+    Serial.begin(115200);
+    
+    wifiManager.begin();
+    Serial.print("ESP32 MAC: ");
+Serial.println(WiFi.macAddress());
+    firebaseManager.begin();
     actuatorManager.begin();
 
     sensorManager.begin();
     rtcManager.begin();
 
-    firebaseManager.begin();
 
     automationManager.begin();
 
@@ -35,8 +39,10 @@ void loop()
     rtcManager.update();
 
     automationManager.update();
+    actuatorManager.update();
 
     firebaseManager.update();
 
     debugManager.update();
+    wifiManager.update();
 }
