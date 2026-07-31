@@ -6,6 +6,7 @@ namespace
 {
 
 constexpr unsigned long COMMAND_READ_INTERVAL  = 5000;
+constexpr unsigned long MOCK_READ_INTERVAL     = 2000;
 constexpr unsigned long SETTINGS_READ_INTERVAL = 60000;
 constexpr unsigned long UPLOAD_INTERVAL        = 10000;
 constexpr unsigned long DEVICE_INFO_INTERVAL   = 60000;
@@ -412,6 +413,7 @@ void FirebaseManager::update()
 
     readCommands();
     readActuatorCommands();
+    readMockSensors();
 
     //--------------------------------------------------
     // Device Uploads
@@ -754,6 +756,7 @@ void FirebaseManager::readCommands()
     RequestSource::MANUAL);
 }
 
+
 void FirebaseManager::readActuatorCommands()
 {
     static unsigned long lastCommandRead = 0;
@@ -816,6 +819,32 @@ void FirebaseManager::readActuatorCommands()
                 lastTimestamps[i] = timestamp;
                 actuatorManager.requestCommand(a, state, source, timestamp, speed);
             }
+        }
+    }
+    
+    // Check for wifiConfig
+    fbdo.jsonObject().get(jsonData, "wifiConfig/ssid");
+    if (jsonData.success)
+    {
+        String newSsid = jsonData.stringValue;
+        fbdo.jsonObject().get(jsonData, "wifiConfig/password");
+        String newPassword = jsonData.success ? jsonData.stringValue : "";
+
+        if (!newSsid.isEmpty())
+        {
+            Serial.println("Received new Wi-Fi credentials via Firebase.");
+            Serial.print("SSID: ");
+            Serial.println(newSsid);
+
+            // Save credentials via WiFiManager
+            wifiManager.saveCredentials(newSsid, newPassword);
+
+            // Delete the command node to acknowledge receipt
+            Firebase.RTDB.deleteNode(&fbdo, deviceRoot() + "/commands/wifiConfig");
+
+            // Trigger a reconnection to the new network
+            Serial.println("Reconnecting to new Wi-Fi network...");
+            wifiManager.reconnect();
         }
     }
 }
@@ -1197,41 +1226,23 @@ void FirebaseManager::writeSensors()
     // Environment
     //--------------------------------------------------
 
-    json.set(
-        "airTemperature",
-        sensors.temperature);
-
-    json.set(
-        "humidity",
-        sensors.humidity);
+    if (!isnan(sensors.temperature)) json.set("airTemperature", sensors.temperature);
+    if (!isnan(sensors.humidity)) json.set("humidity", sensors.humidity);
 
     //--------------------------------------------------
     // Reservoir
     //--------------------------------------------------
 
-    json.set(
-        "waterTemperature",
-        sensors.waterTemp);
-
-    json.set(
-        "waterLevel",
-        sensors.waterLevel);
+    if (!isnan(sensors.waterTemp)) json.set("waterTemperature", sensors.waterTemp);
+    json.set("waterLevel", sensors.waterLevel); // waterLevel is clamped, never NaN
 
     //--------------------------------------------------
     // Nutrient
     //--------------------------------------------------
 
-    json.set(
-        "ec",
-        sensors.ec);
-
-    json.set(
-        "tds",
-        sensors.tds);
-
-    json.set(
-        "ph",
-        sensors.ph);
+    if (!isnan(sensors.ec)) json.set("ec", sensors.ec);
+    if (!isnan(sensors.tds)) json.set("tds", sensors.tds);
+    if (!isnan(sensors.ph)) json.set("ph", sensors.ph);
 
     //--------------------------------------------------
     // Metadata
@@ -1561,3 +1572,74 @@ String FirebaseManager::deviceRoot() const
     return "/devices/" + deviceId;
 }
 
+
+
+//==================================================
+// Remote Mocking
+//==================================================
+
+void FirebaseManager::readMockSensors()
+{
+    static unsigned long lastMockRead = 0;
+    if(millis() - lastMockRead < MOCK_READ_INTERVAL) return;
+    lastMockRead = millis();
+
+    if(!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/mockSensors")) {
+        systemState.mockSensorsEnabled = false;
+        return;
+    }
+
+    FirebaseJsonData data;
+    FirebaseJson& json = fbdo.jsonObject();
+
+    json.get(data, "enabled");
+    if (data.success) {
+        systemState.mockSensorsEnabled = data.boolValue;
+    } else {
+        systemState.mockSensorsEnabled = false;
+    }
+
+    if (!systemState.mockSensorsEnabled) return;
+
+    // Air Temperature
+    json.get(data, "airTemperature");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.temperature = data.floatValue;
+    else 
+        systemState.mockSensors.temperature = NAN;
+
+    // Humidity
+    json.get(data, "humidity");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.humidity = data.floatValue;
+    else 
+        systemState.mockSensors.humidity = NAN;
+
+    // Water Temperature
+    json.get(data, "waterTemperature");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.waterTemp = data.floatValue;
+    else 
+        systemState.mockSensors.waterTemp = NAN;
+
+    // Water Level
+    json.get(data, "waterLevel");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.waterLevel = data.floatValue;
+    else 
+        systemState.mockSensors.waterLevel = NAN;
+
+    // pH
+    json.get(data, "ph");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.ph = data.floatValue;
+    else 
+        systemState.mockSensors.ph = NAN;
+
+    // EC
+    json.get(data, "ec");
+    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
+        systemState.mockSensors.ec = data.floatValue;
+    else 
+        systemState.mockSensors.ec = NAN;
+}

@@ -278,6 +278,10 @@ struct SystemState
 
     bool resetSafetyLock = false;
 
+    // Remote Mocking
+    bool mockSensorsEnabled = false;
+    SensorData mockSensors;
+
     //==================================================
     // Operations
     //==================================================

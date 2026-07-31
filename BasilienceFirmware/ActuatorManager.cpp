@@ -68,7 +68,7 @@ void ActuatorManager::turnOff(Actuator actuator)
 {
     if (actuator == CANOPY_FAN)
     {
-        ledcWrite(getPin(actuator), 0);
+        ledcWrite(0, 0); // Channel 0
     }
     else
     {
@@ -260,7 +260,7 @@ void ActuatorManager::update()
                     if (a == CANOPY_FAN)
                     {
                         uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
-                        ledcWrite(getPin(a), pwmValue);
+                        ledcWrite(0, pwmValue); // Channel 0
                     }
                 }
                 break;

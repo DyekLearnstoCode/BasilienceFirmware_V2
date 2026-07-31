@@ -266,7 +266,7 @@ void AutomationManager::processPHDownOperation()
 void AutomationManager::processResetSafetyOperation()
 {
     if(systemState.operationRequest.action !=
-       OperationAction::START)
+       OperationAction::EXECUTE && systemState.operationRequest.action != OperationAction::START)
     {
         return;
     }
@@ -277,6 +277,8 @@ void AutomationManager::processResetSafetyOperation()
         changeState(
             STARTUP);
     }
+
+    completeCurrentOperation();
 }
 
 //System Validation

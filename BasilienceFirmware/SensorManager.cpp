@@ -63,6 +63,19 @@ void SensorManager::update()
     readEC();
 
     readPH();
+
+    //--------------------------------------------------
+    // Remote Mocking Override
+    //--------------------------------------------------
+    if (systemState.mockSensorsEnabled)
+    {
+        if (!isnan(systemState.mockSensors.temperature)) sensors.temperature = systemState.mockSensors.temperature;
+        if (!isnan(systemState.mockSensors.humidity))    sensors.humidity = systemState.mockSensors.humidity;
+        if (!isnan(systemState.mockSensors.waterTemp))   sensors.waterTemp = systemState.mockSensors.waterTemp;
+        if (!isnan(systemState.mockSensors.waterLevel))  sensors.waterLevel = systemState.mockSensors.waterLevel;
+        if (!isnan(systemState.mockSensors.ph))          sensors.ph = systemState.mockSensors.ph;
+        if (!isnan(systemState.mockSensors.ec))          sensors.ec = systemState.mockSensors.ec;
+    }
 }
 
 float SensorManager::measureDistanceCM()

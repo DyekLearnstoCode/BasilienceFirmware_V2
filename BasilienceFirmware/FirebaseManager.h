@@ -66,6 +66,7 @@ private:
 
     void readCommands();
     void readActuatorCommands();
+    void readMockSensors();
 
     void provisionDevice();
     String getMacAddress();
