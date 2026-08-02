@@ -58,6 +58,7 @@ bool WiFiManager::connect()
             Serial.println("WiFi Connection Timeout");
 
             systemState.wifiConnected = false;
+            startAP(); // Start AP mode for in-app configuration
 
             return false;
         }
@@ -110,6 +111,30 @@ bool WiFiManager::saveCredentials(
     this->password = password;
 
     return true;
+}
+
+bool WiFiManager::updateCredentialsSafely(
+    const String& newSsid,
+    const String& newPassword)
+{
+    String oldSsid = this->ssid;
+    String oldPassword = this->password;
+
+    Serial.println("Testing new Wi-Fi credentials...");
+    saveCredentials(newSsid, newPassword);
+
+    if (reconnect())
+    {
+        Serial.println("Successfully connected to new network.");
+        return true;
+    }
+    else
+    {
+        Serial.println("Failed to connect to new network. Restoring previous credentials.");
+        saveCredentials(oldSsid, oldPassword);
+        reconnect();
+        return false;
+    }
 }
 
 void WiFiManager::clearCredentials()
@@ -166,6 +191,13 @@ bool WiFiManager::loadCredentials()
 
 void WiFiManager::update()
 {
+    if (isAPMode)
+    {
+        dnsServer.processNextRequest();
+        server.handleClient();
+        return;
+    }
+
     systemState.wifiConnected =
         WiFi.status() == WL_CONNECTED;
 
@@ -189,3 +221,65 @@ void WiFiManager::update()
 
     reconnect();
 }
+
+void WiFiManager::startAP()
+{
+    if (isAPMode) return;
+    
+    Serial.println("Starting Access Point: Basilience-Setup");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Basilience-Setup"); // Open network for easy setup
+
+    delay(500); // Wait for AP to initialize
+    
+    // Start DNS server to redirect all traffic to ESP32 IP
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    
+    setupAPServer();
+    server.begin();
+    
+    isAPMode = true;
+    Serial.print("AP IP Address: ");
+    Serial.println(WiFi.softAPIP());
+}
+
+void WiFiManager::stopAP()
+{
+    if (!isAPMode) return;
+    
+    Serial.println("Stopping Access Point...");
+    dnsServer.stop();
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    isAPMode = false;
+}
+
+void WiFiManager::setupAPServer()
+{
+    server.on("/status", HTTP_GET, [this]() {
+        server.send(200, "application/json", "{\"status\":\"setup_mode\"}");
+    });
+
+    server.on("/setup", HTTP_POST, [this]() {
+        if (!server.hasArg("ssid") || !server.hasArg("password")) {
+            server.send(400, "text/plain", "Missing SSID or Password");
+            return;
+        }
+        
+        String newSsid = server.arg("ssid");
+        String newPass = server.arg("password");
+        
+        Serial.println("Received new WiFi credentials from App.");
+        server.send(200, "text/plain", "Credentials received. Rebooting...");
+        
+        saveCredentials(newSsid, newPass);
+        
+        delay(1000);
+        ESP.restart(); // Safest way to apply new WiFi credentials cleanly
+    });
+
+    // Captive portal redirect for any unknown requests
+    server.onNotFound([this]() {
+        server.send(200, "text/plain", "Basilience Setup AP active. Connect via the Android App.");
+    });
+}

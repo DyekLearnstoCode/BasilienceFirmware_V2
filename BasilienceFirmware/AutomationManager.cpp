@@ -63,7 +63,17 @@ void AutomationManager::update()
 
     if(systemState.manualMode)
     {
-        return;
+        // Abort any running automated operations when manual override mode is enabled
+        if(systemState.operationRequest.state == RequestState::RUNNING)
+        {
+            failCurrentOperation("Aborted: manual override mode activated");
+        }
+        
+        // Force the FSM state back to NORMAL if it is in an active dosing/refilling operational state
+        if(systemState.currentMode != NORMAL && systemState.currentMode != SENSOR_STABILIZATION && systemState.currentMode != SAFETY_LOCK)
+        {
+            changeState(NORMAL);
+        }
     }
 
     //--------------------------------------------------
@@ -539,6 +549,12 @@ void AutomationManager::handleNormal()
     updateCooling();
 
     handleCanopyClimate();
+
+    if (systemState.manualMode)
+    {
+        processFogCycle();
+        return;
+    }
 
     if(processRefillRequest())
     {

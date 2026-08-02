@@ -15,6 +15,7 @@
 
 #define WIFI_SSID "Deduyo's_Wifi_2.4G"
 #define WIFI_PASSWORD "p@ssw0rd"
+#define CREDENTIALS_KEY "BasilienceSecureWiFiKey123"
 
 // ======================================================
 // Firebase
@@ -90,7 +91,7 @@ constexpr float MIN_EC = 1.2f;
 
 constexpr float LOW_WATER_LEVEL = 20.0f;
 
-constexpr float HIGH_WATER_TEMP = 24.0f;
+constexpr float HIGH_WATER_TEMP = 25.0f;
 constexpr float COOLER_OFF_TEMP = 22.5f;
 
 constexpr float HIGH_AIR_TEMP = 35.0f;
@@ -128,25 +129,29 @@ constexpr unsigned long EC_DOSE_COOLDOWN =
 
 constexpr unsigned long SENSOR_STABILIZATION_TIME = 10000UL;
 
-constexpr unsigned long STARTUP_ON_TIME = 10000UL;
+constexpr unsigned long STARTUP_ON_TIME =
+    60UL * 1000UL; // 1 minute
 
-constexpr unsigned long STARTUP_OFF_TIME = 5000UL;
+constexpr unsigned long STARTUP_OFF_TIME =
+    60UL * 1000UL; // 1 minute
 
-constexpr unsigned long NORMAL_FOG_ON_TIME = 5000UL;
+constexpr unsigned long NORMAL_FOG_ON_TIME =
+    30UL * 1000UL; // 30 seconds
 
-constexpr unsigned long NORMAL_FOG_OFF_TIME = 5000UL;
+constexpr unsigned long NORMAL_FOG_OFF_TIME =
+    2UL * 60UL * 1000UL; // 2 minutes
 
 constexpr unsigned long HOT_FOG_ON_TIME =
-    5UL * 60UL * 1000UL;
+    15UL * 1000UL; // 15 seconds
 
 constexpr unsigned long HOT_FOG_OFF_TIME =
-    2UL * 60UL * 1000UL;
+    60UL * 1000UL; // 1 minute
 
 constexpr unsigned long COLD_FOG_ON_TIME =
-    2UL * 60UL * 1000UL;
+    60UL * 1000UL; // 1 minute
 
 constexpr unsigned long COLD_FOG_OFF_TIME =
-    5UL * 60UL * 1000UL;
+    4UL * 60UL * 1000UL; // 4 minutes
 
 constexpr unsigned long PH_STABILIZATION_TIME = 10000UL;
 constexpr unsigned long EC_STABILIZATION_TIME = 10000UL;

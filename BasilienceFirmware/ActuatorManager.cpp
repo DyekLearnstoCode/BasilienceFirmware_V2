@@ -50,6 +50,7 @@ void ActuatorManager::begin()
         commands[i].isPending = false;
         statuses[i].state = ActuatorCommandState::OFF;
         statuses[i].running = false;
+        manuallyOverridden[i] = false;
     }
 }
 
@@ -105,6 +106,17 @@ void ActuatorManager::turnOffAll()
 
 void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed)
 {
+    // Ignore automatic schedule commands when this actuator is manually overridden in manual mode
+    if (systemState.manualMode && source == "automatic" && manuallyOverridden[actuator])
+    {
+        return;
+    }
+
+    if (source == "manual")
+    {
+        manuallyOverridden[actuator] = true;
+    }
+
     commands[actuator].isPending = true;
     commands[actuator].targetState = state;
     commands[actuator].speed = speed;
@@ -179,6 +191,14 @@ void ActuatorManager::update()
 {
     unsigned long currentMillis = millis();
 
+    if (!systemState.manualMode)
+    {
+        for (int i = 0; i < ACTUATOR_COUNT; i++)
+        {
+            manuallyOverridden[i] = false;
+        }
+    }
+
     for (int i = 0; i < ACTUATOR_COUNT; i++)
     {
         Actuator a = (Actuator)i;
@@ -212,65 +232,104 @@ void ActuatorManager::update()
             }
         }
 
-        switch (status.state)
+        bool stateChanged = true;
+        while (stateChanged)
         {
-            case ActuatorCommandState::OFF:
-                break;
-
-            case ActuatorCommandState::COMMAND_RECEIVED:
-                status.state = ActuatorCommandState::VALIDATING;
-                break;
-
-            case ActuatorCommandState::VALIDATING:
+            stateChanged = false;
+            switch (status.state)
             {
-                String reason;
-                if (validateCommand(a, true, reason))
-                {
-                    status.state = ActuatorCommandState::ACTIVATING;
-                    status.reason = "";
-                }
-                else
-                {
-                    status.state = ActuatorCommandState::REJECTED;
-                    status.reason = reason;
-                }
-                break;
-            }
+                case ActuatorCommandState::OFF:
+                    break;
 
-            case ActuatorCommandState::REJECTED:
-                break;
+                case ActuatorCommandState::COMMAND_RECEIVED:
+                    status.state = ActuatorCommandState::VALIDATING;
+                    stateChanged = true;
+                    break;
 
-            case ActuatorCommandState::ACTIVATING:
-                turnOn(a);
-                status.running = true;
-                status.startedAt = currentMillis;
-                status.state = ActuatorCommandState::RUNNING;
-                break;
-
-            case ActuatorCommandState::RUNNING:
-            {
-                String reason;
-                if (!validateCommand(a, true, reason))
+                case ActuatorCommandState::VALIDATING:
                 {
-                    status.state = ActuatorCommandState::STOPPING;
-                    status.reason = reason;
-                }
-                else
-                {
-                    if (a == CANOPY_FAN)
+                    String reason;
+                    if (validateCommand(a, true, reason))
                     {
-                        uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
-                        ledcWrite(0, pwmValue); // Channel 0
+                        status.state = ActuatorCommandState::ACTIVATING;
+                        status.reason = "";
+                        stateChanged = true;
                     }
+                    else
+                    {
+                        status.state = ActuatorCommandState::REJECTED;
+                        status.reason = reason;
+                        stateChanged = true;
+                    }
+                    break;
                 }
-                break;
-            }
 
-            case ActuatorCommandState::STOPPING:
-                turnOff(a);
-                status.running = false;
-                status.state = ActuatorCommandState::OFF;
-                break;
+                case ActuatorCommandState::REJECTED:
+                    break;
+
+                case ActuatorCommandState::ACTIVATING:
+                    turnOn(a);
+                    status.running = true;
+                    status.startedAt = currentMillis;
+                    status.state = ActuatorCommandState::RUNNING;
+                    stateChanged = true;
+                    break;
+
+                case ActuatorCommandState::RUNNING:
+                {
+                    // Check local safety timeout watchdogs
+                    unsigned long runTime = currentMillis - status.startedAt;
+                    bool timeoutExceeded = false;
+                    
+                    if (a == PH_UP_PUMP || a == PH_DOWN_PUMP || a == GROW_PUMP || a == BLOOM_PUMP)
+                    {
+                        if (runTime >= 60000UL) // 60 seconds
+                        {
+                            timeoutExceeded = true;
+                            status.reason = "Safety limit: dosing pump running too long";
+                        }
+                    }
+                    else if (a == SOLENOID)
+                    {
+                        if (runTime >= 600000UL) // 10 minutes
+                        {
+                            timeoutExceeded = true;
+                            status.reason = "Safety limit: solenoid running too long";
+                        }
+                    }
+                    
+                    if (timeoutExceeded)
+                    {
+                        status.state = ActuatorCommandState::STOPPING;
+                        stateChanged = true;
+                        break;
+                    }
+
+                    String reason;
+                    if (!validateCommand(a, true, reason))
+                    {
+                        status.state = ActuatorCommandState::STOPPING;
+                        status.reason = reason;
+                        stateChanged = true;
+                    }
+                    else
+                    {
+                        if (a == CANOPY_FAN)
+                        {
+                            uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
+                            ledcWrite(0, pwmValue); // Channel 0
+                        }
+                    }
+                    break;
+                }
+
+                case ActuatorCommandState::STOPPING:
+                    turnOff(a);
+                    status.running = false;
+                    status.state = ActuatorCommandState::OFF;
+                    stateChanged = true;
+                    break;
+            }
         }
     }
 }

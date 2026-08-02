@@ -5,11 +5,11 @@
 namespace
 {
 
-constexpr unsigned long COMMAND_READ_INTERVAL  = 5000;
+constexpr unsigned long COMMAND_READ_INTERVAL  = 1500;
 constexpr unsigned long MOCK_READ_INTERVAL     = 2000;
 constexpr unsigned long SETTINGS_READ_INTERVAL = 60000;
 constexpr unsigned long UPLOAD_INTERVAL        = 10000;
-constexpr unsigned long DEVICE_INFO_INTERVAL   = 60000;
+constexpr unsigned long DEVICE_INFO_INTERVAL   = 15000;
 
 //==================================================
 // Firebase Operation Conversions
@@ -768,8 +768,7 @@ void FirebaseManager::readActuatorCommands()
     FirebaseJsonData jsonData;
     
     // Check for manualMode flag
-    fbdo.jsonObject().get(jsonData, "manualMode");
-    if (jsonData.success)
+    if (fbdo.jsonObject().get(jsonData, "manualMode"))
     {
         systemState.manualMode = jsonData.boolValue;
     }
@@ -785,28 +784,24 @@ void FirebaseManager::readActuatorCommands()
         String source = "";
         double timestamp = 0;
 
-        fbdo.jsonObject().get(jsonData, name + "/state");
-        if (jsonData.success)
+        if (fbdo.jsonObject().get(jsonData, name + "/state"))
         {
             state = jsonData.boolValue;
             hasCommand = true;
         }
 
-        fbdo.jsonObject().get(jsonData, name + "/source");
-        if (jsonData.success)
+        if (fbdo.jsonObject().get(jsonData, name + "/source"))
         {
             source = jsonData.stringValue;
         }
 
-        fbdo.jsonObject().get(jsonData, name + "/timestamp");
-        if (jsonData.success)
+        if (fbdo.jsonObject().get(jsonData, name + "/timestamp"))
         {
             timestamp = jsonData.doubleValue;
         }
 
         uint8_t speed = 100;
-        fbdo.jsonObject().get(jsonData, name + "/speed");
-        if (jsonData.success)
+        if (fbdo.jsonObject().get(jsonData, name + "/speed"))
         {
             speed = jsonData.intValue;
         }
@@ -823,28 +818,42 @@ void FirebaseManager::readActuatorCommands()
     }
     
     // Check for wifiConfig
-    fbdo.jsonObject().get(jsonData, "wifiConfig/ssid");
-    if (jsonData.success)
+    if (fbdo.jsonObject().get(jsonData, "wifiConfig/ssid"))
     {
-        String newSsid = jsonData.stringValue;
-        fbdo.jsonObject().get(jsonData, "wifiConfig/password");
-        String newPassword = jsonData.success ? jsonData.stringValue : "";
+        String encryptedSsid = jsonData.stringValue;
+        String encryptedPassword = "";
+        if (fbdo.jsonObject().get(jsonData, "wifiConfig/password")) {
+            encryptedPassword = jsonData.stringValue;
+        }
+
+        // Decrypt helper lambda
+        auto decryptString = [](const String& hexInput, const String& key) -> String {
+            String output = "";
+            int len = hexInput.length();
+            for (int i = 0; i < len; i += 2) {
+                if (i + 2 > len) break;
+                String hexPart = hexInput.substring(i, i + 2);
+                char c = (char) strtol(hexPart.c_str(), NULL, 16);
+                char k = key.charAt((i / 2) % key.length());
+                output += (char)(c ^ k);
+            }
+            return output;
+        };
+
+        String newSsid = decryptString(encryptedSsid, CREDENTIALS_KEY);
+        String newPassword = decryptString(encryptedPassword, CREDENTIALS_KEY);
 
         if (!newSsid.isEmpty())
         {
-            Serial.println("Received new Wi-Fi credentials via Firebase.");
+            Serial.println("Received new Wi-Fi credentials via Firebase (Decrypted).");
             Serial.print("SSID: ");
             Serial.println(newSsid);
 
-            // Save credentials via WiFiManager
-            wifiManager.saveCredentials(newSsid, newPassword);
-
-            // Delete the command node to acknowledge receipt
+            // Delete the command node to acknowledge receipt before we potentially lose connection
             Firebase.RTDB.deleteNode(&fbdo, deviceRoot() + "/commands/wifiConfig");
 
-            // Trigger a reconnection to the new network
-            Serial.println("Reconnecting to new Wi-Fi network...");
-            wifiManager.reconnect();
+            // Safely update credentials (will automatically fallback if connection fails)
+            wifiManager.updateCredentialsSafely(newSsid, newPassword);
         }
     }
 }

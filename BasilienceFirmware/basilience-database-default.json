@@ -5,39 +5,39 @@
                 "bloomPump": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
                 },
                 "blower": {
-                    "reason": "",
-                    "running": false,
-                    "source": "automatic",
-                    "speed": 100,
-                    "startedAt": 0,
-                    "state": 0
-                },
-                "canopyFan": {
                     "reason": "Manual stop",
                     "running": false,
                     "source": "automatic",
+                    "speed": 100,
+                    "startedAt": 19471,
+                    "state": 0
+                },
+                "canopyFan": {
+                    "reason": "",
+                    "running": false,
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
                 },
                 "fogger": {
-                    "reason": "",
+                    "reason": "Manual stop",
                     "running": false,
                     "source": "automatic",
                     "speed": 100,
-                    "startedAt": 0,
+                    "startedAt": 19471,
                     "state": 0
                 },
                 "growLight": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
@@ -45,7 +45,7 @@
                 "growPump": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
@@ -53,7 +53,7 @@
                 "peltier": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
@@ -61,7 +61,7 @@
                 "phDownPump": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
@@ -69,7 +69,7 @@
                 "phUpPump": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
@@ -77,68 +77,57 @@
                 "solenoid": {
                     "reason": "",
                     "running": false,
-                    "source": "automatic",
+                    "source": "android",
                     "speed": 100,
                     "startedAt": 0,
                     "state": 0
                 }
             },
-            "actuators": {
-                "bloomPump": false,
-                "blower": false,
-                "fogger": false,
-                "growLight": false,
-                "growPump": false,
-                "peltier": false,
-                "phDownPump": false,
-                "phUpPump": false,
-                "solenoid": false
-            },
             "alerts": {
                 "ecLow": false,
                 "highTemperature": false,
                 "lowWater": false,
-                "phOutOfRange": true,
-                "sensorFault": false,
-                "waterTempOutOfRange": true
+                "phOutOfRange": false,
+                "sensorFault": true,
+                "waterTempOutOfRange": false
             },
             "commands": {
                 "bloomPump": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "blower": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "canopyFan": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "current": {
-                    "action": "NONE",
-                    "operation": "NONE",
+                    "action": "START",
+                    "operation": "RESET_SAFETY",
                     "protocolVersion": 1,
-                    "requestId": 0,
-                    "requestTimestamp": 0
+                    "requestId": 1,
+                    "requestTimestamp": 1785499960
                 },
                 "fogger": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "growLight": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "growPump": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "light": {
                     "source": "android",
@@ -147,13 +136,13 @@
                 },
                 "manualMode": false,
                 "mockSensors": {
-                    "airTemperature": 35,
+                    "airTemperature": 24,
                     "ec": 1.5,
                     "enabled": true,
-                    "humidity": 30,
-                    "ph": 6,
-                    "waterLevel": 90,
-                    "waterTemperature": 28
+                    "humidity": 80,
+                    "ph": 5.5,
+                    "waterLevel": 40,
+                    "waterTemperature": 23
                 },
                 "nutrients": {
                     "source": "android",
@@ -163,7 +152,7 @@
                 "peltier": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "phDown": {
                     "source": "android",
@@ -173,7 +162,7 @@
                 "phDownPump": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "phUp": {
                     "source": "android",
@@ -183,7 +172,7 @@
                 "phUpPump": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "reservoirFan": {
                     "source": "android",
@@ -193,7 +182,7 @@
                 "solenoid": {
                     "source": "android",
                     "state": false,
-                    "timestamp": 1785480622430
+                    "timestamp": 1785499831196
                 },
                 "waterEc": {
                     "source": "android",
@@ -209,26 +198,26 @@
             "deviceInfo": {
                 "deviceName": "Basilience Controller",
                 "firmwareVersion": "2.0.0",
-                "lastSeen": 1221887,
+                "lastSeen": 8202,
                 "online": true
             },
             "operations": {
                 "current": {
                     "acceptedTimestamp": 0,
                     "action": "NONE",
-                    "completedTimestamp": 120833,
-                    "lastUpdatedTimestamp": 120833,
+                    "completedTimestamp": 0,
+                    "lastUpdatedTimestamp": 0,
                     "operation": "NONE",
                     "protocolVersion": 1,
-                    "reason": "Invalid request timestamp.",
+                    "reason": "",
                     "requestId": 0,
-                    "requestTimestamp": 120833,
-                    "source": "MANUAL",
+                    "requestTimestamp": 0,
+                    "source": "AUTOMATIC",
                     "startedTimestamp": 0,
-                    "state": "REJECTED"
+                    "state": "IDLE"
                 },
-                "history": [
-                    {
+                "history": {
+                    "0": {
                         "acceptedTimestamp": 0,
                         "action": "NONE",
                         "completedTimestamp": 120833,
@@ -241,122 +230,37 @@
                         "source": "MANUAL",
                         "startedTimestamp": 0,
                         "state": "REJECTED"
+                    },
+                    "1": {
+                        "acceptedTimestamp": 7483,
+                        "action": "START",
+                        "completedTimestamp": 12199,
+                        "lastUpdatedTimestamp": 12199,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 1,
+                        "requestTimestamp": 7483,
+                        "source": "MANUAL",
+                        "startedTimestamp": 9463,
+                        "state": "COMPLETED"
+                    },
+                    "42687": {
+                        "acceptedTimestamp": 7477,
+                        "action": "EXECUTE",
+                        "completedTimestamp": 10572,
+                        "lastUpdatedTimestamp": 10572,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 42687,
+                        "requestTimestamp": 7477,
+                        "source": "MANUAL",
+                        "startedTimestamp": 9039,
+                        "state": "COMPLETED"
                     }
-                ]
-            },
-            "rtc": {
-                "day": 0,
-                "hour": 0,
-                "minute": 0,
-                "month": 0,
-                "second": 0,
-                "year": 0
-            },
-            "sensors": {
-                "airTemperature": 35,
-                "ec": 0.17102,
-                "humidity": 30,
-                "ph": 6,
-                "tds": 85.51057,
-                "timestamp": 1236936,
-                "waterLevel": 90,
-                "waterTemperature": 28
-            },
-            "settings": {
-                "coolerOffTemp": 22.5,
-                "highWaterTemp": 24,
-                "lightOffHour": 22,
-                "lightOffMinute": 0,
-                "lightOnHour": 6,
-                "lightOnMinute": 0,
-                "maxPH": 6.5,
-                "minEC": 1,
-                "minPH": 5.5,
-                "refillStartLevel": 20,
-                "refillStopLevel": 75
-            },
-            "status": {
-                "currentMode": 8,
-                "firebaseConnected": true,
-                "manualMode": false,
-                "reservoirLocked": true,
-                "safetyLock": false,
-                "wifiConnected": true
-            },
-            "telemetry": {
-                "ecAttempts": 0,
-                "ecDoseTime": 0,
-                "phAttempts": 0,
-                "phDoseTime": 60000
-            }
-        },
-        "basilience_001": {
-            "actuators": {
-                "bloomPump": false,
-                "blower": false,
-                "fogger": false,
-                "growLight": false,
-                "growPump": false,
-                "peltier": false,
-                "phDownPump": false,
-                "phUpPump": false,
-                "solenoid": true
-            },
-            "alerts": {
-                "ecLow": false,
-                "highTemperature": false,
-                "lowWater": true,
-                "phOutOfRange": true,
-                "sensorFault": false,
-                "waterTempOutOfRange": true
-            },
-            "commands": {
-                "current": {
-                    "action": "NONE",
-                    "operation": "NONE",
-                    "protocolVersion": 1,
-                    "requestId": 0,
-                    "requestTimestamp": 0
                 }
             },
-            "deviceInfo": {
-                "deviceName": "Basilience Controller",
-                "firmwareVersion": "2.0.0",
-                "lastSeen": 67129,
-                "online": true
-            },
-            "operations": {
-                "current": {
-                    "acceptedTimestamp": 0,
-                    "action": "NONE",
-                    "completedTimestamp": 70701,
-                    "lastUpdatedTimestamp": 70701,
-                    "operation": "NONE",
-                    "protocolVersion": 1,
-                    "reason": "Invalid request timestamp.",
-                    "requestId": 0,
-                    "requestTimestamp": 70701,
-                    "source": "MANUAL",
-                    "startedTimestamp": 0,
-                    "state": "REJECTED"
-                },
-                "history": [
-                    {
-                        "acceptedTimestamp": 0,
-                        "action": "NONE",
-                        "completedTimestamp": 70701,
-                        "lastUpdatedTimestamp": 70701,
-                        "operation": "NONE",
-                        "protocolVersion": 1,
-                        "reason": "Invalid request timestamp.",
-                        "requestId": 0,
-                        "requestTimestamp": 70701,
-                        "source": "MANUAL",
-                        "startedTimestamp": 0,
-                        "state": "REJECTED"
-                    }
-                ]
-            },
             "rtc": {
                 "day": 0,
                 "hour": 0,
@@ -366,14 +270,11 @@
                 "year": 0
             },
             "sensors": {
-                "airTemperature": 0,
-                "ec": 5.80932,
-                "humidity": 0,
-                "ph": 11.98736,
-                "tds": 2904.66235,
-                "timestamp": 63626,
-                "waterLevel": 0,
-                "waterTemperature": 0
+                "airTemperature": 24,
+                "humidity": 80,
+                "timestamp": 22027,
+                "waterLevel": 40,
+                "waterTemperature": 23
             },
             "settings": {
                 "coolerOffTemp": 22.5,
@@ -389,10 +290,10 @@
                 "refillStopLevel": 75
             },
             "status": {
-                "currentMode": 3,
+                "currentMode": 1,
                 "firebaseConnected": true,
                 "manualMode": false,
-                "reservoirLocked": true,
+                "reservoirLocked": false,
                 "safetyLock": false,
                 "wifiConnected": true
             },
@@ -401,109 +302,6 @@
                 "ecDoseTime": 0,
                 "phAttempts": 0,
                 "phDoseTime": 0
-            }
-        },
-        "devices": {
-            "BASIL_001": {
-                "actuators": {
-                    "bloomPump": false,
-                    "blower": false,
-                    "fogger": false,
-                    "growLight": false,
-                    "growPump": false,
-                    "peltier": false,
-                    "phDownPump": false,
-                    "phUpPump": false,
-                    "solenoid": false
-                },
-                "alerts": {
-                    "ecHigh": false,
-                    "ecLow": false,
-                    "highWaterTemp": false,
-                    "lowWater": false,
-                    "lowWaterTemp": false,
-                    "phHigh": false,
-                    "phLow": false,
-                    "reservoirEmpty": false,
-                    "sensorFailure": false
-                },
-                "commands": {
-                    "current": {
-                        "action": "NONE",
-                        "operation": "NONE",
-                        "protocolVersion": 1,
-                        "requestId": 0,
-                        "requestTimestamp": 0
-                    }
-                },
-                "deviceInfo": {
-                    "deviceName": "Basilience Unit 1",
-                    "firmwareVersion": "2.0.0",
-                    "lastSeen": 0,
-                    "online": false,
-                    "protocolVersion": 1
-                },
-                "operations": {
-                    "current": {
-                        "acceptedTimestamp": 0,
-                        "action": "NONE",
-                        "completedTimestamp": 0,
-                        "lastUpdatedTimestamp": 0,
-                        "operation": "NONE",
-                        "protocolVersion": 1,
-                        "reason": "",
-                        "requestId": 0,
-                        "requestTimestamp": 0,
-                        "startedTimestamp": 0,
-                        "state": "IDLE"
-                    }
-                },
-                "rtc": {
-                    "day": 1,
-                    "hour": 0,
-                    "minute": 0,
-                    "month": 1,
-                    "second": 0,
-                    "year": 2026
-                },
-                "sensors": {
-                    "airTemperature": 0,
-                    "ec": 2,
-                    "humidity": 0,
-                    "ph": 0,
-                    "tds": 0,
-                    "timestamp": 0,
-                    "waterLevel": 0,
-                    "waterTemperature": 0
-                },
-                "settings": {
-                    "coolerOffTemp": 22.5,
-                    "highWaterTemp": 24,
-                    "lightOffHour": 22,
-                    "lightOffMinute": 0,
-                    "lightOnHour": 6,
-                    "lightOnMinute": 0,
-                    "maxPH": 6.5,
-                    "minEC": 1.2,
-                    "minPH": 5.5,
-                    "refillStartLevel": 20,
-                    "refillStopLevel": 75
-                },
-                "status": {
-                    "currentMode": "NORMAL",
-                    "firebaseConnected": false,
-                    "manualMode": false,
-                    "reservoirLocked": false,
-                    "runtimeState": "MONITORING",
-                    "safetyLock": false,
-                    "wifiConnected": false
-                },
-                "telemetry": {
-                    "ecAttempts": 0,
-                    "ecDoseTime": 0,
-                    "phAttempts": 0,
-                    "phDoseTime": 0
-                }
             }
         }
     },
