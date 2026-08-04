@@ -69,7 +69,7 @@ void ActuatorManager::turnOff(Actuator actuator)
 {
     if (actuator == CANOPY_FAN)
     {
-        ledcWrite(0, 0); // Channel 0
+        ledcWrite(getPin(actuator), 0);
     }
     else
     {
@@ -142,36 +142,46 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
     switch (actuator)
     {
         case PH_UP_PUMP:
-            if (isOn(PH_DOWN_PUMP))
+        case PH_DOWN_PUMP:
+        case GROW_PUMP:
+        case BLOOM_PUMP:
+            if (systemState.reservoirLocked || isOn(SOLENOID))
+            {
+                outReason = "Reservoir is currently locked by another operation.";
+                return false;
+            }
+            if (alertState.lowWater)
+            {
+                outReason = "Cannot dose: Water reservoir level is too low.";
+                return false;
+            }
+            
+            if (actuator == PH_UP_PUMP && isOn(PH_DOWN_PUMP))
             {
                 outReason = "Cannot activate pH Up. pH Down is currently running.";
                 return false;
             }
-            break;
-        case PH_DOWN_PUMP:
-            if (isOn(PH_UP_PUMP))
+            if (actuator == PH_DOWN_PUMP && isOn(PH_UP_PUMP))
             {
                 outReason = "Cannot activate pH Down. pH Up is currently running.";
                 return false;
             }
             break;
-        case GROW_PUMP:
-            if (isOn(BLOOM_PUMP))
-            {
-                outReason = "Nutrient B dosing is currently active. Wait until completion.";
-                return false;
-            }
-            break;
-        case BLOOM_PUMP:
-            if (isOn(GROW_PUMP))
-            {
-                outReason = "Nutrient A dosing is currently active. Wait until completion.";
-                return false;
-            }
-            break;
         case CANOPY_FAN:
             break;
+        case SOLENOID:
+            if (isOn(PH_UP_PUMP) || isOn(PH_DOWN_PUMP) || isOn(GROW_PUMP) || isOn(BLOOM_PUMP))
+            {
+                outReason = "Cannot refill while dosing pumps are active.";
+                return false;
+            }
+            break;
         case PELTIER:
+            if (alertState.lowWater)
+            {
+                outReason = "Peltier stopped. Water reservoir level is too low.";
+                return false;
+            }
             break;
         case FOGGER:
             if (alertState.lowWater)
@@ -317,7 +327,7 @@ void ActuatorManager::update()
                         if (a == CANOPY_FAN)
                         {
                             uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
-                            ledcWrite(0, pwmValue); // Channel 0
+                            ledcWrite(getPin(a), pwmValue);
                         }
                     }
                     break;

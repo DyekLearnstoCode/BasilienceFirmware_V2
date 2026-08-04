@@ -37,9 +37,6 @@ void AlertManager::updateTemperatureAlert()
 void AlertManager::updateWaterTemperatureAlert()
 {
     alertState.waterTempOutOfRange =
-        sensors.waterTemp <
-        systemState.coolerOffTemp ||
-
         sensors.waterTemp >
         systemState.highWaterTemp;
 }

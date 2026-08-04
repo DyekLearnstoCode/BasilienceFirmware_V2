@@ -16,6 +16,7 @@ public:
         RequestSource source);
 
 private:
+    uint16_t generateAutoRequestId();
 
     //==================================================
     // Startup
@@ -30,6 +31,7 @@ private:
     StartupPhase startupPhase;
 
     bool fogCycleOn;
+    unsigned long fogTimerStart;
 
     //==================================================
     // Core

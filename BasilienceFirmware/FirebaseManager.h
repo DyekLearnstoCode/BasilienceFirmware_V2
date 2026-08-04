@@ -50,6 +50,10 @@ private:
     bool writeJson(
         const String& path,
         FirebaseJson& json);
+
+    bool updateJson(
+        const String& path,
+        FirebaseJson& json);
     
     String deviceRoot() const;
     void loadDeviceId();

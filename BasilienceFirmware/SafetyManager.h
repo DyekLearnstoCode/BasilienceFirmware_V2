@@ -14,6 +14,7 @@ public:
     SafetyResult canRefill() const;
     SafetyResult canFog() const;
     SafetyResult canCool() const;
+    SafetyResult canResetSafety() const;
 
     const char* getSafetyReason(
         SafetyResult result) const;

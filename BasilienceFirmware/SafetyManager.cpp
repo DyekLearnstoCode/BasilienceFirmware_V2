@@ -130,10 +130,23 @@ SafetyResult SafetyManager::canCool() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
+    if(alertState.lowWater)
+    {
+        return SafetyResult::LOW_WATER;
+    }
+
     if(alertState.sensorFault)
     {
         return SafetyResult::SENSOR_FAULT;
     }
 
+    return SafetyResult::SAFE;
+}
+SafetyResult SafetyManager::canResetSafety() const
+{
+    if(alertState.sensorFault)
+    {
+        return SafetyResult::SENSOR_FAULT;
+    }
     return SafetyResult::SAFE;
 }

@@ -317,9 +317,9 @@ struct SystemState
 
     uint8_t phAttempts = 0;
 
-    float minPH = 5.5f;
+    float minPH = MIN_PH;
 
-    float maxPH = 6.5f;
+    float maxPH = MAX_PH;
 
     //==================================================
     // EC
@@ -329,7 +329,7 @@ struct SystemState
 
     uint8_t ecAttempts = 0;
 
-    float minEC = 1.0f;
+    float minEC = MIN_EC;
 
     //==================================================
     // Grow Light Schedule

@@ -14,6 +14,8 @@ void AutomationManager::begin()
 
     systemState.stateStartTime =
         millis();
+
+    fogTimerStart = millis();
 }
 
 void AutomationManager::update()
@@ -73,27 +75,6 @@ void AutomationManager::update()
         if(systemState.currentMode != NORMAL && systemState.currentMode != SENSOR_STABILIZATION && systemState.currentMode != SAFETY_LOCK)
         {
             changeState(NORMAL);
-        }
-    }
-
-    //--------------------------------------------------
-    // Safety reset
-    //--------------------------------------------------
-
-    if(systemState.resetSafetyLock)
-    {
-        systemState.resetSafetyLock = false;
-
-        if(systemState.currentMode ==
-           SAFETY_LOCK)
-        {
-            Serial.println(
-                "SAFETY LOCK RESET");
-
-            changeState(
-                STARTUP);
-
-            return;
         }
     }
 
@@ -281,12 +262,32 @@ void AutomationManager::processResetSafetyOperation()
         return;
     }
 
-    if(systemState.currentMode ==
+    if(systemState.currentMode !=
        SAFETY_LOCK)
     {
-        changeState(
-            STARTUP);
+        // Already safe or not in lock
+        completeCurrentOperation();
+        return;
     }
+
+    SafetyResult result =
+        safetyManager.canResetSafety();
+
+    if(result != SafetyResult::SAFE)
+    {
+        failCurrentOperation(
+            safetyManager.getSafetyReason(result));
+
+        return;
+    }
+
+    // Reset is safe; clear attempt counters
+    systemState.phAttempts = 0;
+    systemState.ecAttempts = 0;
+    systemState.safetyLock = false;
+
+    changeState(
+        STARTUP);
 
     completeCurrentOperation();
 }
@@ -308,6 +309,15 @@ void AutomationManager::validateSystem()
 
             return;
         }
+
+        // Create a synthetic operation request for automatic refill
+        // so FirebaseManager can broadcast it to operations/current
+        createOperationRequest(
+            generateAutoRequestId(), // Auto-generated ID in the 32768-65535 range
+            OperationType::REFILL,
+            OperationAction::START,
+            RequestSource::AUTOMATIC
+        );
 
         changeState(
             REFILLING);
@@ -445,6 +455,7 @@ void AutomationManager::changeState(SystemMode newMode)
 
     if(newMode == SAFETY_LOCK)
     {
+        systemState.safetyLock = true;
         Serial.println(
             "!!! SAFETY LOCK ACTIVATED !!!");
     }
@@ -524,6 +535,7 @@ void AutomationManager::handleStartup()
                STARTUP_OFF_TIME)
             {
                 fogCycleOn = true;
+                fogTimerStart = millis();
 
                 changeState(
                     NORMAL);
@@ -541,10 +553,7 @@ void AutomationManager::handleNormal()
 
     alertManager.update();
 
-    if(!validateNormalOperation())
-    {
-        return;
-    }
+    validateNormalOperation();
 
     updateCooling();
 
@@ -554,6 +563,18 @@ void AutomationManager::handleNormal()
     {
         processFogCycle();
         return;
+    }
+
+    // Check for automatic refill before processing manual requests
+    if (alertState.lowWater)
+    {
+        SafetyResult result = safetyManager.canRefill();
+        if (result == SafetyResult::SAFE)
+        {
+            createOperationRequest(generateAutoRequestId(), OperationType::REFILL, OperationAction::START, RequestSource::AUTOMATIC);
+            changeState(REFILLING);
+            return;
+        }
     }
 
     if(processRefillRequest())
@@ -697,6 +718,13 @@ bool AutomationManager::processPHCorrection()
         return true;
     }
 
+    createOperationRequest(
+        generateAutoRequestId(),
+        systemState.phDirection == PH_UP ? OperationType::PH_UP : OperationType::PH_DOWN,
+        OperationAction::START,
+        RequestSource::AUTOMATIC
+    );
+
     systemState.correctionMode =
     CorrectionMode::AUTOMATIC;
 
@@ -749,6 +777,13 @@ bool AutomationManager::processECCorrection()
         return true;
     }
 
+    createOperationRequest(
+        generateAutoRequestId(),
+        OperationType::EC_CORRECTION,
+        OperationAction::START,
+        RequestSource::AUTOMATIC
+    );
+
     systemState.correctionMode =
     CorrectionMode::AUTOMATIC;
 
@@ -795,7 +830,7 @@ void AutomationManager::processFogCycle()
 {
     unsigned long elapsed =
         millis() -
-        systemState.stateStartTime;
+        fogTimerStart;
 
     unsigned long fogOnTime =
         NORMAL_FOG_ON_TIME;
@@ -833,9 +868,7 @@ void AutomationManager::processFogCycle()
         if(elapsed >= fogOnTime)
         {
             fogCycleOn = false;
-
-            systemState.stateStartTime =
-                millis();
+            fogTimerStart = millis();
         }
     }
     else
@@ -849,9 +882,7 @@ void AutomationManager::processFogCycle()
         if(elapsed >= fogOffTime)
         {
             fogCycleOn = true;
-
-            systemState.stateStartTime =
-                millis();
+            fogTimerStart = millis();
         }
     }
 }
@@ -1055,6 +1086,19 @@ void AutomationManager::handleStabilizingPH()
                 return;
             }
 
+            // Recalculate error and direction to prevent wrong-way dosing if we overshot
+            float error;
+            if(sensors.ph < systemState.minPH) {
+                systemState.phDirection = PH_UP;
+                error = systemState.minPH - sensors.ph;
+            } else {
+                systemState.phDirection = PH_DOWN;
+                error = sensors.ph - systemState.maxPH;
+            }
+
+            if(error < 0.3f) systemState.phDoseTime = 15000UL;
+            else if(error < 1.0f) systemState.phDoseTime = 30000UL;
+            else systemState.phDoseTime = 60000UL;
 
             systemState.firstCorrectionCycle = false;
 
@@ -1376,4 +1420,16 @@ void AutomationManager::handleCanopyClimate()
     }
 
     actuatorManager.requestCommand(CANOPY_FAN, true, "automatic", millis(), speed);
+}
+
+// Generate a unique request ID for automatic operations
+uint16_t AutomationManager::generateAutoRequestId()
+{
+    static uint16_t autoId = 32768;
+    uint16_t id = autoId++;
+    if(autoId == 0) // overflow wrapped around 65535
+    {
+        autoId = 32768;
+    }
+    return id;
 }

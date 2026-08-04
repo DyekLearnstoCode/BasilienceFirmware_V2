@@ -237,6 +237,16 @@ Serial.println("]");
 }
 void FirebaseManager::initializeDatabase()
 {
+    // Configure server-side Last Will & Testament (onDisconnect)
+    Firebase.RTDB.onDisconnectSetBool(&fbdo, deviceRoot() + "/status/online", false);
+    Firebase.RTDB.onDisconnectSetBool(&fbdo, deviceRoot() + "/deviceInfo/online", false);
+    Serial.println("Firebase RTDB onDisconnect rules registered.");
+
+    // Mark online state immediately on both status and deviceInfo nodes
+    FirebaseJson onlineJson;
+    onlineJson.set("online", true);
+    updateJson(deviceRoot() + "/status", onlineJson);
+    updateJson(deviceRoot() + "/deviceInfo", onlineJson);
 
     FirebaseJson json;
 
@@ -468,10 +478,7 @@ void FirebaseManager::update()
 
 void FirebaseManager::readSettings()
 {
-
-    if(!Firebase.RTDB.getJSON(
-        &fbdo,
-        deviceRoot() + "/settings"))
+    if(!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/settings"))
     {
         return;
     }
@@ -482,54 +489,85 @@ void FirebaseManager::readSettings()
     // Grow Light
     //--------------------------------------------------
 
-    fbdo.jsonObject().get(data, "lightOnHour");
-    systemState.lightOnHour = data.intValue;
+    if (fbdo.jsonObject().get(data, "lightOnHour"))
+        systemState.lightOnHour = data.intValue;
 
-    fbdo.jsonObject().get(data, "lightOnMinute");
-    systemState.lightOnMinute = data.intValue;
+    if (fbdo.jsonObject().get(data, "lightOnMinute"))
+        systemState.lightOnMinute = data.intValue;
 
-    fbdo.jsonObject().get(data, "lightOffHour");
-    systemState.lightOffHour = data.intValue;
+    if (fbdo.jsonObject().get(data, "lightOffHour"))
+        systemState.lightOffHour = data.intValue;
 
-    fbdo.jsonObject().get(data, "lightOffMinute");
-    systemState.lightOffMinute = data.intValue;
+    if (fbdo.jsonObject().get(data, "lightOffMinute"))
+        systemState.lightOffMinute = data.intValue;
 
     //--------------------------------------------------
     // pH
     //--------------------------------------------------
 
-    fbdo.jsonObject().get(data, "minPH");
-    systemState.minPH = data.floatValue;
+    float incomingMinPH = systemState.minPH;
+    float incomingMaxPH = systemState.maxPH;
 
-    fbdo.jsonObject().get(data, "maxPH");
-    systemState.maxPH = data.floatValue;
+    if (fbdo.jsonObject().get(data, "minPH"))
+        incomingMinPH = data.floatValue;
+
+    if (fbdo.jsonObject().get(data, "maxPH"))
+        incomingMaxPH = data.floatValue;
+
+    // Validate pH bounds
+    if (incomingMinPH > 0.0f && incomingMaxPH > incomingMinPH)
+    {
+        systemState.minPH = incomingMinPH;
+        systemState.maxPH = incomingMaxPH;
+    }
 
     //--------------------------------------------------
     // EC
     //--------------------------------------------------
 
-    fbdo.jsonObject().get(data, "minEC");
-    systemState.minEC = data.floatValue;
+    if (fbdo.jsonObject().get(data, "minEC"))
+    {
+        if (data.floatValue > 0.0f)
+            systemState.minEC = data.floatValue;
+    }
 
     //--------------------------------------------------
     // Reservoir
     //--------------------------------------------------
 
-    fbdo.jsonObject().get(data, "refillStartLevel");
-    systemState.refillStartLevel = data.floatValue;
+    float incomingRefillStart = systemState.refillStartLevel;
+    float incomingRefillStop = systemState.refillStopLevel;
 
-    fbdo.jsonObject().get(data, "refillStopLevel");
-    systemState.refillStopLevel = data.floatValue;
+    if (fbdo.jsonObject().get(data, "refillStartLevel"))
+        incomingRefillStart = data.floatValue;
+
+    if (fbdo.jsonObject().get(data, "refillStopLevel"))
+        incomingRefillStop = data.floatValue;
+
+    if (incomingRefillStart > 0.0f && incomingRefillStop > incomingRefillStart)
+    {
+        systemState.refillStartLevel = incomingRefillStart;
+        systemState.refillStopLevel = incomingRefillStop;
+    }
 
     //--------------------------------------------------
     // Cooling
     //--------------------------------------------------
 
-    fbdo.jsonObject().get(data, "highWaterTemp");
-    systemState.highWaterTemp = data.floatValue;
+    float incomingHighWater = systemState.highWaterTemp;
+    float incomingCoolerOff = systemState.coolerOffTemp;
 
-    fbdo.jsonObject().get(data, "coolerOffTemp");
-    systemState.coolerOffTemp = data.floatValue;
+    if (fbdo.jsonObject().get(data, "highWaterTemp"))
+        incomingHighWater = data.floatValue;
+
+    if (fbdo.jsonObject().get(data, "coolerOffTemp"))
+        incomingCoolerOff = data.floatValue;
+
+    if (incomingHighWater > 0.0f && incomingHighWater > incomingCoolerOff)
+    {
+        systemState.highWaterTemp = incomingHighWater;
+        systemState.coolerOffTemp = incomingCoolerOff;
+    }
 }
 
 
@@ -1319,7 +1357,7 @@ void FirebaseManager::writeStatus()
         "firebaseConnected",
         systemState.firebaseConnected);
 
-    if(writeJson(
+    if(updateJson(
         deviceRoot() + "/status",
         json))
     {
@@ -1542,6 +1580,26 @@ bool FirebaseManager::writeJson(
     if(!success)
     {
         Serial.print("Firebase Write Failed: ");
+        Serial.println(path);
+        Serial.println(fbdo.errorReason());
+    }
+
+    return success;
+}
+
+bool FirebaseManager::updateJson(
+    const String& path,
+    FirebaseJson& json)
+{
+    bool success =
+        Firebase.RTDB.updateNode(
+            &fbdo,
+            path,
+            &json);
+
+    if(!success)
+    {
+        Serial.print("Firebase Update Failed: ");
         Serial.println(path);
         Serial.println(fbdo.errorReason());
     }
