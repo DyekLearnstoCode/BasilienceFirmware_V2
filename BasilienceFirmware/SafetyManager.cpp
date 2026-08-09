@@ -2,6 +2,39 @@
 
 #include "Globals.h"
 
+namespace
+{
+    bool validPH()
+    {
+        return isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
+    }
+
+    bool validEC()
+    {
+        return isfinite(sensors.ec) && sensors.ec >= 0.0f;
+    }
+
+    bool validWaterLevel()
+    {
+        return isfinite(sensors.waterLevel) &&
+            sensors.waterLevel >= 0.0f && sensors.waterLevel <= 100.0f;
+    }
+
+    bool validWaterTemperature()
+    {
+        return isfinite(sensors.waterTemp) &&
+            sensors.waterTemp >= 0.0f && sensors.waterTemp <= 100.0f;
+    }
+
+    bool validEnvironment()
+    {
+        return isfinite(sensors.temperature) &&
+            sensors.temperature >= -40.0f && sensors.temperature <= 100.0f &&
+            isfinite(sensors.humidity) &&
+            sensors.humidity >= 0.0f && sensors.humidity <= 100.0f;
+    }
+}
+
 void SafetyManager::begin()
 {
 }
@@ -45,19 +78,23 @@ SafetyResult SafetyManager::canDosePH() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(systemState.reservoirLocked)
+    const bool phCorrectionOwnsLock =
+        systemState.currentMode == DOSING_PH ||
+        systemState.currentMode == STABILIZING_PH;
+
+    if(systemState.reservoirLocked && !phCorrectionOwnsLock)
     {
         return SafetyResult::RESERVOIR_LOCK;
     }
 
-    if(alertState.lowWater)
-    {
-        return SafetyResult::LOW_WATER;
-    }
-
-    if(alertState.sensorFault)
+    if(!validWaterLevel() || !validPH())
     {
         return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.waterLevel < systemState.refillStartLevel)
+    {
+        return SafetyResult::LOW_WATER;
     }
 
     return SafetyResult::SAFE;
@@ -70,19 +107,23 @@ SafetyResult SafetyManager::canDoseEC() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(systemState.reservoirLocked)
+    const bool ecCorrectionOwnsLock =
+        systemState.currentMode == DOSING_EC ||
+        systemState.currentMode == STABILIZING_EC;
+
+    if(systemState.reservoirLocked && !ecCorrectionOwnsLock)
     {
         return SafetyResult::RESERVOIR_LOCK;
     }
 
-    if(alertState.lowWater)
-    {
-        return SafetyResult::LOW_WATER;
-    }
-
-    if(alertState.sensorFault)
+    if(!validWaterLevel() || !validEC())
     {
         return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.waterLevel < systemState.refillStartLevel)
+    {
+        return SafetyResult::LOW_WATER;
     }
 
     return SafetyResult::SAFE;
@@ -95,7 +136,7 @@ SafetyResult SafetyManager::canRefill() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(alertState.sensorFault)
+    if(!validWaterLevel())
     {
         return SafetyResult::SENSOR_FAULT;
     }
@@ -110,14 +151,14 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(alertState.lowWater)
-    {
-        return SafetyResult::LOW_WATER;
-    }
-
-    if(alertState.sensorFault)
+    if(!validWaterLevel() || !validEnvironment())
     {
         return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.waterLevel < systemState.refillStartLevel)
+    {
+        return SafetyResult::LOW_WATER;
     }
 
     return SafetyResult::SAFE;
@@ -130,14 +171,14 @@ SafetyResult SafetyManager::canCool() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(alertState.lowWater)
-    {
-        return SafetyResult::LOW_WATER;
-    }
-
-    if(alertState.sensorFault)
+    if(!validWaterLevel() || !validWaterTemperature())
     {
         return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.waterLevel < systemState.refillStartLevel)
+    {
+        return SafetyResult::LOW_WATER;
     }
 
     return SafetyResult::SAFE;

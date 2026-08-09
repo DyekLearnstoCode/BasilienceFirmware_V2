@@ -8,6 +8,7 @@ void AutomationManager::begin()
     startupPhase = STARTUP_FOG_ON;
 
     fogCycleOn = true;
+    activeFogStrategy = "";
 
     systemState.currentMode =
         SENSOR_STABILIZATION;
@@ -20,6 +21,11 @@ void AutomationManager::begin()
 
 void AutomationManager::update()
 {
+    // Support actuators are reconciled for every FSM state, including operation
+    // requests that return early below. Both physical and mock inputs have already
+    // been normalized into the same effective sensors structure before this call.
+    updateCooling();
+
     //--------------------------------------------------
     // Operation lifecycle
     //--------------------------------------------------
@@ -42,6 +48,13 @@ void AutomationManager::update()
     if(systemState.operationRequest.state ==
        RequestState::RUNNING)
     {
+        if(systemState.operationRequest.startedTimestamp != 0 &&
+           millis() - systemState.operationRequest.startedTimestamp >= OPERATION_TIMEOUT_MS)
+        {
+            abortCurrentOperation("Operation timeout");
+            return;
+        }
+
         processOperationRequest();
         return;
     }
@@ -85,6 +98,11 @@ void AutomationManager::update()
     processCurrentState();
 
 } //Core Framework
+
+void AutomationManager::setManualCoolingDemand(bool active)
+{
+    manualCoolingDemandActive = active;
+}
 
 void AutomationManager::processCurrentState()
 {
@@ -184,8 +202,15 @@ void AutomationManager::processRefillOperation()
         return;
     }
 
-    changeState(
-        REFILLING);
+    if(systemState.currentMode != REFILLING)
+    {
+        changeState(REFILLING);
+        return;
+    }
+
+    // RUNNING operations are routed here before processCurrentState(). Continue
+    // the active state handler so the stop threshold can complete the request.
+    handleRefilling();
 }
 
 //PH Up Operation
@@ -194,6 +219,18 @@ void AutomationManager::processPHUpOperation()
     if(systemState.operationRequest.action !=
        OperationAction::START)
     {
+        return;
+    }
+
+    if(systemState.currentMode == DOSING_PH)
+    {
+        handleDosingPH();
+        return;
+    }
+
+    if(systemState.currentMode == STABILIZING_PH)
+    {
+        handleStabilizingPH();
         return;
     }
 
@@ -211,8 +248,9 @@ void AutomationManager::processPHUpOperation()
     systemState.phDirection =
         PH_UP;
 
-        systemState.correctionMode =
-    CorrectionMode::MANUAL;
+    systemState.correctionMode =
+        systemState.operationRequest.source == RequestSource::AUTOMATIC ?
+            CorrectionMode::AUTOMATIC : CorrectionMode::MANUAL;
 
     systemState.firstCorrectionCycle = true;
     systemState.phAttempts = 0;
@@ -226,6 +264,18 @@ void AutomationManager::processPHDownOperation()
     if(systemState.operationRequest.action !=
        OperationAction::START)
     {
+        return;
+    }
+
+    if(systemState.currentMode == DOSING_PH)
+    {
+        handleDosingPH();
+        return;
+    }
+
+    if(systemState.currentMode == STABILIZING_PH)
+    {
+        handleStabilizingPH();
         return;
     }
 
@@ -244,7 +294,8 @@ void AutomationManager::processPHDownOperation()
         PH_DOWN;
 
     systemState.correctionMode =
-    CorrectionMode::MANUAL;
+        systemState.operationRequest.source == RequestSource::AUTOMATIC ?
+            CorrectionMode::AUTOMATIC : CorrectionMode::MANUAL;
 
     systemState.firstCorrectionCycle = true;
     systemState.phAttempts = 0;
@@ -402,6 +453,11 @@ void AutomationManager::changeState(SystemMode newMode)
     SystemMode oldMode =
         systemState.currentMode;
 
+    if(newMode == oldMode)
+    {
+        return;
+    }
+
     Serial.println();
     Serial.println("================================");
     Serial.println("STATE CHANGE");
@@ -463,12 +519,18 @@ void AutomationManager::changeState(SystemMode newMode)
     Serial.println("================================");
     Serial.println();
 
-    if(newMode == STARTUP)
+if(newMode == STARTUP)
 {
     startupPhase = STARTUP_FOG_ON;
 
     fogCycleOn = true;
+    activeFogStrategy = "";
 }
+
+    if(newMode == REFILLING)
+    {
+        refillDiagnosticsInitialized = false;
+    }
 
     systemState.currentMode =
         newMode;
@@ -505,14 +567,14 @@ void AutomationManager::handleStartup()
     {
         case STARTUP_FOG_ON:
         {
-            actuatorManager.requestCommand(FOGGER, true, "automatic", millis());
+            actuatorManager.requestCommand(FOGGER, true, "automatic", millis(), 100, "startup");
             actuatorManager.requestCommand(BLOWER, true, "automatic", millis());
 
             if(millis() -
                systemState.stateStartTime >=
                STARTUP_ON_TIME)
             {
-                actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+                actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
                 actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
                 startupPhase =
@@ -527,7 +589,7 @@ void AutomationManager::handleStartup()
 
         case STARTUP_FOG_OFF:
         {
-            actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+            actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
             actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
             if(millis() -
@@ -554,8 +616,6 @@ void AutomationManager::handleNormal()
     alertManager.update();
 
     validateNormalOperation();
-
-    updateCooling();
 
     handleCanopyClimate();
 
@@ -598,6 +658,9 @@ void AutomationManager::handleNormal()
 //safety Lock Handling
 bool AutomationManager::validateNormalOperation()
 {
+    static bool diagnosticInitialized = false;
+    static SafetyResult lastDiagnosticResult = SafetyResult::SAFE;
+
     SafetyResult result =
         safetyManager.canFog();
 
@@ -606,42 +669,183 @@ bool AutomationManager::validateNormalOperation()
         actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
         actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
 
-        Serial.println(
-            safetyManager.getSafetyReason(result));
+        if (!diagnosticInitialized || result != lastDiagnosticResult)
+        {
+            Serial.print("[SAFETY] ");
+            Serial.println(safetyManager.getSafetyReason(result));
+        }
+
+        diagnosticInitialized = true;
+        lastDiagnosticResult = result;
 
         return false;
     }
 
+    if (diagnosticInitialized && lastDiagnosticResult != SafetyResult::SAFE)
+    {
+        Serial.println("[SAFETY] Normal operation restored");
+    }
+
+    diagnosticInitialized = true;
+    lastDiagnosticResult = SafetyResult::SAFE;
+
     return true;
 }
 
-//Cooling Handling
+// Cooling and reservoir circulation handling
 void AutomationManager::updateCooling()
 {
-    SafetyResult result =
-        safetyManager.canCool();
+    const SafetyResult coolingSafety = safetyManager.canCool();
 
-    if(result != SafetyResult::SAFE)
+    const int8_t temperatureBand =
+        sensors.waterTemp > systemState.highWaterTemp ? 1 :
+        (sensors.waterTemp < systemState.coolerOffTemp ? -1 : 0);
+
+    if (coolingSafety != SafetyResult::SAFE)
     {
-        actuatorManager.requestCommand(
-            PELTIER, false, "automatic", millis());
-
-        return;
+        coolingDemandActive = false;
+        manualCoolingDemandActive = false;
+    }
+    else if (temperatureBand == 1)
+    {
+        coolingDemandActive = true;
+    }
+    else if (temperatureBand == -1)
+    {
+        coolingDemandActive = false;
+        manualCoolingDemandActive = false;
     }
 
-    if(sensors.waterTemp >
-       systemState.highWaterTemp)
+    if (temperatureBand != lastWaterTemperatureBand)
+    {
+        Serial.print("[TEMP] water="); Serial.print(sensors.waterTemp, 2);
+        Serial.print(" high="); Serial.print(systemState.highWaterTemp, 2);
+        Serial.print(" coolerOff="); Serial.println(systemState.coolerOffTemp, 2);
+        if (temperatureBand == 1 && coolingSafety == SafetyResult::SAFE)
+            Serial.println("[TEMP] Peltier requested");
+        else if (temperatureBand == -1 || coolingSafety != SafetyResult::SAFE)
+            Serial.println("[TEMP] Peltier OFF requested");
+        lastWaterTemperatureBand = temperatureBand;
+    }
+
+    const bool phStabilizationActive =
+        systemState.currentMode == STABILIZING_PH;
+    const bool ecStabilizationActive =
+        systemState.currentMode == STABILIZING_EC;
+
+    constexpr uint8_t DEMAND_PELTIER = 0x01;
+    constexpr uint8_t DEMAND_PH = 0x02;
+    constexpr uint8_t DEMAND_EC = 0x04;
+
+    uint8_t demandMask = 0;
+    if (coolingDemandActive || manualCoolingDemandActive) demandMask |= DEMAND_PELTIER;
+    if (phStabilizationActive) demandMask |= DEMAND_PH;
+    if (ecStabilizationActive) demandMask |= DEMAND_EC;
+
+    if (!circulationDiagnosticsInitialized || demandMask != lastCirculationDemandMask)
+    {
+        const uint8_t added = demandMask & ~lastCirculationDemandMask;
+        const uint8_t removed = lastCirculationDemandMask & ~demandMask;
+
+        if (added & DEMAND_PELTIER) Serial.println("[CIRCULATION] Demand added: PELTIER");
+        if (added & DEMAND_PH) Serial.println("[CIRCULATION] Demand added: PH_STABILIZATION");
+        if (added & DEMAND_EC) Serial.println("[CIRCULATION] Demand added: EC_STABILIZATION");
+        if (removed & DEMAND_PELTIER) Serial.println("[CIRCULATION] Demand removed: PELTIER");
+        if (removed & DEMAND_PH) Serial.println("[CIRCULATION] Demand removed: PH_STABILIZATION");
+        if (removed & DEMAND_EC) Serial.println("[CIRCULATION] Demand removed: EC_STABILIZATION");
+
+        if (removed != 0 && demandMask != 0)
+        {
+            Serial.print("[CIRCULATION] Remaining demand: ");
+            Serial.println(getCirculationReason(demandMask));
+        }
+
+        lastCirculationDemandMask = demandMask;
+        circulationDiagnosticsInitialized = true;
+    }
+
+    const String circulationReason = getCirculationReason(demandMask);
+    actuatorManager.requestCommand(
+        CIRCULATION_PUMP,
+        demandMask != 0,
+        "automatic",
+        millis(),
+        100,
+        "",
+        circulationReason);
+
+    const ActuatorStatus circulationStatus =
+        actuatorManager.getStatus(CIRCULATION_PUMP);
+    const bool circulationConfirmed =
+        circulationStatus.running &&
+        circulationStatus.state == ActuatorCommandState::RUNNING;
+
+    if (circulationConfirmed != lastCirculationRunning)
+    {
+        Serial.println(circulationConfirmed
+            ? "[CIRCULATION] Pump ON"
+            : "[CIRCULATION] Pump OFF");
+        lastCirculationRunning = circulationConfirmed;
+    }
+
+    if (circulationStatus.state != lastCirculationState)
+    {
+        if (circulationStatus.state == ActuatorCommandState::REJECTED)
+        {
+            Serial.print("[CIRCULATION] REJECTED: ");
+            Serial.println(circulationStatus.reason);
+        }
+        lastCirculationState = circulationStatus.state;
+    }
+
+    if (coolingDemandActive && circulationConfirmed)
     {
         actuatorManager.requestCommand(
             PELTIER, true, "automatic", millis());
     }
-
-    if(sensors.waterTemp <
-       systemState.coolerOffTemp)
+    else
     {
         actuatorManager.requestCommand(
-            PELTIER, false, "automatic", millis());
+            PELTIER,
+            false,
+            "automatic",
+            millis(),
+            100,
+            "",
+            coolingDemandActive ? "waiting_for_circulation" : "");
     }
+
+    const bool peltierRunning = actuatorManager.getStatus(PELTIER).running;
+    if (peltierRunning != lastPeltierRunning)
+    {
+        if (peltierRunning)
+        {
+            Serial.println("[TEMP] Circulation confirmed");
+            Serial.println("[TEMP] Peltier RUNNING");
+        }
+        else
+        {
+            Serial.println("[TEMP] Peltier OFF");
+        }
+        lastPeltierRunning = peltierRunning;
+    }
+}
+
+String AutomationManager::getCirculationReason(uint8_t demandMask) const
+{
+    String reason;
+    if (demandMask & 0x01) reason = "temperature_circulation";
+    if (demandMask & 0x02)
+    {
+        if (!reason.isEmpty()) reason += "+";
+        reason += "ph_stabilization";
+    }
+    if (demandMask & 0x04)
+    {
+        if (!reason.isEmpty()) reason += "+";
+        reason += "ec_stabilization";
+    }
+    return reason;
 }
 
 //force refill request
@@ -725,6 +929,12 @@ bool AutomationManager::processPHCorrection()
         RequestSource::AUTOMATIC
     );
 
+    Serial.print("[PH] value="); Serial.print(sensors.ph, 2);
+    Serial.print(" min="); Serial.print(systemState.minPH, 2);
+    Serial.print(" max="); Serial.println(systemState.maxPH, 2);
+    Serial.print("[PH] requesting ");
+    Serial.println(systemState.phDirection == PH_UP ? "PH_UP" : "PH_DOWN");
+
     systemState.correctionMode =
     CorrectionMode::AUTOMATIC;
 
@@ -784,6 +994,10 @@ bool AutomationManager::processECCorrection()
         RequestSource::AUTOMATIC
     );
 
+    Serial.print("[EC] value="); Serial.print(sensors.ec, 2);
+    Serial.print(" min="); Serial.println(systemState.minEC, 2);
+    Serial.println("[EC] requesting nutrient correction");
+
     systemState.correctionMode =
     CorrectionMode::AUTOMATIC;
 
@@ -804,6 +1018,18 @@ void AutomationManager::processECCorrectionOperation()
         return;
     }
 
+    if(systemState.currentMode == DOSING_EC)
+    {
+        handleDosingEC();
+        return;
+    }
+
+    if(systemState.currentMode == STABILIZING_EC)
+    {
+        handleStabilizingEC();
+        return;
+    }
+
     SafetyResult result =
         safetyManager.canDoseEC();
 
@@ -816,7 +1042,8 @@ void AutomationManager::processECCorrectionOperation()
     }
 
     systemState.correctionMode =
-        CorrectionMode::MANUAL;
+        systemState.operationRequest.source == RequestSource::AUTOMATIC ?
+            CorrectionMode::AUTOMATIC : CorrectionMode::MANUAL;
 
         systemState.firstCorrectionCycle = true;
         systemState.ecAttempts = 0;
@@ -832,14 +1059,34 @@ void AutomationManager::processFogCycle()
         millis() -
         fogTimerStart;
 
+    String fogStrategy = "normal";
+
+    if(sensors.temperature >
+       systemState.hotFogTemperature)
+    {
+        fogStrategy =
+            "hot";
+    }
+    else if(sensors.temperature <
+            systemState.coldFogTemperature)
+    {
+        fogStrategy =
+            "cold";
+    }
+
+    if(activeFogStrategy == "")
+    {
+        activeFogStrategy =
+            fogStrategy;
+    }
+
     unsigned long fogOnTime =
         NORMAL_FOG_ON_TIME;
 
     unsigned long fogOffTime =
         NORMAL_FOG_OFF_TIME;
 
-    if(sensors.temperature >
-       systemState.hotFogTemperature)
+    if(activeFogStrategy == "hot")
     {
         fogOnTime =
             HOT_FOG_ON_TIME;
@@ -847,8 +1094,7 @@ void AutomationManager::processFogCycle()
         fogOffTime =
             HOT_FOG_OFF_TIME;
     }
-    else if(sensors.temperature <
-            systemState.coldFogTemperature)
+    else if(activeFogStrategy == "cold")
     {
         fogOnTime =
             COLD_FOG_ON_TIME;
@@ -860,7 +1106,7 @@ void AutomationManager::processFogCycle()
     if(fogCycleOn)
     {
         actuatorManager.requestCommand(
-            FOGGER, true, "automatic", millis());
+            FOGGER, true, "automatic", millis(), 100, activeFogStrategy);
 
         actuatorManager.requestCommand(
             BLOWER, true, "automatic", millis());
@@ -874,7 +1120,7 @@ void AutomationManager::processFogCycle()
     else
     {
         actuatorManager.requestCommand(
-            FOGGER, false, "automatic", millis());
+            FOGGER, false, "automatic", millis(), 100, activeFogStrategy);
 
         actuatorManager.requestCommand(
             BLOWER, false, "automatic", millis());
@@ -883,6 +1129,7 @@ void AutomationManager::processFogCycle()
         {
             fogCycleOn = true;
             fogTimerStart = millis();
+            activeFogStrategy = "";
         }
     }
 }
@@ -963,23 +1210,56 @@ void AutomationManager::handleRefilling()
 
     systemState.reservoirLocked = true;
 
-    actuatorManager.requestCommand(
-        SOLENOID, true, "automatic", millis());
+    const bool mockSource = systemState.mockSensorsEnabled;
+    const bool diagnosticsChanged =
+        !refillDiagnosticsInitialized ||
+        mockSource != lastRefillMockSource ||
+        fabsf(sensors.waterLevel - lastRefillWaterLevel) > 0.01f ||
+        fabsf(systemState.refillStartLevel - lastRefillStartLevel) > 0.01f ||
+        fabsf(systemState.refillStopLevel - lastRefillStopLevel) > 0.01f;
+
+    if(diagnosticsChanged)
+    {
+        Serial.print("[REFILL] source=");
+        Serial.println(mockSource ? "MOCK" : "PHYSICAL");
+        Serial.print("[REFILL] waterLevel=");
+        Serial.println(sensors.waterLevel, 2);
+        Serial.print("[REFILL] refillStartLevel=");
+        Serial.println(systemState.refillStartLevel, 2);
+        Serial.print("[REFILL] refillStopLevel=");
+        Serial.println(systemState.refillStopLevel, 2);
+
+        refillDiagnosticsInitialized = true;
+        lastRefillMockSource = mockSource;
+        lastRefillWaterLevel = sensors.waterLevel;
+        lastRefillStartLevel = systemState.refillStartLevel;
+        lastRefillStopLevel = systemState.refillStopLevel;
+    }
 
     if(sensors.waterLevel >=
        systemState.refillStopLevel)
     {
+        Serial.println("[REFILL] Stop threshold reached");
+
         actuatorManager.requestCommand(
             SOLENOID, false, "automatic", millis());
+
+        Serial.println("[REFILL] Solenoid OFF");
 
         systemState.reservoirLocked = false;
 
         completeCurrentOperation();
 
+        Serial.println("[REFILL] Operation COMPLETED");
+
         changeState(
             STARTUP);
 
+        return;
     }
+
+    actuatorManager.requestCommand(
+        SOLENOID, true, "automatic", millis());
 }
 
 //handle ph dosing
@@ -1115,6 +1395,8 @@ void AutomationManager::handleStabilizingPH()
         systemState.reservoirLocked = false;
 
         completeCurrentOperation();
+
+        Serial.println("[PH] correction completed");
 
         changeState(
             NORMAL);
@@ -1253,6 +1535,8 @@ void AutomationManager::handleStabilizingEC()
 
         completeCurrentOperation();
 
+        Serial.println("[EC] correction completed");
+
         changeState(
             NORMAL);
     }
@@ -1306,12 +1590,22 @@ const char* AutomationManager::getStateName(SystemMode mode)
 bool AutomationManager::abortCurrentOperation(
     SafetyResult result)
 {
-    actuatorManager.turnOffAll();
+    return abortCurrentOperation(safetyManager.getSafetyReason(result));
+}
+
+bool AutomationManager::abortCurrentOperation(
+    const String& reason)
+{
+    Serial.print("[SAFETY] ");
+    Serial.print(getStateName(systemState.currentMode));
+    Serial.print(" stopped: ");
+    Serial.println(reason);
+
+    actuatorManager.turnOffAll(reason);
 
     systemState.reservoirLocked = true;
 
-    failCurrentOperation(
-        safetyManager.getSafetyReason(result));
+    failCurrentOperation(reason);
 
     changeState(
         SAFETY_LOCK);

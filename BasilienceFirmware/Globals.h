@@ -18,6 +18,7 @@
 // ======================================================
 
 extern SensorData sensors;
+extern SensorData physicalSensors;
 extern SystemState systemState;
 extern AlertState alertState;
 extern ActuatorManager actuatorManager;

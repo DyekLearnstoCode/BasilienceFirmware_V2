@@ -13,9 +13,8 @@
 //#define WIFI_SSID "EVITH WIFI"
 //#define WIFI_PASSWORD "Ronald123"
 
-#define WIFI_SSID "Deduyo's_Wifi_2.4G"
-#define WIFI_PASSWORD "p@ssw0rd"
-#define CREDENTIALS_KEY "BasilienceSecureWiFiKey123"
+#define WIFI_SSID "Jake"
+#define WIFI_PASSWORD "walongone"
 
 // ======================================================
 // Firebase
@@ -56,6 +55,7 @@ constexpr uint8_t PH_DOWN_PUMP_PIN = 12;
 
 constexpr uint8_t CANOPY_FAN_PIN = 17;
 constexpr uint8_t PELTIER_PIN = 16;
+constexpr uint8_t CIRCULATION_PUMP_PIN = 13;
 
 // ======================================================
 // Sensor Inputs

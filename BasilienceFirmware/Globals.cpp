@@ -5,6 +5,7 @@
 // ======================================================
 
 SensorData sensors;
+SensorData physicalSensors;
 
 SystemState systemState;
 

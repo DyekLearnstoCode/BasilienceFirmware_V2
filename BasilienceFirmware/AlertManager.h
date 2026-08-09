@@ -9,7 +9,15 @@ public:
 
     void update();
 
+    bool isDirty() const;
+
+    void markSynced();
+
 private:
+    bool alertsDirty = true;
+
+    void setAlert(const char* name, bool& currentValue, bool nextValue);
+
     void updateLowWaterAlert();
 
     void updateTemperatureAlert();

@@ -8,6 +8,7 @@ class AutomationManager
 public:
     void begin();
     void update();
+    void setManualCoolingDemand(bool active);
 
         void createOperationRequest(
         uint16_t requestId,
@@ -32,6 +33,21 @@ private:
 
     bool fogCycleOn;
     unsigned long fogTimerStart;
+    String activeFogStrategy;
+
+    bool refillDiagnosticsInitialized = false;
+    bool lastRefillMockSource = false;
+    float lastRefillWaterLevel = NAN;
+    float lastRefillStartLevel = NAN;
+    float lastRefillStopLevel = NAN;
+    int8_t lastWaterTemperatureBand = -2;
+    bool coolingDemandActive = false;
+    bool manualCoolingDemandActive = false;
+    bool circulationDiagnosticsInitialized = false;
+    uint8_t lastCirculationDemandMask = 0;
+    bool lastCirculationRunning = false;
+    bool lastPeltierRunning = false;
+    ActuatorCommandState lastCirculationState = ActuatorCommandState::OFF;
 
     //==================================================
     // Core
@@ -71,6 +87,9 @@ private:
     bool abortCurrentOperation(
     SafetyResult result);
 
+    bool abortCurrentOperation(
+    const String& reason);
+
     //==================================================
     // Automatic Operations
     //==================================================
@@ -80,6 +99,8 @@ private:
     bool validateNormalOperation();
 
     void updateCooling();
+
+    String getCirculationReason(uint8_t demandMask) const;
 
     void handleCanopyClimate();
 

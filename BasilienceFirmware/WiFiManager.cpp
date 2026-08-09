@@ -1,22 +1,27 @@
 #include "WiFiManager.h"
 
-#include "Config.h"
 #include "Globals.h"
 
 void WiFiManager::begin()
 {
+    preferences.begin("wifi", false);
+    firebaseResumePending = preferences.getBool("resumeFirebase", false);
+    if (firebaseResumePending)
+    {
+        preferences.remove("resumeFirebase");
+    }
+    preferences.end();
+
     if (!loadCredentials())
     {
         Serial.println("No saved WiFi credentials.");
-
-        saveCredentials(
-            WIFI_SSID,
-            WIFI_PASSWORD);
-
-        loadCredentials();
+        enterAutomaticProvisioningMode();
+        initialConnectionAttempt = false;
+        return;
     }
 
     connect();
+    initialConnectionAttempt = false;
 }
 
 
@@ -27,7 +32,7 @@ bool WiFiManager::connect()
         Serial.println("No WiFi credentials available.");
 
         systemState.wifiConnected = false;
-
+        enterAutomaticProvisioningMode();
         return false;
     }
 
@@ -40,7 +45,9 @@ bool WiFiManager::connect()
     }
 
     Serial.println();
-    Serial.println("Connecting WiFi...");
+    Serial.print("[WIFI] Connecting to ");
+    Serial.print(ssid);
+    Serial.println("...");
 
     WiFi.mode(WIFI_STA);
 
@@ -55,10 +62,10 @@ bool WiFiManager::connect()
         if (millis() - startTime >= 30000)
         {
             Serial.println();
-            Serial.println("WiFi Connection Timeout");
+            Serial.println("[WIFI] Connection failed");
 
             systemState.wifiConnected = false;
-            startAP(); // Start AP mode for in-app configuration
+            enterAutomaticProvisioningMode();
 
             return false;
         }
@@ -68,7 +75,7 @@ bool WiFiManager::connect()
     }
 
     Serial.println();
-    Serial.println("WiFi Connected");
+    Serial.println("[WIFI] Connected");
 
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
@@ -154,13 +161,25 @@ void WiFiManager::clearCredentials()
 
 bool WiFiManager::hasCredentials() const
 {
-    return !ssid.isEmpty() &&
-           !password.isEmpty();
+    // An empty password is valid for an open target Wi-Fi network.
+    return !ssid.isEmpty();
 }
 
 bool WiFiManager::isConnected() const
 {
     return WiFi.status() == WL_CONNECTED;
+}
+
+bool WiFiManager::isProvisioningMode() const
+{
+    return isAPMode;
+}
+
+bool WiFiManager::consumeFirebaseResumePending()
+{
+    bool pending = firebaseResumePending;
+    firebaseResumePending = false;
+    return pending;
 }
 
 String WiFiManager::getSSID() const
@@ -222,13 +241,38 @@ void WiFiManager::update()
     reconnect();
 }
 
-void WiFiManager::startAP()
+void WiFiManager::enterAutomaticProvisioningMode()
+{
+    Serial.println("[WIFI] Entering provisioning mode");
+    if (initialConnectionAttempt)
+    {
+        Serial.println("[FIREBASE] Not started because Wi-Fi is unavailable");
+    }
+
+    // Stop the failed STA association before assigning the radio to the setup AP.
+    WiFi.disconnect(true, false);
+    startAP(!initialConnectionAttempt);
+}
+
+void WiFiManager::startAP(bool suspendFirebase)
 {
     if (isAPMode) return;
-    
-    Serial.println("Starting Access Point: Basilience-Setup");
+
+    if (suspendFirebase)
+    {
+        Serial.println("[FIREBASE] Suspended during provisioning mode");
+    }
+    Serial.println("[AP] Starting Basilience-Setup");
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("Basilience-Setup"); // Open network for easy setup
+    const IPAddress apIp(192, 168, 4, 1);
+    const IPAddress gateway(192, 168, 4, 1);
+    const IPAddress subnet(255, 255, 255, 0);
+    WiFi.softAPConfig(apIp, gateway, subnet);
+    if (!WiFi.softAP("Basilience-Setup"))
+    {
+        Serial.println("[AP] Failed to start Basilience-Setup");
+        return;
+    }
 
     delay(500); // Wait for AP to initialize
     
@@ -237,10 +281,11 @@ void WiFiManager::startAP()
     
     setupAPServer();
     server.begin();
-    
+
     isAPMode = true;
-    Serial.print("AP IP Address: ");
+    Serial.print("[AP] IP: ");
     Serial.println(WiFi.softAPIP());
+    Serial.println("[AP] HTTP server started");
 }
 
 void WiFiManager::stopAP()
@@ -257,29 +302,53 @@ void WiFiManager::stopAP()
 void WiFiManager::setupAPServer()
 {
     server.on("/status", HTTP_GET, [this]() {
+        Serial.println("[AP HTTP] GET /status");
         server.send(200, "application/json", "{\"status\":\"setup_mode\"}");
+        Serial.println("[AP HTTP] Response: 200");
     });
 
     server.on("/setup", HTTP_POST, [this]() {
+        Serial.println("[AP HTTP] POST /setup");
         if (!server.hasArg("ssid") || !server.hasArg("password")) {
+            Serial.println("[AP HTTP] Invalid setup request");
             server.send(400, "text/plain", "Missing SSID or Password");
+            Serial.println("[AP HTTP] Response: 400");
             return;
         }
         
         String newSsid = server.arg("ssid");
         String newPass = server.arg("password");
-        
-        Serial.println("Received new WiFi credentials from App.");
-        server.send(200, "text/plain", "Credentials received. Rebooting...");
-        
-        saveCredentials(newSsid, newPass);
-        
+
+        Serial.print("[AP HTTP] SSID received: ");
+        Serial.println(newSsid);
+        if (newSsid.isEmpty()) {
+            Serial.println("[AP HTTP] Invalid setup request");
+            server.send(400, "text/plain", "SSID cannot be empty");
+            Serial.println("[AP HTTP] Response: 400");
+            return;
+        }
+        if (!saveCredentials(newSsid, newPass)) {
+            server.send(500, "text/plain", "Unable to save credentials");
+            Serial.println("[AP HTTP] Response: 500");
+            return;
+        }
+        Serial.println("[AP] Credentials saved");
+        Serial.println("[AP] Credentials saved");
+
+        preferences.begin("wifi", false);
+        preferences.putBool("resumeFirebase", true);
+        preferences.end();
+
+        server.send(200, "text/plain", "Credentials saved. Connecting device...");
+        Serial.println("[AP HTTP] Response: 200");
+
+        Serial.println("[WIFI] Reconnecting...");
         delay(1000);
-        ESP.restart(); // Safest way to apply new WiFi credentials cleanly
+        ESP.restart();
     });
 
     // Captive portal redirect for any unknown requests
     server.onNotFound([this]() {
         server.send(200, "text/plain", "Basilience Setup AP active. Connect via the Android App.");
     });
-}
+}

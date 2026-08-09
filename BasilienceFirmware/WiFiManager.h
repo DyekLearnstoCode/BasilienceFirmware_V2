@@ -32,15 +32,18 @@ public:
     bool hasCredentials() const;
 
     bool isConnected() const;
+    bool isProvisioningMode() const;
+    bool consumeFirebaseResumePending();
 
     String getSSID() const;
 
-    void startAP();
+    void startAP(bool suspendFirebase = true);
     void stopAP();
 
 private:
     bool loadCredentials();
     void setupAPServer();
+    void enterAutomaticProvisioningMode();
 
     Preferences preferences;
     String ssid;
@@ -50,8 +53,10 @@ private:
     static constexpr unsigned long RECONNECT_INTERVAL = 10000;
 
     bool isAPMode = false;
+    bool firebaseResumePending = false;
+    bool initialConnectionAttempt = true;
     WebServer server{80};
     DNSServer dnsServer;
 };
 
-#endif
+#endif

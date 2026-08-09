@@ -31,6 +31,9 @@ private:
 
     AnalogSampler phSampler;
 
+    bool sensorSourceReported = false;
+    bool lastReportedMockSource = false;
+
     // =====================================================
     // Sensor Reading Functions
     // =====================================================
@@ -46,6 +49,8 @@ private:
     void readEC();
 
     void readPH();
+
+    void applyEffectiveSensors();
 };
 
 #endif

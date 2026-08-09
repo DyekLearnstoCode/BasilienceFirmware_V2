@@ -98,6 +98,7 @@ enum Actuator
     // Temperature
     CANOPY_FAN,
     PELTIER,
+    CIRCULATION_PUMP,
 
     ACTUATOR_COUNT
 };
@@ -116,6 +117,7 @@ inline const char* getActuatorName(Actuator a)
         case PH_DOWN_PUMP: return "phDownPump";
         case CANOPY_FAN: return "canopyFan";
         case PELTIER: return "peltier";
+        case CIRCULATION_PUMP: return "circulationPump";
         default: return "unknown";
     }
 }
@@ -137,6 +139,8 @@ struct ActuatorCommand
     bool targetState = false;
     uint8_t speed = 100;
     String source = "";
+    String strategy = "";
+    String reason = "";
     uint32_t timestamp = 0;
 };
 
@@ -147,6 +151,7 @@ struct ActuatorStatus
     uint8_t speed = 100;
     uint32_t startedAt = 0;
     String source = "";
+    String strategy = "";
     String reason = "";
 };
 
@@ -281,6 +286,7 @@ struct SystemState
     // Remote Mocking
     bool mockSensorsEnabled = false;
     SensorData mockSensors;
+    bool mockApplyPending = false;
 
     //==================================================
     // Operations

@@ -15,6 +15,8 @@ public:
 
     void update();
 
+    void syncMockSensors();
+
 private:
 
     //==================================================
@@ -37,6 +39,25 @@ private:
     //==================================================
 
     unsigned long lastSettingsRead = 0;
+
+    bool wasFirebaseConnected = false;
+    bool suspendedForProvisioning = false;
+    bool refillSettingsInitialized = false;
+    bool refillRejectionLogged = false;
+    float lastRejectedRefillStart = NAN;
+    float lastRejectedRefillStop = NAN;
+    bool highAirTempSettingsInitialized = false;
+    bool highAirTempRejectionLogged = false;
+    float lastRejectedHighAirTemp = NAN;
+
+    unsigned long lastAlertFullUpload = 0;
+    unsigned long lastActuatorFullUpload = 0;
+    bool alertCacheInitialized = false;
+    bool actuatorCacheInitialized = false;
+    AlertState lastPublishedAlerts;
+    ActuatorStatus lastPublishedActuators[ACTUATOR_COUNT];
+    uint64_t lastActuatorCommandTimestamps[ACTUATOR_COUNT] = { 0 };
+    bool actuatorCommandsPrimed = false;
 
     RequestState lastPublishedOperationState =
         RequestState::IDLE;
@@ -70,6 +91,10 @@ private:
 
     void readCommands();
     void readActuatorCommands();
+    void primeActuatorCommands();
+    void consumeActuatorCommandSnapshot(FirebaseJson& snapshot, bool dispatchCommands);
+    void loadActuatorCommandTimestamps();
+    void saveActuatorCommandTimestamp(Actuator actuator, uint64_t timestamp);
     void readMockSensors();
 
     void provisionDevice();
@@ -107,13 +132,13 @@ private:
     // Uploads
     //==================================================
 
-    void writeSensors();
+    void writeSensors(bool force = false);
 
     void writeStatus();
 
     void writeTelemetry();
 
-    void writeAlerts();
+    bool writeAlerts();
 
     void writeActuators();
 
