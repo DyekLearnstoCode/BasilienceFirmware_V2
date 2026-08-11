@@ -41,6 +41,8 @@ void SafetyManager::begin()
 
 void SafetyManager::update()
 {
+    // Refresh local safety inputs even while the FSM is parked in SAFETY_LOCK.
+    alertManager.update();
 }
 
 const char* SafetyManager::getSafetyReason(
@@ -65,6 +67,12 @@ const char* SafetyManager::getSafetyReason(
 
         case SafetyResult::RESERVOIR_LOCK:
             return "Reservoir locked";
+
+        case SafetyResult::INVALID_PH:
+            return "pH remains outside the configured safe range";
+
+        case SafetyResult::INVALID_EC:
+            return "EC remains below the configured safe threshold";
 
         default:
             return "Unknown";
@@ -188,6 +196,18 @@ SafetyResult SafetyManager::canResetSafety() const
     if(alertState.sensorFault)
     {
         return SafetyResult::SENSOR_FAULT;
+    }
+    if(alertState.lowWater)
+    {
+        return SafetyResult::LOW_WATER;
+    }
+    if(alertState.phOutOfRange)
+    {
+        return SafetyResult::INVALID_PH;
+    }
+    if(alertState.ecLow)
+    {
+        return SafetyResult::INVALID_EC;
     }
     return SafetyResult::SAFE;
 }

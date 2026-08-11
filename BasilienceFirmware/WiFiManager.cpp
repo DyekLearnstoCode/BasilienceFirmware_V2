@@ -59,7 +59,7 @@ bool WiFiManager::connect()
 
     while (WiFi.status() != WL_CONNECTED)
     {
-        if (millis() - startTime >= 30000)
+        if (millis() - startTime >= RECOVERY_TIMEOUT)
         {
             Serial.println();
             Serial.println("[WIFI] Connection failed");
@@ -172,7 +172,12 @@ bool WiFiManager::isConnected() const
 
 bool WiFiManager::isProvisioningMode() const
 {
-    return isAPMode;
+    return provisioningMode != ProvisioningMode::NONE;
+}
+
+WiFiManager::ProvisioningMode WiFiManager::getProvisioningMode() const
+{
+    return provisioningMode;
 }
 
 bool WiFiManager::consumeFirebaseResumePending()
@@ -210,10 +215,60 @@ bool WiFiManager::loadCredentials()
 
 void WiFiManager::update()
 {
-    if (isAPMode)
+    if (isProvisioningMode())
     {
         dnsServer.processNextRequest();
         server.handleClient();
+
+        // Keep the setup portal available while occasionally trying the retained
+        // network in STA mode. This lets a temporary router outage self-heal.
+        if (!hasCredentials()) return;
+
+        const unsigned long now = millis();
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            systemState.wifiConnected = true;
+            apReconnectInProgress = false;
+            if (provisioningMode == ProvisioningMode::MANUAL)
+            {
+                if (!manualReachabilityLogged)
+                {
+                    Serial.println("[WIFI] Saved network still reachable");
+                    Serial.println("[WIFI] Manual provisioning active - keeping setup AP open");
+                    manualReachabilityLogged = true;
+                }
+                return;
+            }
+
+            Serial.println("[WIFI] Saved network restored");
+            Serial.println("[WIFI] Returning to normal operation");
+            stopAP();
+            WiFi.mode(WIFI_STA);
+            return;
+        }
+
+        manualReachabilityLogged = false;
+
+        if (apReconnectInProgress)
+        {
+            if (now - apReconnectStartedAt >= RECOVERY_TIMEOUT)
+            {
+                Serial.println("[WIFI] Saved network still unavailable; provisioning remains active");
+                WiFi.disconnect(false, false);
+                apReconnectInProgress = false;
+            }
+            return;
+        }
+
+        if (lastAPReconnectAttempt == 0 || now - lastAPReconnectAttempt >= AP_RECONNECT_INTERVAL)
+        {
+            lastAPReconnectAttempt = now;
+            apReconnectStartedAt = now;
+            apReconnectInProgress = true;
+            Serial.println("[WIFI] Provisioning active; retrying saved network...");
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.begin(ssid.c_str(), password.c_str());
+        }
         return;
     }
 
@@ -222,28 +277,49 @@ void WiFiManager::update()
 
     if (systemState.wifiConnected)
     {
+        if (recoveryInProgress)
+        {
+            Serial.println("[WIFI] Saved network restored");
+            Serial.println("[WIFI] Returning to normal operation");
+            recoveryInProgress = false;
+        }
         return;
     }
 
-    if (millis() - lastReconnectAttempt <
-        RECONNECT_INTERVAL)
+    const unsigned long now = millis();
+    if (!recoveryInProgress)
+    {
+        recoveryInProgress = true;
+        recoveryStartedAt = now;
+        lastReconnectAttempt = 0;
+        Serial.println("[WIFI] Connection lost");
+        Serial.println("[WIFI] Attempting reconnection...");
+    }
+
+    if (now - recoveryStartedAt >= RECOVERY_TIMEOUT)
+    {
+        Serial.println("[WIFI] Reconnection timeout");
+        Serial.println("[WIFI] Starting provisioning AP");
+        Serial.println("[WIFI] Saved credentials retained");
+        recoveryInProgress = false;
+        enterAutomaticProvisioningMode();
+        return;
+    }
+
+    if (lastReconnectAttempt != 0 && now - lastReconnectAttempt < RECONNECT_INTERVAL)
     {
         return;
     }
 
-    lastReconnectAttempt = millis();
-
-    Serial.println();
-    Serial.println("WiFi disconnected.");
-
-    Serial.println("Attempting reconnection...");
-
-    reconnect();
+    lastReconnectAttempt = now;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
 }
 
 void WiFiManager::enterAutomaticProvisioningMode()
 {
-    Serial.println("[WIFI] Entering provisioning mode");
+    if (provisioningMode == ProvisioningMode::MANUAL) return;
+    Serial.println("[WIFI] Provisioning mode: FALLBACK");
     if (initialConnectionAttempt)
     {
         Serial.println("[FIREBASE] Not started because Wi-Fi is unavailable");
@@ -251,19 +327,27 @@ void WiFiManager::enterAutomaticProvisioningMode()
 
     // Stop the failed STA association before assigning the radio to the setup AP.
     WiFi.disconnect(true, false);
-    startAP(!initialConnectionAttempt);
+    startAP(ProvisioningMode::FALLBACK, !initialConnectionAttempt);
 }
 
-void WiFiManager::startAP(bool suspendFirebase)
+void WiFiManager::startManualProvisioning()
 {
-    if (isAPMode) return;
+    if (provisioningMode == ProvisioningMode::MANUAL) return;
+    if (isProvisioningMode()) stopAP();
+    Serial.println("[WIFI] Provisioning mode: MANUAL");
+    startAP(ProvisioningMode::MANUAL, true);
+}
+
+void WiFiManager::startAP(ProvisioningMode mode, bool suspendFirebase)
+{
+    if (isProvisioningMode()) return;
 
     if (suspendFirebase)
     {
         Serial.println("[FIREBASE] Suspended during provisioning mode");
     }
     Serial.println("[AP] Starting Basilience-Setup");
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(hasCredentials() ? WIFI_AP_STA : WIFI_AP);
     const IPAddress apIp(192, 168, 4, 1);
     const IPAddress gateway(192, 168, 4, 1);
     const IPAddress subnet(255, 255, 255, 0);
@@ -282,7 +366,10 @@ void WiFiManager::startAP(bool suspendFirebase)
     setupAPServer();
     server.begin();
 
-    isAPMode = true;
+    provisioningMode = mode;
+    manualReachabilityLogged = false;
+    lastAPReconnectAttempt = millis();
+    apReconnectInProgress = false;
     Serial.print("[AP] IP: ");
     Serial.println(WiFi.softAPIP());
     Serial.println("[AP] HTTP server started");
@@ -290,13 +377,17 @@ void WiFiManager::startAP(bool suspendFirebase)
 
 void WiFiManager::stopAP()
 {
-    if (!isAPMode) return;
+    if (!isProvisioningMode()) return;
     
     Serial.println("Stopping Access Point...");
     dnsServer.stop();
     server.stop();
-    WiFi.softAPdisconnect(true);
-    isAPMode = false;
+    // Keep the STA radio alive when AP+STA recovery has already restored the
+    // saved network; only remove the provisioning access point.
+    WiFi.softAPdisconnect(false);
+    provisioningMode = ProvisioningMode::NONE;
+    manualReachabilityLogged = false;
+    apReconnectInProgress = false;
 }
 
 void WiFiManager::setupAPServer()
@@ -333,7 +424,6 @@ void WiFiManager::setupAPServer()
             return;
         }
         Serial.println("[AP] Credentials saved");
-        Serial.println("[AP] Credentials saved");
 
         preferences.begin("wifi", false);
         preferences.putBool("resumeFirebase", true);
@@ -341,6 +431,11 @@ void WiFiManager::setupAPServer()
 
         server.send(200, "text/plain", "Credentials saved. Connecting device...");
         Serial.println("[AP HTTP] Response: 200");
+
+        if (provisioningMode == ProvisioningMode::MANUAL)
+        {
+            Serial.println("[WIFI] Manual provisioning completed");
+        }
 
         Serial.println("[WIFI] Reconnecting...");
         delay(1000);

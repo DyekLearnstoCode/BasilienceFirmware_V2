@@ -12,17 +12,23 @@
 #include "SafetyManager.h"
 #include "DebugManager.h"
 
+bool firebaseInitialized = false;
+
 void setup()
 {
 
     Serial.begin(115200);
-    
+
+    // Restore the last validated automation configuration before networking so
+    // an offline boot does not silently forget the user's accepted settings.
+    firebaseManager.loadPersistedSettings();
     wifiManager.begin();
     Serial.print("ESP32 MAC: ");
 Serial.println(WiFi.macAddress());
     if (!wifiManager.isProvisioningMode())
     {
         firebaseManager.begin();
+        firebaseInitialized = true;
     }
     actuatorManager.begin();
 
@@ -55,6 +61,7 @@ void loop()
     rtcManager.update();
 
     automationManager.update();
+    safetyManager.update();
     actuatorManager.update();
 
     if (provisioningMode)
@@ -64,6 +71,14 @@ void loop()
         wifiManager.update();
         debugManager.update();
         return;
+    }
+
+    // A saved network can recover while the setup AP is active. Firebase was
+    // intentionally never started on that boot, so initialize it only now.
+    if (!firebaseInitialized)
+    {
+        firebaseManager.begin();
+        firebaseInitialized = true;
     }
 
     firebaseManager.update();

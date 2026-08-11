@@ -389,6 +389,10 @@ struct AlertState
 
     bool phOutOfRange = false;
 
+    bool phLow = false;
+
+    bool phHigh = false;
+
     bool waterTempOutOfRange = false;
 
     bool sensorFault = false;

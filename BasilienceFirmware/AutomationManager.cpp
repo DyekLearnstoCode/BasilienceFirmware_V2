@@ -73,25 +73,6 @@ void AutomationManager::update()
     }
 
     //--------------------------------------------------
-    // Manual mode
-    //--------------------------------------------------
-
-    if(systemState.manualMode)
-    {
-        // Abort any running automated operations when manual override mode is enabled
-        if(systemState.operationRequest.state == RequestState::RUNNING)
-        {
-            failCurrentOperation("Aborted: manual override mode activated");
-        }
-        
-        // Force the FSM state back to NORMAL if it is in an active dosing/refilling operational state
-        if(systemState.currentMode != NORMAL && systemState.currentMode != SENSOR_STABILIZATION && systemState.currentMode != SAFETY_LOCK)
-        {
-            changeState(NORMAL);
-        }
-    }
-
-    //--------------------------------------------------
     // State Machine
     //--------------------------------------------------
 
@@ -618,12 +599,6 @@ void AutomationManager::handleNormal()
     validateNormalOperation();
 
     handleCanopyClimate();
-
-    if (systemState.manualMode)
-    {
-        processFogCycle();
-        return;
-    }
 
     // Check for automatic refill before processing manual requests
     if (alertState.lowWater)

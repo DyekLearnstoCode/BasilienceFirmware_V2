@@ -79,10 +79,13 @@ void AlertManager::updateWaterTemperatureAlert()
 
 void AlertManager::updatePHAlert()
 {
-    setAlert(
-        "phOutOfRange",
-        alertState.phOutOfRange,
-        sensors.ph < systemState.minPH || sensors.ph > systemState.maxPH);
+    const bool valid = isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
+    const bool low = valid && sensors.ph < systemState.minPH;
+    const bool high = valid && sensors.ph > systemState.maxPH;
+
+    setAlert("phLow", alertState.phLow, low);
+    setAlert("phHigh", alertState.phHigh, high);
+    setAlert("phOutOfRange", alertState.phOutOfRange, low || high);
 }
 
 void AlertManager::updateECAlert()

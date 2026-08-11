@@ -13,6 +13,8 @@ public:
 
     void begin();
 
+    void loadPersistedSettings();
+
     void update();
 
     void syncMockSensors();
@@ -42,6 +44,12 @@ private:
 
     bool wasFirebaseConnected = false;
     bool suspendedForProvisioning = false;
+    bool hasPublishedHeartbeat = false;
+    bool heartbeatResumePending = false;
+    unsigned long lastSuccessfulSensorUpload = 0;
+    unsigned long lastHeartbeatSuccessLog = 0;
+    uint32_t consecutiveSensorUploadFailures = 0;
+    String lastSensorUploadFailureReason;
     bool refillSettingsInitialized = false;
     bool refillRejectionLogged = false;
     float lastRejectedRefillStart = NAN;
@@ -75,6 +83,8 @@ private:
     bool updateJson(
         const String& path,
         FirebaseJson& json);
+
+    void logFirebaseDuration(const char* operation, unsigned long durationMs) const;
     
     String deviceRoot() const;
     void loadDeviceId();
@@ -86,6 +96,8 @@ private:
     //==================================================
 
     void readSettings();
+
+    void persistSettings();
 
     void syncRTC();
 

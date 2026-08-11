@@ -87,6 +87,8 @@
                 "ecLow": false,
                 "highTemperature": false,
                 "lowWater": false,
+                "phHigh": false,
+                "phLow": false,
                 "phOutOfRange": false,
                 "sensorFault": true,
                 "waterTempOutOfRange": false
