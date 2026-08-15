@@ -33,6 +33,19 @@ private:
 
     bool sensorSourceReported = false;
     bool lastReportedMockSource = false;
+    bool sensorSourceWaitingLogged = false;
+
+    // Water-temperature read scheduling and transient-failure tolerance.
+    // physicalSensors.waterTemp only becomes NaN once a scheduled read has
+    // failed WATER_TEMP_READ_INTERVAL_MS-spaced attempts consecutively for
+    // SENSOR_TRANSIENT_FAILURE_THRESHOLD times; lastValidWaterTemp is kept
+    // separately so readEC() can still compensate using it even after that.
+    unsigned long lastWaterTempReadTime = 0;
+    uint8_t waterTempFailureStreak = 0;
+    float lastValidWaterTemp = NAN;
+
+    enum class EcCompensationSource { LIVE, LAST_VALID, FALLBACK_DEFAULT };
+    EcCompensationSource lastEcCompensationSource = EcCompensationSource::LIVE;
 
     // =====================================================
     // Sensor Reading Functions

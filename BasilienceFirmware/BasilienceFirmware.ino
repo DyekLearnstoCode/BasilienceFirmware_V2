@@ -19,27 +19,23 @@ void setup()
 
     Serial.begin(115200);
 
-    // Restore the last validated automation configuration before networking so
-    // an offline boot does not silently forget the user's accepted settings.
+    // Local plant protection is initialized before any network or TLS path.
+    // Defaults/persisted settings, safe GPIO states, sensors, RTC, safety, and
+    // automation are therefore available even when Firebase is unreachable.
     firebaseManager.loadPersistedSettings();
-    wifiManager.begin();
-    Serial.print("ESP32 MAC: ");
-Serial.println(WiFi.macAddress());
-    if (!wifiManager.isProvisioningMode())
-    {
-        firebaseManager.begin();
-        firebaseInitialized = true;
-    }
     actuatorManager.begin();
-
     sensorManager.begin();
     rtcManager.begin();
-
-
-    automationManager.begin();
-
-    debugManager.begin();
+    alertManager.begin();
     safetyManager.begin();
+    automationManager.begin();
+    debugManager.begin();
+
+    Serial.println("[CONTROL] Local automation and safety ready");
+
+    wifiManager.begin();
+    Serial.print("ESP32 MAC: ");
+    Serial.println(WiFi.macAddress());
 }
 
 void loop()
@@ -50,19 +46,19 @@ void loop()
     wifiManager.update();
     const bool provisioningMode = wifiManager.isProvisioningMode();
 
-    // Read a pending mock command before choosing the effective sensor source.
-    // This guarantees automation consumes the same dataset acknowledged in status/mockData.
-    if (!provisioningMode)
-    {
-        firebaseManager.syncMockSensors();
-    }
-
     sensorManager.update();
     rtcManager.update();
 
-    automationManager.update();
-    safetyManager.update();
+    if (!systemState.sensorTestEnabled)
+    {
+        automationManager.update();
+        safetyManager.update();
+    }
     actuatorManager.update();
+
+    // All optional Firebase polling runs after local sensing, control, safety,
+    // and actuator enforcement. Newly received mock/test commands take effect
+    // on the next local control iteration.
 
     if (provisioningMode)
     {
@@ -75,7 +71,7 @@ void loop()
 
     // A saved network can recover while the setup AP is active. Firebase was
     // intentionally never started on that boot, so initialize it only now.
-    if (!firebaseInitialized)
+    if (!firebaseInitialized && wifiManager.isConnected())
     {
         firebaseManager.begin();
         firebaseInitialized = true;

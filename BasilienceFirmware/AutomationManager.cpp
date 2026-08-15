@@ -3,6 +3,23 @@
 #include "Config.h"
 #include "Globals.h"
 
+namespace
+{
+    // Local to this file so it does not collide with FirebaseManager.cpp's
+    // own (internal-linkage) operationToString() used for RTDB payloads.
+    const char* latencyOperationName(OperationType operation)
+    {
+        switch(operation)
+        {
+            case OperationType::REFILL: return "REFILL";
+            case OperationType::PH_UP: return "PH_UP";
+            case OperationType::PH_DOWN: return "PH_DOWN";
+            case OperationType::EC_CORRECTION: return "EC_CORRECTION";
+            default: return "NONE";
+        }
+    }
+}
+
 void AutomationManager::begin()
 {
     startupPhase = STARTUP_FOG_ON;
@@ -229,6 +246,11 @@ void AutomationManager::processPHUpOperation()
     systemState.phDirection =
         PH_UP;
 
+    {
+        const float error = systemState.phTargetMin - sensors.ph;
+        systemState.phDoseTime = error < 0.3f ? 5000UL : (error < 1.0f ? 10000UL : 15000UL);
+    }
+
     systemState.correctionMode =
         systemState.operationRequest.source == RequestSource::AUTOMATIC ?
             CorrectionMode::AUTOMATIC : CorrectionMode::MANUAL;
@@ -274,6 +296,11 @@ void AutomationManager::processPHDownOperation()
     systemState.phDirection =
         PH_DOWN;
 
+    {
+        const float error = sensors.ph - systemState.phTargetMax;
+        systemState.phDoseTime = error < 0.3f ? 5000UL : (error < 1.0f ? 10000UL : 15000UL);
+    }
+
     systemState.correctionMode =
         systemState.operationRequest.source == RequestSource::AUTOMATIC ?
             CorrectionMode::AUTOMATIC : CorrectionMode::MANUAL;
@@ -294,33 +321,17 @@ void AutomationManager::processResetSafetyOperation()
         return;
     }
 
-    if(systemState.currentMode !=
-       SAFETY_LOCK)
+    String reason;
+    if(!safetyManager.resetRecoverableSubsystems(reason))
     {
-        // Already safe or not in lock
-        completeCurrentOperation();
+        failCurrentOperation(reason.isEmpty() ? "No locked subsystem can be reset." : reason);
         return;
     }
 
-    SafetyResult result =
-        safetyManager.canResetSafety();
-
-    if(result != SafetyResult::SAFE)
-    {
-        failCurrentOperation(
-            safetyManager.getSafetyReason(result));
-
-        return;
-    }
-
-    // Reset is safe; clear attempt counters
     systemState.phAttempts = 0;
     systemState.ecAttempts = 0;
-    systemState.safetyLock = false;
-
-    changeState(
-        STARTUP);
-
+    systemState.reservoirLocked = false;
+    if(systemState.currentMode == SAFETY_LOCK) changeState(STARTUP);
     completeCurrentOperation();
 }
 
@@ -380,6 +391,31 @@ void AutomationManager::completeCurrentOperation()
 
     systemState.operationRequest.lastUpdatedTimestamp =
         systemState.operationRequest.completedTimestamp;
+
+    if (systemState.operationRequest.operation == OperationType::PH_UP ||
+        systemState.operationRequest.operation == OperationType::PH_DOWN ||
+        systemState.operationRequest.operation == OperationType::EC_CORRECTION ||
+        systemState.operationRequest.operation == OperationType::REFILL)
+    {
+        Serial.print("[LATENCY] localComplete t=");
+        Serial.print(systemState.operationRequest.completedTimestamp);
+        Serial.print(" requestId=");
+        Serial.print(systemState.operationRequest.requestId);
+        Serial.print(" operation=");
+        Serial.println(latencyOperationName(systemState.operationRequest.operation));
+    }
+
+    if (systemState.operationRequest.source == RequestSource::AUTOMATIC &&
+        (systemState.operationRequest.operation == OperationType::PH_UP ||
+         systemState.operationRequest.operation == OperationType::PH_DOWN ||
+         systemState.operationRequest.operation == OperationType::EC_CORRECTION))
+    {
+        systemState.chemistryFoggingHoldActive = true;
+        systemState.chemistryFoggingHoldStartTime =
+            systemState.operationRequest.completedTimestamp;
+
+        Serial.println("[CHEMISTRY] Correction complete - waiting for lifecycle publication");
+    }
 
         systemState.correctionMode =
     CorrectionMode::NONE;
@@ -513,6 +549,12 @@ if(newMode == STARTUP)
         refillDiagnosticsInitialized = false;
     }
 
+    if(newMode == DOSING_PH || newMode == STABILIZING_PH ||
+       newMode == DOSING_EC || newMode == STABILIZING_EC)
+    {
+        suspendAutomaticRootFogging("Chemistry correction active");
+    }
+
     systemState.currentMode =
         newMode;
 
@@ -523,9 +565,15 @@ if(newMode == STARTUP)
 //sensor stabilization
 void AutomationManager::handleSensorStabilization()
 {
-    actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+    suspendAutomaticRootFogging("Waiting for valid startup sensor readings");
 
-    actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
+    // Stabilization no longer gates every reservoir-control subsystem. Each
+    // path's safety check requires the readings it needs to be finite and valid.
+    // Applied mock data is therefore authoritative on the next local pass.
+    if(processReadyLocalRegulation())
+    {
+        return;
+    }
 
     if(millis() -
        systemState.stateStartTime >=
@@ -544,19 +592,26 @@ void AutomationManager::handleStartup()
         return;
     }
 
+    // Retain the startup fog cycle without making it an exclusive 120-second
+    // gate in front of ready local reservoir-control inputs.
+    if(processReadyLocalRegulation())
+    {
+        return;
+    }
+
     switch(startupPhase)
     {
         case STARTUP_FOG_ON:
         {
             actuatorManager.requestCommand(FOGGER, true, "automatic", millis(), 100, "startup");
-            actuatorManager.requestCommand(BLOWER, true, "automatic", millis());
+            actuatorManager.requestCommand(BLOWER, true, "automatic", millis(), 100, "startup");
 
             if(millis() -
                systemState.stateStartTime >=
                STARTUP_ON_TIME)
             {
                 actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
-                actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
+                actuatorManager.requestCommand(BLOWER, false, "automatic", millis(), 100, "startup");
 
                 startupPhase =
                     STARTUP_FOG_OFF;
@@ -571,7 +626,7 @@ void AutomationManager::handleStartup()
         case STARTUP_FOG_OFF:
         {
             actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
-            actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
+            actuatorManager.requestCommand(BLOWER, false, "automatic", millis(), 100, "startup");
 
             if(millis() -
                systemState.stateStartTime >=
@@ -596,7 +651,7 @@ void AutomationManager::handleNormal()
 
     alertManager.update();
 
-    validateNormalOperation();
+    const bool fogCycleAllowed = validateNormalOperation();
 
     handleCanopyClimate();
 
@@ -627,7 +682,44 @@ void AutomationManager::handleNormal()
         return;
     }
 
-    processFogCycle();
+    if(fogCycleAllowed)
+    {
+        processFogCycle();
+    }
+}
+
+bool AutomationManager::processReadyLocalRegulation()
+{
+    alertManager.update();
+
+    if(alertState.lowWater)
+    {
+        SafetyResult result = safetyManager.canRefill();
+        if(result == SafetyResult::SAFE)
+        {
+            createOperationRequest(
+                generateAutoRequestId(),
+                OperationType::REFILL,
+                OperationAction::START,
+                RequestSource::AUTOMATIC);
+            changeState(REFILLING);
+            return true;
+        }
+    }
+
+    if(processRefillRequest()) return true;
+    if(processPHCorrection()) return true;
+    if(processECCorrection()) return true;
+
+    return false;
+}
+
+void AutomationManager::suspendAutomaticRootFogging(const String& reason)
+{
+    actuatorManager.requestCommand(
+        FOGGER, false, "automatic", millis(), 100, "", reason);
+    actuatorManager.requestCommand(
+        BLOWER, false, "automatic", millis(), 100, "", reason);
 }
 
 //safety Lock Handling
@@ -635,6 +727,7 @@ bool AutomationManager::validateNormalOperation()
 {
     static bool diagnosticInitialized = false;
     static SafetyResult lastDiagnosticResult = SafetyResult::SAFE;
+    static bool coolingFoggingSuspendedLogged = false;
 
     SafetyResult result =
         safetyManager.canFog();
@@ -663,6 +756,49 @@ bool AutomationManager::validateNormalOperation()
 
     diagnosticInitialized = true;
     lastDiagnosticResult = SafetyResult::SAFE;
+
+    // Root fogging must stay off for the entire duration active water
+    // cooling is required, independent of the chemistry hold below.
+    // coolingDemandActive is the same authoritative signal updateCooling()
+    // itself uses to drive circulation/Peltier - not a separate condition.
+    if (coolingDemandActive)
+    {
+        actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
+        actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
+
+        if (!coolingFoggingSuspendedLogged)
+        {
+            Serial.println("[COOLING] Root fogging suspended during water cooling");
+            coolingFoggingSuspendedLogged = true;
+        }
+
+        return false;
+    }
+
+    if (coolingFoggingSuspendedLogged)
+    {
+        Serial.println("[COOLING] Root fogging eligible after cooling");
+        coolingFoggingSuspendedLogged = false;
+    }
+
+    // canFog() already confirmed pH/EC are in range and no dosing/stabilizing
+    // is active. A just-completed automatic chemistry correction still holds
+    // Fogger/Blower back until FirebaseManager confirms the COMPLETED write,
+    // unless the bounded local grace period has elapsed - Firebase
+    // availability must never be a plant-survival dependency.
+    if (systemState.chemistryFoggingHoldActive)
+    {
+        if (millis() - systemState.chemistryFoggingHoldStartTime >=
+            CHEMISTRY_FOGGING_HOLD_TIMEOUT_MS)
+        {
+            systemState.chemistryFoggingHoldActive = false;
+            Serial.println("[CHEMISTRY] Cloud unavailable - releasing fogging from local safe state");
+        }
+        else
+        {
+            return false;
+        }
+    }
 
     return true;
 }
@@ -843,6 +979,9 @@ bool AutomationManager::processRefillRequest()
 //PH Correction Handling
 bool AutomationManager::processPHCorrection()
 {
+    if(systemState.phSubsystemLocked)
+        return false;
+
     if(!alertState.phOutOfRange)
     {
         return false;
@@ -856,8 +995,10 @@ bool AutomationManager::processPHCorrection()
         systemState.phDirection =
             PH_UP;
 
+        // minPH/maxPH remain the acceptable-range trigger only; dose size is
+        // computed against the correction target, matching every retry dose.
         error =
-            systemState.minPH -
+            systemState.phTargetMin -
             sensors.ph;
     }
     else
@@ -867,23 +1008,23 @@ bool AutomationManager::processPHCorrection()
 
         error =
             sensors.ph -
-            systemState.maxPH;
+            systemState.phTargetMax;
     }
 
     if(error < 0.3f)
     {
         systemState.phDoseTime =
-            15000UL;
+            5000UL;
     }
     else if(error < 1.0f)
     {
         systemState.phDoseTime =
-            30000UL;
+            10000UL;
     }
     else
     {
         systemState.phDoseTime =
-            60000UL;
+            15000UL;
     }
 
     SafetyResult result =
@@ -926,36 +1067,51 @@ bool AutomationManager::processPHCorrection()
 //EC Correction Handling
 bool AutomationManager::processECCorrection()
 {
-    if(!alertState.ecLow)
+    if(systemState.ecSubsystemLocked)
+        return false;
+
+    if(!alertState.ecLow && !alertState.ecHigh)
     {
         return false;
     }
 
-    float error =
-        systemState.minEC -
-        sensors.ec;
+    systemState.ecDirection = alertState.ecLow ? EC_RAISE : EC_DILUTE;
+
+    float error = systemState.ecDirection == EC_RAISE
+        ? systemState.ecTargetMin - sensors.ec
+        : sensors.ec - systemState.ecTargetMax;
 
     if(error < 0.2f)
     {
         systemState.ecDoseTime =
-            15000UL;
+            5000UL;
     }
     else if(error < 0.5f)
     {
         systemState.ecDoseTime =
-            30000UL;
+            10000UL;
     }
     else
     {
         systemState.ecDoseTime =
-            60000UL;
+            15000UL;
     }
 
-    SafetyResult result =
-        safetyManager.canDoseEC();
+    SafetyResult result = systemState.ecDirection == EC_RAISE
+        ? safetyManager.canDoseEC()
+        : safetyManager.canDiluteEC();
 
     if(result != SafetyResult::SAFE)
     {
+        if(systemState.ecDirection == EC_DILUTE && result == SafetyResult::RESERVOIR_FULL)
+        {
+            systemState.ecSubsystemLocked = true;
+            actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+            actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+            actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100,
+                "dilution", "Reservoir full; manual EC attention required");
+            Serial.println("[EC] Dilution blocked: reservoir full; manual attention required");
+        }
         failCurrentOperation(
             safetyManager.getSafetyReason(result));
 
@@ -970,8 +1126,11 @@ bool AutomationManager::processECCorrection()
     );
 
     Serial.print("[EC] value="); Serial.print(sensors.ec, 2);
-    Serial.print(" min="); Serial.println(systemState.minEC, 2);
-    Serial.println("[EC] requesting nutrient correction");
+    Serial.print(" min="); Serial.print(systemState.minEC, 2);
+    Serial.print(" max="); Serial.println(systemState.maxEC, 2);
+    Serial.println(systemState.ecDirection == EC_RAISE
+        ? "[EC] requesting nutrient correction"
+        : "[EC] requesting dilution correction");
 
     systemState.correctionMode =
     CorrectionMode::AUTOMATIC;
@@ -1005,11 +1164,27 @@ void AutomationManager::processECCorrectionOperation()
         return;
     }
 
-    SafetyResult result =
-        safetyManager.canDoseEC();
+    systemState.ecDirection = sensors.ec < systemState.minEC ? EC_RAISE : EC_DILUTE;
+    const float error = systemState.ecDirection == EC_RAISE
+        ? systemState.ecTargetMin - sensors.ec
+        : sensors.ec - systemState.ecTargetMax;
+    systemState.ecDoseTime = error < 0.2f ? 5000UL : (error < 0.5f ? 10000UL : 15000UL);
+
+    SafetyResult result = systemState.ecDirection == EC_RAISE
+        ? safetyManager.canDoseEC()
+        : safetyManager.canDiluteEC();
 
     if(result != SafetyResult::SAFE)
     {
+        if(systemState.ecDirection == EC_DILUTE && result == SafetyResult::RESERVOIR_FULL)
+        {
+            systemState.ecSubsystemLocked = true;
+            actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+            actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+            actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100,
+                "dilution", "Reservoir full; manual EC attention required");
+            Serial.println("[EC] Dilution blocked: reservoir full; manual attention required");
+        }
         failCurrentOperation(
             safetyManager.getSafetyReason(result));
 
@@ -1084,7 +1259,7 @@ void AutomationManager::processFogCycle()
             FOGGER, true, "automatic", millis(), 100, activeFogStrategy);
 
         actuatorManager.requestCommand(
-            BLOWER, true, "automatic", millis());
+            BLOWER, true, "automatic", millis(), 100, activeFogStrategy);
 
         if(elapsed >= fogOnTime)
         {
@@ -1098,7 +1273,7 @@ void AutomationManager::processFogCycle()
             FOGGER, false, "automatic", millis(), 100, activeFogStrategy);
 
         actuatorManager.requestCommand(
-            BLOWER, false, "automatic", millis());
+            BLOWER, false, "automatic", millis(), 100, activeFogStrategy);
 
         if(elapsed >= fogOffTime)
         {
@@ -1325,35 +1500,37 @@ void AutomationManager::handleStabilizingPH()
        systemState.stateStartTime >=
        PH_STABILIZATION_TIME)
     {
-        if(alertState.phOutOfRange)
+        const bool targetReached =
+            systemState.phDirection == PH_UP
+                ? sensors.ph >= systemState.phTargetMin
+                : sensors.ph <= systemState.phTargetMax;
+
+        if(!targetReached)
         {
             systemState.phAttempts++;
 
             if(systemState.phAttempts >=
             MAX_PH_ATTEMPTS)
             {
-                failCurrentOperation(
-                    "Maximum pH correction attempts reached.");
-
-                changeState(
-                    SAFETY_LOCK);
+                failCurrentSubsystem("Maximum pH correction attempts reached.");
 
                 return;
             }
 
-            // Recalculate error and direction to prevent wrong-way dosing if we overshot
-            float error;
-            if(sensors.ph < systemState.minPH) {
-                systemState.phDirection = PH_UP;
-                error = systemState.minPH - sensors.ph;
-            } else {
+            // Continue toward the inner target. Only reverse direction after an
+            // actual overshoot beyond the opposite inner target.
+            if(systemState.phDirection == PH_UP && sensors.ph > systemState.phTargetMax)
                 systemState.phDirection = PH_DOWN;
-                error = sensors.ph - systemState.maxPH;
-            }
+            else if(systemState.phDirection == PH_DOWN && sensors.ph < systemState.phTargetMin)
+                systemState.phDirection = PH_UP;
 
-            if(error < 0.3f) systemState.phDoseTime = 15000UL;
-            else if(error < 1.0f) systemState.phDoseTime = 30000UL;
-            else systemState.phDoseTime = 60000UL;
+            const float error = systemState.phDirection == PH_UP
+                ? systemState.phTargetMin - sensors.ph
+                : sensors.ph - systemState.phTargetMax;
+
+            if(error < 0.3f) systemState.phDoseTime = 5000UL;
+            else if(error < 1.0f) systemState.phDoseTime = 10000UL;
+            else systemState.phDoseTime = 15000UL;
 
             systemState.firstCorrectionCycle = false;
 
@@ -1383,8 +1560,9 @@ void AutomationManager::handleDosingEC()
 {
     alertManager.update();
 
-    SafetyResult result =
-        safetyManager.canDoseEC();
+    SafetyResult result = systemState.ecDirection == EC_RAISE
+        ? safetyManager.canDoseEC()
+        : safetyManager.canDiluteEC();
 
     if(result != SafetyResult::SAFE)
     {
@@ -1394,8 +1572,19 @@ void AutomationManager::handleDosingEC()
 
     systemState.reservoirLocked = true;
 
-    actuatorManager.requestCommand(GROW_PUMP, true, "automatic", millis());
-    actuatorManager.requestCommand(BLOOM_PUMP, true, "automatic", millis());
+    if(systemState.ecDirection == EC_RAISE)
+    {
+        actuatorManager.requestCommand(SOLENOID, false, "automatic", millis());
+        actuatorManager.requestCommand(GROW_PUMP, true, "automatic", millis());
+        actuatorManager.requestCommand(BLOOM_PUMP, true, "automatic", millis());
+    }
+    else
+    {
+        actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(SOLENOID, true, "automatic", millis(), 100,
+            "dilution", "ec_high_dilution");
+    }
 
     bool stopDosing = false;
 
@@ -1403,7 +1592,10 @@ void AutomationManager::handleDosingEC()
        CorrectionMode::MANUAL &&
        systemState.firstCorrectionCycle)
     {
-        if(!alertState.ecLow)
+        const bool targetReached = systemState.ecDirection == EC_RAISE
+            ? sensors.ec >= systemState.ecTargetMin
+            : sensors.ec <= systemState.ecTargetMax;
+        if(targetReached)
         {
             stopDosing = true;
         }
@@ -1429,6 +1621,9 @@ void AutomationManager::handleDosingEC()
     {
         actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
         actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100,
+            systemState.ecDirection == EC_DILUTE ? "dilution" : "",
+            systemState.ecDirection == EC_DILUTE ? "dilution_interval_complete" : "");
 
         changeState(STABILIZING_EC);
     }
@@ -1439,8 +1634,17 @@ void AutomationManager::handleStabilizingEC()
 {
     alertManager.update();
 
-    SafetyResult result =
-        safetyManager.canDoseEC();
+    SafetyResult result = systemState.ecDirection == EC_RAISE
+        ? safetyManager.canDoseEC()
+        : safetyManager.canDiluteEC();
+
+    // A full reservoir is a terminal dilution condition only while EC still
+    // requires correction. The solenoid must never continue adding water.
+    if(result == SafetyResult::RESERVOIR_FULL && systemState.ecDirection == EC_DILUTE)
+    {
+        failCurrentSubsystem("Reservoir reached refill stop level before EC target; manual attention required.");
+        return;
+    }
 
     if(result != SafetyResult::SAFE)
     {
@@ -1454,48 +1658,53 @@ void AutomationManager::handleStabilizingEC()
     actuatorManager.requestCommand(
         BLOOM_PUMP, false, "automatic", millis());
 
+    actuatorManager.requestCommand(
+        SOLENOID, false, "automatic", millis(), 100,
+        systemState.ecDirection == EC_DILUTE ? "dilution" : "");
+
     if(millis() -
        systemState.stateStartTime >=
        EC_STABILIZATION_TIME)
     {
         alertManager.update();
 
-        if(alertState.ecLow)
+        const bool targetReached =
+            systemState.ecDirection == EC_RAISE
+                ? sensors.ec >= systemState.ecTargetMin
+                : sensors.ec <= systemState.ecTargetMax;
+
+        if(!targetReached)
         {
             systemState.ecAttempts++;
 
             if(systemState.ecAttempts >=
             MAX_EC_ATTEMPTS)
             {
-                failCurrentOperation(
-                    "Maximum EC correction attempts reached.");
-
-                changeState(
-                    SAFETY_LOCK);
+                failCurrentSubsystem("Maximum EC correction attempts reached; manual attention required.");
 
                 return;
             }
 
             systemState.firstCorrectionCycle = false;
 
-            float error =
-                systemState.minEC -
-                sensors.ec;
+            float error = systemState.ecDirection == EC_RAISE
+                ? systemState.ecTargetMin - sensors.ec
+                : sensors.ec - systemState.ecTargetMax;
 
             if(error < 0.2f)
             {
                 systemState.ecDoseTime =
-                    15000UL;
+                    5000UL;
             }
             else if(error < 0.5f)
             {
                 systemState.ecDoseTime =
-                    30000UL;
+                    10000UL;
             }
             else
             {
                 systemState.ecDoseTime =
-                    60000UL;
+                    15000UL;
             }
 
             changeState(
@@ -1505,6 +1714,8 @@ void AutomationManager::handleStabilizingEC()
         }
 
         systemState.ecAttempts = 0;
+
+        systemState.ecDirection = EC_NONE;
 
         systemState.reservoirLocked = false;
 
@@ -1576,16 +1787,53 @@ bool AutomationManager::abortCurrentOperation(
     Serial.print(" stopped: ");
     Serial.println(reason);
 
-    actuatorManager.turnOffAll(reason);
-
-    systemState.reservoirLocked = true;
-
-    failCurrentOperation(reason);
-
-    changeState(
-        SAFETY_LOCK);
+    failCurrentSubsystem(reason);
 
     return true;
+}
+
+void AutomationManager::failCurrentSubsystem(const String& reason)
+{
+    const OperationType operation = systemState.operationRequest.operation;
+
+    if(operation == OperationType::PH_UP || operation == OperationType::PH_DOWN ||
+       systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH)
+    {
+        suspendAutomaticRootFogging("pH remains outside the acceptable range");
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis(), 100, "", reason);
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis(), 100, "", reason);
+        systemState.phSubsystemLocked = true;
+    }
+    else if(operation == OperationType::EC_CORRECTION ||
+            systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC)
+    {
+        suspendAutomaticRootFogging("EC remains outside the acceptable range");
+        actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis(), 100, "", reason);
+        actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis(), 100, "", reason);
+        actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100,
+            systemState.ecDirection == EC_DILUTE ? "dilution" : "", reason);
+        systemState.ecSubsystemLocked = true;
+        systemState.ecDirection = EC_NONE;
+    }
+    else if(operation == OperationType::REFILL || systemState.currentMode == REFILLING)
+    {
+        actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100, "refill", reason);
+        systemState.refillSubsystemLocked = true;
+    }
+    else
+    {
+        // The global mechanism remains available for a genuinely system-wide
+        // critical condition, but ordinary subsystem failures never reach it.
+        actuatorManager.turnOffAll(reason);
+        systemState.safetyLock = true;
+        changeState(SAFETY_LOCK);
+        failCurrentOperation(reason);
+        return;
+    }
+
+    systemState.reservoirLocked = false;
+    failCurrentOperation(reason);
+    changeState(NORMAL);
 }
 
 void AutomationManager::createOperationRequest(
@@ -1658,34 +1906,27 @@ void AutomationManager::handleCanopyClimate()
     float temp = sensors.temperature;
     float humidity = sensors.humidity;
 
-    uint8_t speed = 50; // Default minimum 50%
+    uint8_t speed = 50;
 
-    // If sensors are failing, default to 100% for safety
+    // DHT failure is isolated from reservoir chemistry. The environmental
+    // fail-safe keeps ventilation at full speed.
     if (isnan(temp) || isnan(humidity))
     {
         speed = 100;
     }
     else
     {
-        if (temp <= 22.0f)
-        {
-            speed = 50;
-        }
-        else if (temp >= 30.0f)
-        {
-            speed = 100;
-        }
-        else
-        {
-            // Linearly scale from 50% at 22C to 100% at 30C
-            speed = 50 + (uint8_t)((temp - 22.0f) * 6.25f);
-        }
+        if (!highAirDemandActive && temp > systemState.highAirTemp)
+            highAirDemandActive = true;
+        else if (highAirDemandActive && temp <= systemState.airTempRelease)
+            highAirDemandActive = false;
 
-        // Override for high humidity
-        if (humidity > MAX_HUMIDITY)
-        {
-            speed = 100;
-        }
+        if (!highHumidityDemandActive && humidity > systemState.highHumidity)
+            highHumidityDemandActive = true;
+        else if (highHumidityDemandActive && humidity <= systemState.humidityRelease)
+            highHumidityDemandActive = false;
+
+        if (highAirDemandActive || highHumidityDemandActive) speed = 100;
     }
 
     actuatorManager.requestCommand(CANOPY_FAN, true, "automatic", millis(), speed);

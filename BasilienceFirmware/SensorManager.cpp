@@ -69,22 +69,38 @@ void SensorManager::update()
 
 void SensorManager::applyEffectiveSensors()
 {
-    // Automation, alerts, safety, and Firebase publication all consume this one
-    // effective dataset. Physical sampling remains active in physicalSensors.
-    sensors = physicalSensors;
+    // Mock mode's enabled/disabled state lives only in Firebase and is not
+    // restored locally at boot (systemState.mockSensorsEnabled defaults to
+    // false), so right after a reboot/brownout we don't yet know whether a
+    // previously-enabled mock session should still own control. Until
+    // FirebaseManager confirms the source at least once, hold every
+    // effective reading explicitly invalid instead of defaulting to physical
+    // - a plausible-looking physical reading at this point (e.g. an
+    // unsettled water level) must never trigger automation/alerts.
+    if (!systemState.sensorSourceResolved)
+    {
+        sensors = SensorData();
+        sensors.waterLevel = NAN;
 
+        if (!sensorSourceWaitingLogged)
+        {
+            Serial.println("[AUTOMATION] Sensor source=WAITING");
+            sensorSourceWaitingLogged = true;
+        }
+        return;
+    }
+
+    // Automation, alerts, safety, and Firebase publication all consume this one
+    // effective dataset. Physical sampling remains active in physicalSensors
+    // regardless of mock mode (Developer Sensor Test reads it directly), but
+    // it must never backfill a field the mock command left unset. Mock mode
+    // is meant to be a fully controlled simulated environment - a field the
+    // mock payload didn't include stays invalid (NaN) rather than silently
+    // reverting to a real, possibly noisy physical reading.
     if (systemState.mockSensorsEnabled)
     {
-        if (!isnan(systemState.mockSensors.temperature)) sensors.temperature = systemState.mockSensors.temperature;
-        if (!isnan(systemState.mockSensors.humidity))    sensors.humidity = systemState.mockSensors.humidity;
-        if (!isnan(systemState.mockSensors.waterTemp))   sensors.waterTemp = systemState.mockSensors.waterTemp;
-        if (!isnan(systemState.mockSensors.waterLevel))  sensors.waterLevel = systemState.mockSensors.waterLevel;
-        if (!isnan(systemState.mockSensors.ph))          sensors.ph = systemState.mockSensors.ph;
-        if (!isnan(systemState.mockSensors.ec))
-        {
-            sensors.ec = systemState.mockSensors.ec;
-            sensors.tds = sensors.ec * 500.0f;
-        }
+        sensors = systemState.mockSensors;
+        sensors.tds = isnan(sensors.ec) ? NAN : sensors.ec * 500.0f;
 
         if (systemState.mockApplyPending)
         {
@@ -96,17 +112,22 @@ void SensorManager::applyEffectiveSensors()
             systemState.mockApplyPending = false;
         }
     }
-    else if (systemState.mockApplyPending)
+    else
     {
-        Serial.println("[MOCK] Mock sensor mode DISABLED");
-        Serial.println("[MOCK] Physical sensors restored as automation source");
-        Serial.print("[PHYSICAL] pH="); Serial.println(sensors.ph, 2);
-        Serial.print("[PHYSICAL] EC="); Serial.println(sensors.ec, 2);
-        Serial.print("[PHYSICAL] AirTemp="); Serial.println(sensors.temperature, 2);
-        Serial.print("[PHYSICAL] Humidity="); Serial.println(sensors.humidity, 2);
-        Serial.print("[PHYSICAL] WaterTemp="); Serial.println(sensors.waterTemp, 2);
-        Serial.print("[PHYSICAL] WaterLevel="); Serial.println(sensors.waterLevel, 2);
-        systemState.mockApplyPending = false;
+        sensors = physicalSensors;
+
+        if (systemState.mockApplyPending)
+        {
+            Serial.println("[MOCK] Mock sensor mode DISABLED");
+            Serial.println("[MOCK] Physical sensors restored as automation source");
+            Serial.print("[PHYSICAL] pH="); Serial.println(sensors.ph, 2);
+            Serial.print("[PHYSICAL] EC="); Serial.println(sensors.ec, 2);
+            Serial.print("[PHYSICAL] AirTemp="); Serial.println(sensors.temperature, 2);
+            Serial.print("[PHYSICAL] Humidity="); Serial.println(sensors.humidity, 2);
+            Serial.print("[PHYSICAL] WaterTemp="); Serial.println(sensors.waterTemp, 2);
+            Serial.print("[PHYSICAL] WaterLevel="); Serial.println(sensors.waterLevel, 2);
+            systemState.mockApplyPending = false;
+        }
     }
 
     if (!sensorSourceReported || lastReportedMockSource != systemState.mockSensorsEnabled)
@@ -163,6 +184,17 @@ void SensorManager::readDHT()
 
 void SensorManager::readWaterTemperature()
 {
+    // The DS18B20 conversion is a blocking OneWire transaction; running it
+    // every loop iteration both stalls loop() and increases how often it can
+    // collide with other blocking work (e.g. Firebase calls). Not due yet
+    // simply means physicalSensors.waterTemp keeps its last value - it must
+    // never be invalidated merely because a new read isn't scheduled.
+    if (millis() - lastWaterTempReadTime < WATER_TEMP_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastWaterTempReadTime = millis();
+
     waterSensor.requestTemperatures();
 
     float temp =
@@ -170,12 +202,35 @@ void SensorManager::readWaterTemperature()
 
     if (temp == DEVICE_DISCONNECTED_C || !isfinite(temp))
     {
-        physicalSensors.waterTemp = NAN;
+        if (waterTempFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            waterTempFailureStreak++;
+
+            if (waterTempFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                Serial.print("[SENSOR] Water temperature transient read failure ");
+                Serial.print(waterTempFailureStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+            else
+            {
+                Serial.println("[SENSOR] Water temperature confirmed unavailable");
+                physicalSensors.waterTemp = NAN;
+            }
+        }
+        // Already confirmed unavailable - stays NaN, no repeated logging.
         return;
     }
 
-    physicalSensors.waterTemp =
-        temp;
+    if (waterTempFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        Serial.println("[SENSOR] Water temperature recovered");
+    }
+
+    waterTempFailureStreak = 0;
+    lastValidWaterTemp = temp;
+    physicalSensors.waterTemp = temp;
 }
 
 void SensorManager::readWaterLevel()
@@ -186,8 +241,11 @@ void SensorManager::readWaterLevel()
     if (distance < 0 || !isfinite(distance))
     {
         physicalSensors.waterLevel = NAN;
+        physicalSensors.waterLevelDistanceCm = NAN;
         return;
     }
+
+    physicalSensors.waterLevelDistanceCm = distance;
 
     constexpr float EMPTY_DISTANCE = 30.0f;
 
@@ -224,10 +282,46 @@ void SensorManager::readEC()
 
     physicalSensors.ecVoltage = voltage;
 
+    // A NaN water temperature must never reach the compensation formula - it
+    // would make EC itself go NaN even though the EC sensor is fine. Fall
+    // back to the last known-good reading, and only to a fixed default if
+    // none has ever been captured this session.
+    float compensationTemp;
+    EcCompensationSource compensationSource;
+
+    if (isfinite(physicalSensors.waterTemp))
+    {
+        compensationTemp = physicalSensors.waterTemp;
+        compensationSource = EcCompensationSource::LIVE;
+    }
+    else if (isfinite(lastValidWaterTemp))
+    {
+        compensationTemp = lastValidWaterTemp;
+        compensationSource = EcCompensationSource::LAST_VALID;
+    }
+    else
+    {
+        compensationTemp = 25.0f;
+        compensationSource = EcCompensationSource::FALLBACK_DEFAULT;
+    }
+
+    if (compensationSource != lastEcCompensationSource)
+    {
+        if (compensationSource == EcCompensationSource::LAST_VALID)
+        {
+            Serial.println("[SENSOR] EC compensation using last valid water temperature");
+        }
+        else if (compensationSource == EcCompensationSource::FALLBACK_DEFAULT)
+        {
+            Serial.println("[SENSOR] EC compensation using 25C fallback");
+        }
+        lastEcCompensationSource = compensationSource;
+    }
+
     float compensationCoefficient =
         1.0f +
         0.02f *
-            (physicalSensors.waterTemp - 25.0f);
+            (compensationTemp - 25.0f);
 
     float compensationVoltage =
         voltage /

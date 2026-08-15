@@ -11,10 +11,12 @@ public:
 
     SafetyResult canDosePH() const;
     SafetyResult canDoseEC() const;
+    SafetyResult canDiluteEC() const;
     SafetyResult canRefill() const;
     SafetyResult canFog() const;
     SafetyResult canCool() const;
     SafetyResult canResetSafety() const;
+    bool resetRecoverableSubsystems(String& reason);
 
     const char* getSafetyReason(
         SafetyResult result) const;

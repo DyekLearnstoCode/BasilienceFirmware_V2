@@ -286,6 +286,18 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
         case GROW_PUMP:
         case BLOOM_PUMP:
         {
+            if ((actuator == PH_UP_PUMP || actuator == PH_DOWN_PUMP) &&
+                systemState.phSubsystemLocked)
+            {
+                outReason = "pH correction subsystem is locked.";
+                return false;
+            }
+            if ((actuator == GROW_PUMP || actuator == BLOOM_PUMP) &&
+                systemState.ecSubsystemLocked)
+            {
+                outReason = "EC correction subsystem is locked.";
+                return false;
+            }
             const bool phCorrectionOwnsLock =
                 (actuator == PH_UP_PUMP || actuator == PH_DOWN_PUMP) &&
                 (systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH);
@@ -339,7 +351,11 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                if (actuator == PH_UP_PUMP && sensors.ph >= systemState.minPH)
+                const float phUpLimit = runningValidation
+                    ? systemState.phTargetMin : systemState.minPH;
+                const float phDownLimit = runningValidation
+                    ? systemState.phTargetMax : systemState.maxPH;
+                if (actuator == PH_UP_PUMP && sensors.ph >= phUpLimit)
                 {
                     outReason = runningValidation
                         ? "pH Up complete: Minimum pH threshold reached."
@@ -347,7 +363,7 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                if (actuator == PH_DOWN_PUMP && sensors.ph <= systemState.maxPH)
+                if (actuator == PH_DOWN_PUMP && sensors.ph <= phDownLimit)
                 {
                     outReason = runningValidation
                         ? "pH Down complete: Maximum pH threshold reached."
@@ -364,7 +380,9 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                if (sensors.ec >= systemState.minEC)
+                const float ecLimit = runningValidation
+                    ? systemState.ecTargetMin : systemState.minEC;
+                if (sensors.ec >= ecLimit)
                 {
                     outReason = runningValidation
                         ? "Nutrient dosing complete: Minimum EC threshold reached."
@@ -377,12 +395,21 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
         case CANOPY_FAN:
             break;
         case SOLENOID:
+        {
+            if (systemState.refillSubsystemLocked)
+            {
+                outReason = "Refill/dilution subsystem is locked.";
+                return false;
+            }
             if (!validPercentage(sensors.waterLevel))
             {
                 outReason = "Cannot refill: Water-level reading is invalid.";
                 return false;
             }
-            if (systemState.reservoirLocked && systemState.currentMode != REFILLING)
+            const bool dilutionOwnsLock =
+                systemState.currentMode == DOSING_EC &&
+                systemState.ecDirection == EC_DILUTE;
+            if (systemState.reservoirLocked && systemState.currentMode != REFILLING && !dilutionOwnsLock)
             {
                 outReason = "Cannot refill: Reservoir is locked by another operation.";
                 return false;
@@ -412,7 +439,14 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 }
             }
             break;
+        }
         case PELTIER:
+            if (systemState.coolingSubsystemLocked)
+            {
+                if (manual) automationManager.setManualCoolingDemand(false);
+                outReason = "Cooling subsystem is locked.";
+                return false;
+            }
             if (!validPercentage(sensors.waterLevel))
             {
                 if (manual) automationManager.setManualCoolingDemand(false);
@@ -473,6 +507,15 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             }
             break;
         case FOGGER:
+            if (statuses[actuator].source == "automatic")
+            {
+                SafetyResult fogSafety = safetyManager.canFog();
+                if (fogSafety != SafetyResult::SAFE)
+                {
+                    outReason = safetyManager.getSafetyReason(fogSafety);
+                    return false;
+                }
+            }
             if (!validPercentage(sensors.waterLevel))
             {
                 outReason = "Fogger stopped. Water-level reading is invalid.";
@@ -487,6 +530,22 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             {
                 outReason = "Fogger stopped. Environmental sensor reading is invalid.";
                 return false;
+            }
+            break;
+        case BLOWER:
+            // Automatic blower demand is the delivery half of an automatic fog
+            // request. Because FOGGER precedes BLOWER in the actuator update,
+            // this accepts only after the paired fogger has actually started.
+            // Manual blower control retains its existing independent behavior.
+            if (statuses[actuator].source == "automatic")
+            {
+                const ActuatorStatus& fogger = statuses[FOGGER];
+                if (!isOn(FOGGER) || !fogger.running ||
+                    fogger.state != ActuatorCommandState::RUNNING)
+                {
+                    outReason = "Blower blocked: automatic fogger is not running.";
+                    return false;
+                }
             }
             break;
         default:
@@ -689,6 +748,7 @@ void ActuatorManager::update()
                         statuses[PELTIER].reason = "Peltier stopped: Circulation unavailable.";
                         manuallyOverridden[PELTIER] = false;
                         automationManager.setManualCoolingDemand(false);
+                        systemState.coolingSubsystemLocked = true;
                         statusDirty = true;
                         Serial.println("[SAFETY] PELTIER stopped: circulation unavailable");
                     }

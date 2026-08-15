@@ -4,14 +4,41 @@
 
 namespace
 {
+    // A single transient invalid tick (OneWire hiccup, ADC noise, a blocking
+    // call landing at the wrong moment) must not abort an active automatic
+    // operation. Each metric tracks its own short consecutive-invalid streak;
+    // any valid reading clears it immediately, while a genuinely sustained
+    // failure still reports invalid after the same short threshold used
+    // elsewhere (sensorFault, water-temperature confirmation).
+    bool debouncedValid(bool rawValid, uint8_t& invalidStreak)
+    {
+        if (rawValid)
+        {
+            invalidStreak = 0;
+            return true;
+        }
+
+        if (invalidStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            invalidStreak++;
+        }
+
+        return invalidStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD;
+    }
+
     bool validPH()
     {
-        return isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
+        static uint8_t invalidStreak = 0;
+        const bool rawValid =
+            isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
+        return debouncedValid(rawValid, invalidStreak);
     }
 
     bool validEC()
     {
-        return isfinite(sensors.ec) && sensors.ec >= 0.0f;
+        static uint8_t invalidStreak = 0;
+        const bool rawValid = isfinite(sensors.ec) && sensors.ec >= 0.0f;
+        return debouncedValid(rawValid, invalidStreak);
     }
 
     bool validWaterLevel()
@@ -22,8 +49,10 @@ namespace
 
     bool validWaterTemperature()
     {
-        return isfinite(sensors.waterTemp) &&
+        static uint8_t invalidStreak = 0;
+        const bool rawValid = isfinite(sensors.waterTemp) &&
             sensors.waterTemp >= 0.0f && sensors.waterTemp <= 100.0f;
+        return debouncedValid(rawValid, invalidStreak);
     }
 
     bool validEnvironment()
@@ -72,7 +101,13 @@ const char* SafetyManager::getSafetyReason(
             return "pH remains outside the configured safe range";
 
         case SafetyResult::INVALID_EC:
-            return "EC remains below the configured safe threshold";
+            return "EC remains outside the configured safe range";
+
+        case SafetyResult::SUBSYSTEM_LOCKED:
+            return "Subsystem locked; reset required";
+
+        case SafetyResult::RESERVOIR_FULL:
+            return "Reservoir full; manual attention required";
 
         default:
             return "Unknown";
@@ -84,6 +119,11 @@ SafetyResult SafetyManager::canDosePH() const
     if(systemState.safetyLock)
     {
         return SafetyResult::SAFETY_LOCKED;
+    }
+
+    if(systemState.phSubsystemLocked)
+    {
+        return SafetyResult::SUBSYSTEM_LOCKED;
     }
 
     const bool phCorrectionOwnsLock =
@@ -115,6 +155,11 @@ SafetyResult SafetyManager::canDoseEC() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
+    if(systemState.ecSubsystemLocked)
+    {
+        return SafetyResult::SUBSYSTEM_LOCKED;
+    }
+
     const bool ecCorrectionOwnsLock =
         systemState.currentMode == DOSING_EC ||
         systemState.currentMode == STABILIZING_EC;
@@ -137,11 +182,26 @@ SafetyResult SafetyManager::canDoseEC() const
     return SafetyResult::SAFE;
 }
 
+SafetyResult SafetyManager::canDiluteEC() const
+{
+    SafetyResult result = canDoseEC();
+    if(result != SafetyResult::SAFE) return result;
+    if(systemState.refillSubsystemLocked) return SafetyResult::SUBSYSTEM_LOCKED;
+    if(sensors.waterLevel >= systemState.refillStopLevel &&
+       sensors.ec > systemState.ecTargetMax) return SafetyResult::RESERVOIR_FULL;
+    return SafetyResult::SAFE;
+}
+
 SafetyResult SafetyManager::canRefill() const
 {
     if(systemState.safetyLock)
     {
         return SafetyResult::SAFETY_LOCKED;
+    }
+
+    if(systemState.refillSubsystemLocked)
+    {
+        return SafetyResult::SUBSYSTEM_LOCKED;
     }
 
     if(!validWaterLevel())
@@ -164,6 +224,36 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SENSOR_FAULT;
     }
 
+    if(!validPH())
+    {
+        return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.ph < systemState.minPH || sensors.ph > systemState.maxPH)
+    {
+        return SafetyResult::INVALID_PH;
+    }
+
+    if(!validEC())
+    {
+        return SafetyResult::SENSOR_FAULT;
+    }
+
+    if(sensors.ec < systemState.minEC || sensors.ec > systemState.maxEC)
+    {
+        return SafetyResult::INVALID_EC;
+    }
+
+    if(systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH)
+    {
+        return SafetyResult::INVALID_PH;
+    }
+
+    if(systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC)
+    {
+        return SafetyResult::INVALID_EC;
+    }
+
     if(sensors.waterLevel < systemState.refillStartLevel)
     {
         return SafetyResult::LOW_WATER;
@@ -177,6 +267,11 @@ SafetyResult SafetyManager::canCool() const
     if(systemState.safetyLock)
     {
         return SafetyResult::SAFETY_LOCKED;
+    }
+
+    if(systemState.coolingSubsystemLocked)
+    {
+        return SafetyResult::SUBSYSTEM_LOCKED;
     }
 
     if(!validWaterLevel() || !validWaterTemperature())
@@ -210,4 +305,64 @@ SafetyResult SafetyManager::canResetSafety() const
         return SafetyResult::INVALID_EC;
     }
     return SafetyResult::SAFE;
+}
+
+bool SafetyManager::resetRecoverableSubsystems(String& reason)
+{
+    bool cleared = false;
+    reason = "";
+
+    if(systemState.phSubsystemLocked)
+    {
+        if(validPH() && sensors.ph >= systemState.minPH && sensors.ph <= systemState.maxPH)
+        {
+            systemState.phSubsystemLocked = false;
+            cleared = true;
+        }
+        else reason += "pH subsystem remains unsafe. ";
+    }
+
+    if(systemState.ecSubsystemLocked)
+    {
+        if(validEC() && sensors.ec >= systemState.minEC && sensors.ec <= systemState.maxEC)
+        {
+            systemState.ecSubsystemLocked = false;
+            cleared = true;
+        }
+        else reason += "EC subsystem remains unsafe. ";
+    }
+
+    if(systemState.refillSubsystemLocked)
+    {
+        if(validWaterLevel())
+        {
+            systemState.refillSubsystemLocked = false;
+            cleared = true;
+        }
+        else reason += "Refill subsystem water-level input remains unsafe. ";
+    }
+
+    if(systemState.coolingSubsystemLocked)
+    {
+        if(validWaterLevel() && validWaterTemperature() &&
+           sensors.waterLevel >= systemState.refillStartLevel)
+        {
+            systemState.coolingSubsystemLocked = false;
+            cleared = true;
+        }
+        else reason += "Cooling subsystem remains unsafe. ";
+    }
+
+    if(systemState.safetyLock)
+    {
+        SafetyResult global = canResetSafety();
+        if(global == SafetyResult::SAFE)
+        {
+            systemState.safetyLock = false;
+            cleared = true;
+        }
+        else reason += String(getSafetyReason(global)) + ". ";
+    }
+
+    return cleared;
 }

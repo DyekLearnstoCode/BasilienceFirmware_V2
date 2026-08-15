@@ -36,6 +36,15 @@ void AlertManager::setAlert(const char* name, bool& currentValue, bool nextValue
 
 void AlertManager::update()
 {
+    // Mirrors the same gate SensorManager applies to the effective sensor
+    // dataset: while the mock-vs-physical source is still unresolved after
+    // boot, sensors are held invalid, and no alert (including sensorFault)
+    // should be derived from that transient window either.
+    if (!systemState.sensorSourceResolved)
+    {
+        return;
+    }
+
     updateLowWaterAlert();
 
     updateTemperatureAlert();
@@ -61,10 +70,17 @@ void AlertManager::updateLowWaterAlert()
 
 void AlertManager::updateTemperatureAlert()
 {
+    const bool valid = isfinite(sensors.temperature);
+
+    setAlert(
+        "lowAirTemperature",
+        alertState.lowAirTemperature,
+        valid && sensors.temperature < COLD_FOG_TEMPERATURE);
+
     setAlert(
         "highTemperature",
         alertState.highTemperature,
-        sensors.temperature > systemState.highAirTemp);
+        valid && sensors.temperature > systemState.highAirTemp);
 }
 
 void AlertManager::updateWaterTemperatureAlert()
@@ -93,7 +109,12 @@ void AlertManager::updateECAlert()
     setAlert(
         "ecLow",
         alertState.ecLow,
-        sensors.ec < systemState.minEC);
+        isfinite(sensors.ec) && sensors.ec < systemState.minEC);
+
+    setAlert(
+        "ecHigh",
+        alertState.ecHigh,
+        isfinite(sensors.ec) && sensors.ec > systemState.maxEC);
 }
 
 void AlertManager::updateSensorFaultAlert()
@@ -132,5 +153,24 @@ void AlertManager::updateSensorFaultAlert()
         isfinite(sensors.waterLevel) &&
         (sensors.waterLevel < 0.0f || sensors.waterLevel > 100.0f);
 
-    setAlert("sensorFault", alertState.sensorFault, sensorFault || waterLevelFault);
+    const bool rawFault = sensorFault || waterLevelFault;
+
+    // A single transient invalid tick must not immediately raise sensorFault.
+    // Any valid tick resets the pending count right away so a real recovery
+    // is never delayed; only SENSOR_TRANSIENT_FAILURE_THRESHOLD consecutive
+    // invalid ticks actually raise it.
+    if (rawFault)
+    {
+        if (sensorFaultPendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            sensorFaultPendingCount++;
+        }
+    }
+    else
+    {
+        sensorFaultPendingCount = 0;
+    }
+
+    setAlert("sensorFault", alertState.sensorFault,
+        sensorFaultPendingCount >= SENSOR_TRANSIENT_FAILURE_THRESHOLD);
 }

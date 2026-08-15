@@ -6,6 +6,25 @@
 
 #define OPERATION_TIMEOUT_MS 300000UL
 
+// Bounded local fallback: how long Fogger/Blower resume waits after a local
+// pH/EC correction completes for RTDB COMPLETED publication before releasing
+// from local safe state anyway, so plant control never depends on cloud
+// availability.
+constexpr unsigned long CHEMISTRY_FOGGING_HOLD_TIMEOUT_MS = 30000UL;
+
+// Minimum spacing between completed DS18B20 conversions. The sensor read
+// itself is a blocking OneWire transaction, so it must not run every loop
+// iteration - both to stop it from dominating loop() timing and to reduce
+// how often it can collide with other blocking work (e.g. Firebase calls).
+constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 1000UL;
+
+// Shared short debounce threshold used to tell a transient one-tick sensor
+// hiccup (OneWire/ADC noise, a blocking call landing at the wrong moment)
+// apart from a genuinely failed/disconnected sensor. Applied consistently to
+// water-temperature confirmation, sensorFault, and the pH/EC/water-temp
+// safety validity checks that can abort an active operation.
+constexpr uint8_t SENSOR_TRANSIENT_FAILURE_THRESHOLD = 3;
+
 // ======================================================
 // WiFi
 // ======================================================
@@ -86,18 +105,25 @@ constexpr float MAX_HUMIDITY = 80.0f;
 
 constexpr float MIN_PH = 5.5f;
 constexpr float MAX_PH = 6.5f;
+constexpr float PH_TARGET_MIN = 5.8f;
+constexpr float PH_TARGET_MAX = 6.3f;
 
 constexpr float MIN_EC = 1.2f;
+constexpr float MAX_EC = 2.0f;
+constexpr float EC_TARGET_MIN = 1.4f;
+constexpr float EC_TARGET_MAX = 1.8f;
 
 constexpr float LOW_WATER_LEVEL = 20.0f;
 
 constexpr float HIGH_WATER_TEMP = 25.0f;
 constexpr float COOLER_OFF_TEMP = 22.5f;
 
-constexpr float HIGH_AIR_TEMP = 35.0f;
-constexpr float LOW_AIR_TEMP = 28.0f;
+constexpr float HIGH_AIR_TEMP = 28.0f;
+constexpr float AIR_TEMP_RELEASE = 26.0f;
+constexpr float HIGH_HUMIDITY = 75.0f;
+constexpr float HUMIDITY_RELEASE = 70.0f;
 
-constexpr float HOT_FOG_TEMPERATURE = 30.0f;
+constexpr float HOT_FOG_TEMPERATURE = 28.0f;
 constexpr float COLD_FOG_TEMPERATURE = 20.0f;
 
 // ======================================================
@@ -136,28 +162,29 @@ constexpr unsigned long STARTUP_OFF_TIME =
     60UL * 1000UL; // 1 minute
 
 constexpr unsigned long NORMAL_FOG_ON_TIME =
-    30UL * 1000UL; // 30 seconds
+    5UL * 60UL * 1000UL; // 5 minutes
 
 constexpr unsigned long NORMAL_FOG_OFF_TIME =
-    2UL * 60UL * 1000UL; // 2 minutes
+    5UL * 60UL * 1000UL; // 5 minutes
 
 constexpr unsigned long HOT_FOG_ON_TIME =
-    15UL * 1000UL; // 15 seconds
+    8UL * 60UL * 1000UL; // 8 minutes
 
 constexpr unsigned long HOT_FOG_OFF_TIME =
-    60UL * 1000UL; // 1 minute
+    4UL * 60UL * 1000UL; // 4 minutes
 
 constexpr unsigned long COLD_FOG_ON_TIME =
-    60UL * 1000UL; // 1 minute
+    3UL * 60UL * 1000UL; // 3 minutes
 
 constexpr unsigned long COLD_FOG_OFF_TIME =
-    4UL * 60UL * 1000UL; // 4 minutes
+    5UL * 60UL * 1000UL; // 5 minutes
 
 constexpr unsigned long PH_STABILIZATION_TIME = 10000UL;
 constexpr unsigned long EC_STABILIZATION_TIME = 10000UL;
 
 constexpr unsigned long PH_DOSING_TIME = 5000UL;
 constexpr unsigned long EC_DOSING_TIME = 5000UL;
+constexpr unsigned long EC_DILUTION_TIME = 5000UL;
 
 constexpr uint8_t MAX_PH_ATTEMPTS = 3;
 constexpr uint8_t MAX_EC_ATTEMPTS = 3;

@@ -48,6 +48,8 @@ private:
     bool lastCirculationRunning = false;
     bool lastPeltierRunning = false;
     ActuatorCommandState lastCirculationState = ActuatorCommandState::OFF;
+    bool highAirDemandActive = false;
+    bool highHumidityDemandActive = false;
 
     //==================================================
     // Core
@@ -90,6 +92,8 @@ private:
     bool abortCurrentOperation(
     const String& reason);
 
+    void failCurrentSubsystem(const String& reason);
+
     //==================================================
     // Automatic Operations
     //==================================================
@@ -97,6 +101,10 @@ private:
     void handleNormal();
 
     bool validateNormalOperation();
+
+    bool processReadyLocalRegulation();
+
+    void suspendAutomaticRootFogging(const String& reason);
 
     void updateCooling();
 

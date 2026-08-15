@@ -19,6 +19,8 @@ public:
 
     void syncMockSensors();
 
+    void syncSensorTest();
+
 private:
 
     //==================================================
@@ -41,6 +43,10 @@ private:
     //==================================================
 
     unsigned long lastSettingsRead = 0;
+    unsigned long lastSensorUploadAttempt = 0;
+    uint8_t optionalFirebaseJobCursor = 0;
+    uint16_t lastProtectedAutomaticRequestId = 0;
+    uint8_t automaticControlPassesRemaining = 0;
 
     bool wasFirebaseConnected = false;
     bool suspendedForProvisioning = false;
@@ -61,14 +67,24 @@ private:
     unsigned long lastAlertFullUpload = 0;
     unsigned long lastActuatorFullUpload = 0;
     bool alertCacheInitialized = false;
+    bool sensorFaultPublicationInitialized = false;
     bool actuatorCacheInitialized = false;
     AlertState lastPublishedAlerts;
     ActuatorStatus lastPublishedActuators[ACTUATOR_COUNT];
     uint64_t lastActuatorCommandTimestamps[ACTUATOR_COUNT] = { 0 };
     bool actuatorCommandsPrimed = false;
+    bool sensorTestCommandBlockedUntilFalse = false;
 
     RequestState lastPublishedOperationState =
         RequestState::IDLE;
+    bool automaticTerminalSyncPending = false;
+    bool automaticTerminalSensorUploaded = false;
+    bool operationPublishFailureLogged = false;
+    uint16_t automaticTerminalRequestId = 0;
+    SensorData automaticTerminalSensors;
+    uint16_t lastDeferredCommandRequestId = 0;
+    unsigned long automaticTerminalSnapshotUploadedAt = 0;
+    bool automaticTerminalSensorUploadFailureLogged = false;
 
     //==================================================
     // Initialization
@@ -85,6 +101,12 @@ private:
         FirebaseJson& json);
 
     void logFirebaseDuration(const char* operation, unsigned long durationMs) const;
+    bool isSensorUploadDue() const;
+    bool shouldDeferOptionalJobsForControlResponse();
+    void runOneOptionalFirebaseJob(bool sensorTestMode, bool deferLowPriorityJobs);
+    void enforceSensorTestTimeout();
+    void captureAutomaticTerminalSnapshot();
+    void syncOperationState();
     
     String deviceRoot() const;
     void loadDeviceId();
@@ -108,6 +130,8 @@ private:
     void loadActuatorCommandTimestamps();
     void saveActuatorCommandTimestamp(Actuator actuator, uint64_t timestamp);
     void readMockSensors();
+    void readSensorTestCommand();
+    void setSensorTestEnabled(bool enabled, bool publishAcknowledgement = true);
 
     void provisionDevice();
     String getMacAddress();
@@ -117,6 +141,8 @@ private:
     //==================================================
 
     bool hasActiveOperation() const;
+
+    bool isOperationLifecycleOwned() const;
 
     bool isDuplicateRequest(
         uint16_t requestId) const;
@@ -144,7 +170,7 @@ private:
     // Uploads
     //==================================================
 
-    void writeSensors(bool force = false);
+    bool writeSensors(bool force = false, const SensorData* snapshot = nullptr);
 
     void writeStatus();
 
@@ -155,6 +181,8 @@ private:
     void writeActuators();
 
     void writeDeviceInfo();
+
+    void writeDiagnosticSensors();
 };
 
 #endif

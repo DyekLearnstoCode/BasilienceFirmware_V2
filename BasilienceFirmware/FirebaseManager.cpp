@@ -6,6 +6,7 @@ namespace
 {
 
 constexpr unsigned long COMMAND_READ_INTERVAL  = 1500;
+constexpr unsigned long COMMAND_FAILURE_BACKOFF_INTERVAL = 5000;
 constexpr unsigned long MOCK_READ_INTERVAL     = 2000;
 constexpr unsigned long SETTINGS_READ_INTERVAL = 60000;
 constexpr unsigned long UPLOAD_INTERVAL        = 10000;
@@ -13,6 +14,7 @@ constexpr unsigned long DEVICE_INFO_INTERVAL   = 15000;
 constexpr unsigned long REALTIME_FALLBACK_INTERVAL = 60000;
 constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
 constexpr unsigned long HEARTBEAT_SUCCESS_LOG_INTERVAL_MS = 60000;
+constexpr unsigned long SENSOR_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 
 //==================================================
 // Firebase Operation Conversions
@@ -197,10 +199,18 @@ void FirebaseManager::loadPersistedSettings()
         systemState.lightOffMinute = preferences.getUChar("lightOffM", systemState.lightOffMinute);
         systemState.minPH = preferences.getFloat("minPH", systemState.minPH);
         systemState.maxPH = preferences.getFloat("maxPH", systemState.maxPH);
+        systemState.phTargetMin = preferences.getFloat("phTargetMin", systemState.phTargetMin);
+        systemState.phTargetMax = preferences.getFloat("phTargetMax", systemState.phTargetMax);
         systemState.minEC = preferences.getFloat("minEC", systemState.minEC);
+        systemState.maxEC = preferences.getFloat("maxEC", systemState.maxEC);
+        systemState.ecTargetMin = preferences.getFloat("ecTargetMin", systemState.ecTargetMin);
+        systemState.ecTargetMax = preferences.getFloat("ecTargetMax", systemState.ecTargetMax);
         systemState.refillStartLevel = preferences.getFloat("refillStart", systemState.refillStartLevel);
         systemState.refillStopLevel = preferences.getFloat("refillStop", systemState.refillStopLevel);
         systemState.highAirTemp = preferences.getFloat("highAir", systemState.highAirTemp);
+        systemState.airTempRelease = preferences.getFloat("airRelease", systemState.airTempRelease);
+        systemState.highHumidity = preferences.getFloat("highHumidity", systemState.highHumidity);
+        systemState.humidityRelease = preferences.getFloat("humidityRel", systemState.humidityRelease);
         systemState.highWaterTemp = preferences.getFloat("highWater", systemState.highWaterTemp);
         systemState.coolerOffTemp = preferences.getFloat("coolerOff", systemState.coolerOffTemp);
         Serial.println("[SETTINGS] Restored persisted automation settings");
@@ -217,10 +227,18 @@ void FirebaseManager::persistSettings()
     preferences.putUChar("lightOffM", systemState.lightOffMinute);
     preferences.putFloat("minPH", systemState.minPH);
     preferences.putFloat("maxPH", systemState.maxPH);
+    preferences.putFloat("phTargetMin", systemState.phTargetMin);
+    preferences.putFloat("phTargetMax", systemState.phTargetMax);
     preferences.putFloat("minEC", systemState.minEC);
+    preferences.putFloat("maxEC", systemState.maxEC);
+    preferences.putFloat("ecTargetMin", systemState.ecTargetMin);
+    preferences.putFloat("ecTargetMax", systemState.ecTargetMax);
     preferences.putFloat("refillStart", systemState.refillStartLevel);
     preferences.putFloat("refillStop", systemState.refillStopLevel);
     preferences.putFloat("highAir", systemState.highAirTemp);
+    preferences.putFloat("airRelease", systemState.airTempRelease);
+    preferences.putFloat("highHumidity", systemState.highHumidity);
+    preferences.putFloat("humidityRel", systemState.humidityRelease);
     preferences.putFloat("highWater", systemState.highWaterTemp);
     preferences.putFloat("coolerOff", systemState.coolerOffTemp);
     preferences.putBool("valid", true);
@@ -286,6 +304,13 @@ Serial.println("]");
 
     initializeDatabase();
 
+    // Diagnostic mode is deliberately non-persistent. A reboot always clears
+    // both the retained command and its acknowledgement before normal control.
+    systemState.sensorTestEnabled = false;
+    systemState.sensorTestStartTime = 0;
+    Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/commands/sensorTest/enabled", false);
+    Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/status/sensorTest", false);
+
     // A new device may not have had a /commands node during the pre-online
     // baseline attempt. initializeDatabase() creates the canonical command
     // container, so finish priming before begin() returns to the main loop.
@@ -301,8 +326,6 @@ Serial.println("]");
     systemState.settingsLoaded = true;
 
     systemState.syncRTC = true;
-
-    systemState.currentMode = NORMAL;
 
     Serial.println("Firebase Started");
 }
@@ -347,8 +370,15 @@ void FirebaseManager::initializeDatabase()
         json.set("maxPH",
             systemState.maxPH);
 
+        json.set("phTargetMin", systemState.phTargetMin);
+        json.set("phTargetMax", systemState.phTargetMax);
+
         json.set("minEC",
             systemState.minEC);
+
+        json.set("maxEC", systemState.maxEC);
+        json.set("ecTargetMin", systemState.ecTargetMin);
+        json.set("ecTargetMax", systemState.ecTargetMax);
 
         json.set("refillStartLevel",
             systemState.refillStartLevel);
@@ -365,6 +395,10 @@ void FirebaseManager::initializeDatabase()
         json.set("highAirTemp",
             systemState.highAirTemp);
 
+        json.set("airTempRelease", systemState.airTempRelease);
+        json.set("highHumidity", systemState.highHumidity);
+        json.set("humidityRelease", systemState.humidityRelease);
+
         writeJson(
             deviceRoot() + "/settings",
             json);
@@ -380,6 +414,28 @@ void FirebaseManager::initializeDatabase()
             {
                 Serial.println("[SETTINGS] Seeded missing highAirTemp");
             }
+        }
+
+        FirebaseJsonData settingData;
+        FirebaseJson missingSettings;
+        bool hasMissingSettings = false;
+#define SEED_SETTING(name, value) \
+        if (!fbdo.jsonObject().get(settingData, name) || !settingData.success) { \
+            missingSettings.set(name, value); \
+            hasMissingSettings = true; \
+        }
+        SEED_SETTING("phTargetMin", systemState.phTargetMin);
+        SEED_SETTING("phTargetMax", systemState.phTargetMax);
+        SEED_SETTING("maxEC", systemState.maxEC);
+        SEED_SETTING("ecTargetMin", systemState.ecTargetMin);
+        SEED_SETTING("ecTargetMax", systemState.ecTargetMax);
+        SEED_SETTING("airTempRelease", systemState.airTempRelease);
+        SEED_SETTING("highHumidity", systemState.highHumidity);
+        SEED_SETTING("humidityRelease", systemState.humidityRelease);
+#undef SEED_SETTING
+        if (hasMissingSettings)
+        {
+            updateJson(deviceRoot() + "/settings", missingSettings);
         }
     }
 
@@ -477,6 +533,32 @@ void FirebaseManager::initializeDatabase()
 
 void FirebaseManager::update()
 {
+    // The diagnostic timeout is local safety state and must remain enforceable
+    // even when cloud communication is unavailable.
+    enforceSensorTestTimeout();
+
+    // Capture completion-time effective readings before any connectivity guard.
+    // Local control may continue normally while this immutable cloud snapshot
+    // waits for Firebase to become available.
+    captureAutomaticTerminalSnapshot();
+
+    // Automatic pH, EC, and refill requests intentionally retain their existing
+    // ACCEPTED -> RUNNING -> actuator-handler lifecycle. Protect the two local
+    // control passes after acceptance from low-priority cloud work so that
+    // noncritical Firebase latency cannot unnecessarily delay physical startup.
+    const bool deferLowPriorityForControlResponse =
+        shouldDeferOptionalJobsForControlResponse();
+
+    // This guard must precede Firebase.ready(), heartbeat, actuator/alert
+    // publication, and every RTDB call. An automatic request needs two local
+    // passes to advance ACCEPTED -> RUNNING -> its actuator handler; allowing
+    // even a "high priority" synchronous cloud call here can insert the same
+    // multi-second delay before the actuator is physically requested.
+    if(deferLowPriorityForControlResponse)
+    {
+        return;
+    }
+
     //--------------------------------------------------
     // Connection Status
     //--------------------------------------------------
@@ -523,94 +605,347 @@ void FirebaseManager::update()
         return;
     }
 
-    //--------------------------------------------------
-    // Realtime state transitions take priority over periodic traffic.
-    //--------------------------------------------------
+    // /sensors is the authoritative presence heartbeat. When due, it owns this
+    // Firebase opportunity and no optional cloud job is allowed to run first.
+    if (isSensorUploadDue())
+    {
+        writeSensors();
+        writeActuators();
+        return;
+    }
 
-    const bool alertTransitionPublished = writeAlerts();
+    // Preserve event-driven actuator publication immediately behind heartbeat.
     writeActuators();
 
-    // Keep the sensor snapshot consistent with a newly published alert edge.
-    if (alertTransitionPublished)
+    // A slow actuator-status transition may itself consume the remaining
+    // heartbeat window. Re-check before starting any optional job.
+    if (isSensorUploadDue())
+    {
+        writeSensors();
+        return;
+    }
+
+    // Alert transitions are event-driven and run directly behind heartbeat and
+    // actuator status instead of waiting for the optional-job cursor. Developer
+    // Sensor Test keeps its existing alert/history suppression contract.
+    const bool alertWasDirty =
+        !systemState.sensorTestEnabled && alertManager.isDirty();
+    if (alertWasDirty && writeAlerts())
     {
         writeSensors(true);
     }
 
-    //--------------------------------------------------
-    // Settings Synchronization
-    //--------------------------------------------------
-
-    if(millis() - lastSettingsRead >=
-       SETTINGS_READ_INTERVAL)
+    // A slow alert update can consume the remaining heartbeat window.
+    if (isSensorUploadDue())
     {
-        lastSettingsRead =
-            millis();
-
-        readSettings();
+        writeSensors();
+        return;
     }
 
-    //--------------------------------------------------
-    // Command Processing
-    //--------------------------------------------------
+    // Every remaining synchronous read/write is distributed across subsequent
+    // loop iterations so slow requests cannot accumulate in one update.
+    runOneOptionalFirebaseJob(
+        systemState.sensorTestEnabled,
+        alertWasDirty || deferLowPriorityForControlResponse);
+}
 
-    readCommands();
-    readActuatorCommands();
+bool FirebaseManager::isSensorUploadDue() const
+{
+    return millis() - lastSensorUploadAttempt >= UPLOAD_INTERVAL;
+}
 
-    // A manual command may have entered AP mode during readActuatorCommands().
-    // Stop this update before any upload or additional Firebase operation.
-    if (wifiManager.isProvisioningMode())
+bool FirebaseManager::shouldDeferOptionalJobsForControlResponse()
+{
+    const OperationRequest& request = systemState.operationRequest;
+    const bool responseSensitiveOperation =
+        request.operation == OperationType::PH_UP ||
+        request.operation == OperationType::PH_DOWN ||
+        request.operation == OperationType::EC_CORRECTION ||
+        request.operation == OperationType::REFILL;
+
+    if (request.source == RequestSource::AUTOMATIC &&
+        responseSensitiveOperation &&
+        request.state == RequestState::ACCEPTED &&
+        request.requestId != lastProtectedAutomaticRequestId)
     {
-        if (!suspendedForProvisioning)
+        lastProtectedAutomaticRequestId = request.requestId;
+        automaticControlPassesRemaining = 2;
+    }
+
+    if (automaticControlPassesRemaining == 0)
+    {
+        return false;
+    }
+
+    automaticControlPassesRemaining--;
+    return true;
+}
+
+void FirebaseManager::runOneOptionalFirebaseJob(
+    bool sensorTestMode,
+    bool deferLowPriorityJobs)
+{
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 11;
+
+    for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
+    {
+        const uint8_t job = optionalFirebaseJobCursor;
+        optionalFirebaseJobCursor = (optionalFirebaseJobCursor + 1) % OPTIONAL_JOB_COUNT;
+
+        // Normal cultivation commands/alerts remain suppressed during the
+        // existing physical sensor diagnostic mode.
+        if (sensorTestMode &&
+            (job == 0 || job == 1 || job == 2 || job == 3 || job == 6))
         {
-            Serial.println("[FIREBASE] Suspended during provisioning mode");
-            suspendedForProvisioning = true;
+            continue;
         }
-        systemState.firebaseConnected = false;
-        wasFirebaseConnected = false;
-        return;
+        if (!sensorTestMode && job == 10)
+        {
+            continue;
+        }
+
+        // A new alert transition must not sit behind low-priority synchronization.
+        // Advance the cursor past these jobs now; they remain eligible on later
+        // non-urgent rotations and therefore cannot be permanently starved.
+        if (deferLowPriorityJobs &&
+            (job == 6 || job == 7 || job == 8 || job == 9 || job == 10))
+        {
+            continue;
+        }
+
+        switch (job)
+        {
+            case 0:
+                // Dirty transitions bypass the cursor above. This slot preserves
+                // the existing 60-second full fallback and initial gated publish.
+                if (!alertManager.isDirty()) writeAlerts();
+                return;
+
+            case 1:
+                syncOperationState();
+                return;
+
+            case 2:
+                readCommands();
+                return;
+
+            case 3:
+                readActuatorCommands();
+                return;
+
+            case 4:
+                readSensorTestCommand();
+                return;
+
+            case 5:
+                readMockSensors();
+                return;
+
+            case 6:
+                if (millis() - lastSettingsRead >= SETTINGS_READ_INTERVAL)
+                {
+                    lastSettingsRead = millis();
+                    readSettings();
+                }
+                return;
+
+            case 7:
+                writeStatus();
+                return;
+
+            case 8:
+                writeTelemetry();
+                return;
+
+            case 9:
+                writeDeviceInfo();
+                return;
+
+            case 10:
+                writeDiagnosticSensors();
+                return;
+        }
     }
+}
 
-    //--------------------------------------------------
-    // Device Uploads
-    //--------------------------------------------------
+void FirebaseManager::syncOperationState()
+{
+    OperationRequest& request = systemState.operationRequest;
+    const RequestState state = request.state;
+    const bool terminal = state == RequestState::COMPLETED ||
+        state == RequestState::FAILED || state == RequestState::REJECTED;
+    const bool orderedAutomaticCompletion =
+        state == RequestState::COMPLETED &&
+        request.source == RequestSource::AUTOMATIC &&
+        (request.operation == OperationType::PH_UP ||
+         request.operation == OperationType::PH_DOWN ||
+         request.operation == OperationType::EC_CORRECTION ||
+         request.operation == OperationType::REFILL);
 
-    writeDeviceInfo();
-
-    writeSensors();
-
-    writeStatus();
-
-    writeTelemetry();
-
-    //--------------------------------------------------
-    // Operation State Synchronization
-    //--------------------------------------------------
-
-    if(systemState.operationRequest.state ==
-       lastPublishedOperationState)
+    if (state == lastPublishedOperationState && !terminal)
     {
         return;
     }
 
-    writeCurrentOperation();
+    if (state != lastPublishedOperationState)
+    {
+        if (orderedAutomaticCompletion)
+        {
+            // The capture runs before connectivity checks, so this remains the
+            // exact effective snapshot observed when the local operation ended.
+            if (!automaticTerminalSyncPending ||
+                automaticTerminalRequestId != request.requestId)
+            {
+                captureAutomaticTerminalSnapshot();
+            }
 
-    lastPublishedOperationState =
-        systemState.operationRequest.state;
+            if (!automaticTerminalSensorUploaded)
+            {
+                if (!writeSensors(true, &automaticTerminalSensors))
+                {
+                    if (!automaticTerminalSensorUploadFailureLogged)
+                    {
+                        Serial.print("[LATENCY] sensorSnapshotFailed t=");
+                        Serial.print(millis());
+                        Serial.print(" requestId=");
+                        Serial.println(request.requestId);
+                        automaticTerminalSensorUploadFailureLogged = true;
+                    }
+                    return;
+                }
 
-    RequestState state =
-        systemState.operationRequest.state;
+                automaticTerminalSensorUploaded = true;
+                automaticTerminalSensorUploadFailureLogged = false;
+                automaticTerminalSnapshotUploadedAt = millis();
+                Serial.println("[OP-SYNC] Sensor snapshot uploaded");
 
-    if(state != RequestState::COMPLETED &&
-       state != RequestState::FAILED &&
-       state != RequestState::REJECTED)
+                Serial.print("[LATENCY] sensorSnapshotUploaded t=");
+                Serial.print(automaticTerminalSnapshotUploadedAt);
+                Serial.print(" requestId=");
+                Serial.println(request.requestId);
+                Serial.print("[LATENCY] localComplete -> sensorSnapshotUploaded = ");
+                Serial.print(automaticTerminalSnapshotUploadedAt - request.completedTimestamp);
+                Serial.println(" ms");
+            }
+        }
+
+        if (!writeCurrentOperation())
+        {
+            // A later heartbeat could overwrite /sensors before this terminal
+            // retry. Require the frozen completion snapshot immediately before
+            // every new COMPLETED publication attempt.
+            if (orderedAutomaticCompletion)
+            {
+                automaticTerminalSensorUploaded = false;
+            }
+
+            if (!operationPublishFailureLogged)
+            {
+                Serial.print("[OP-SYNC] ");
+                Serial.print(requestStateToString(state));
+                Serial.println(" publish failed - retry pending");
+                operationPublishFailureLogged = true;
+
+                if (orderedAutomaticCompletion)
+                {
+                    Serial.print("[LATENCY] completedPublishFailed t=");
+                    Serial.print(millis());
+                    Serial.print(" requestId=");
+                    Serial.println(request.requestId);
+                }
+            }
+            return;
+        }
+
+        // Publication bookkeeping advances only after Firebase acknowledges the
+        // write. A failure leaves the same request and timestamps retryable.
+        lastPublishedOperationState = state;
+        operationPublishFailureLogged = false;
+
+        if (terminal)
+        {
+            Serial.print("[OP-SYNC] ");
+            Serial.print(requestStateToString(state));
+            Serial.print(" published requestId=");
+            Serial.print(request.requestId);
+            Serial.print(" operation=");
+            Serial.println(operationToString(request.operation));
+
+            if (orderedAutomaticCompletion)
+            {
+                const unsigned long publishedAt = millis();
+                Serial.print("[LATENCY] completedPublished t=");
+                Serial.print(publishedAt);
+                Serial.print(" requestId=");
+                Serial.println(request.requestId);
+                Serial.print("[LATENCY] sensorSnapshotUploaded -> completedPublished = ");
+                Serial.print(publishedAt - automaticTerminalSnapshotUploadedAt);
+                Serial.println(" ms");
+                Serial.print("[LATENCY] localComplete -> completedPublished = ");
+                Serial.print(publishedAt - request.completedTimestamp);
+                Serial.println(" ms");
+
+                if (request.operation == OperationType::PH_UP ||
+                    request.operation == OperationType::PH_DOWN ||
+                    request.operation == OperationType::EC_CORRECTION)
+                {
+                    systemState.chemistryFoggingHoldActive = false;
+                    Serial.println("[CHEMISTRY] Lifecycle published - fogging eligible");
+                }
+            }
+        }
+    }
+
+    if (!terminal)
     {
         return;
     }
 
-    if(archiveCurrentOperation())
+    // Archive failures are retried while the already-published terminal state
+    // remains intact. Reset is permitted only after both durable writes succeed.
+    if (archiveCurrentOperation())
     {
+        const uint16_t archivedRequestId = request.requestId;
         resetCurrentOperation();
+
+        if (automaticTerminalSyncPending &&
+            automaticTerminalRequestId == archivedRequestId)
+        {
+            automaticTerminalSyncPending = false;
+            automaticTerminalSensorUploaded = false;
+            automaticTerminalRequestId = 0;
+        }
     }
+}
+
+void FirebaseManager::captureAutomaticTerminalSnapshot()
+{
+    const OperationRequest& request = systemState.operationRequest;
+    const bool requiresSensorOrdering =
+        request.state == RequestState::COMPLETED &&
+        request.source == RequestSource::AUTOMATIC &&
+        (request.operation == OperationType::PH_UP ||
+         request.operation == OperationType::PH_DOWN ||
+         request.operation == OperationType::EC_CORRECTION ||
+         request.operation == OperationType::REFILL);
+
+    if (!requiresSensorOrdering ||
+        (automaticTerminalSyncPending &&
+         automaticTerminalRequestId == request.requestId))
+    {
+        return;
+    }
+
+    automaticTerminalSyncPending = true;
+    automaticTerminalSensorUploaded = false;
+    automaticTerminalSensorUploadFailureLogged = false;
+    automaticTerminalRequestId = request.requestId;
+    automaticTerminalSensors = sensors;
+
+    Serial.print("[OP-SYNC] COMPLETED pending requestId=");
+    Serial.print(request.requestId);
+    Serial.print(" operation=");
+    Serial.println(operationToString(request.operation));
 }
 
 //==================================================
@@ -665,14 +1000,39 @@ void FirebaseManager::readSettings()
         systemState.maxPH = incomingMaxPH;
     }
 
+    float incomingPHTargetMin = systemState.phTargetMin;
+    float incomingPHTargetMax = systemState.phTargetMax;
+    if (fbdo.jsonObject().get(data, "phTargetMin")) incomingPHTargetMin = data.floatValue;
+    if (fbdo.jsonObject().get(data, "phTargetMax")) incomingPHTargetMax = data.floatValue;
+    if (incomingPHTargetMin >= systemState.minPH &&
+        incomingPHTargetMax <= systemState.maxPH &&
+        incomingPHTargetMax > incomingPHTargetMin)
+    {
+        systemState.phTargetMin = incomingPHTargetMin;
+        systemState.phTargetMax = incomingPHTargetMax;
+    }
+
     //--------------------------------------------------
     // EC
     //--------------------------------------------------
 
-    if (fbdo.jsonObject().get(data, "minEC"))
+    float incomingMinEC = systemState.minEC;
+    float incomingMaxEC = systemState.maxEC;
+    float incomingECTargetMin = systemState.ecTargetMin;
+    float incomingECTargetMax = systemState.ecTargetMax;
+    if (fbdo.jsonObject().get(data, "minEC")) incomingMinEC = data.floatValue;
+    if (fbdo.jsonObject().get(data, "maxEC")) incomingMaxEC = data.floatValue;
+    if (fbdo.jsonObject().get(data, "ecTargetMin")) incomingECTargetMin = data.floatValue;
+    if (fbdo.jsonObject().get(data, "ecTargetMax")) incomingECTargetMax = data.floatValue;
+    if (incomingMinEC > 0.0f && incomingMaxEC > incomingMinEC &&
+        incomingECTargetMin >= incomingMinEC &&
+        incomingECTargetMax <= incomingMaxEC &&
+        incomingECTargetMax > incomingECTargetMin)
     {
-        if (data.floatValue > 0.0f)
-            systemState.minEC = data.floatValue;
+        systemState.minEC = incomingMinEC;
+        systemState.maxEC = incomingMaxEC;
+        systemState.ecTargetMin = incomingECTargetMin;
+        systemState.ecTargetMax = incomingECTargetMax;
     }
 
     //--------------------------------------------------
@@ -799,6 +1159,21 @@ void FirebaseManager::readSettings()
         }
     }
 
+    float incomingAirRelease = systemState.airTempRelease;
+    float incomingHighHumidity = systemState.highHumidity;
+    float incomingHumidityRelease = systemState.humidityRelease;
+    if (fbdo.jsonObject().get(data, "airTempRelease")) incomingAirRelease = data.floatValue;
+    if (incomingAirRelease >= -40.0f && incomingAirRelease < systemState.highAirTemp)
+        systemState.airTempRelease = incomingAirRelease;
+    if (fbdo.jsonObject().get(data, "highHumidity")) incomingHighHumidity = data.floatValue;
+    if (fbdo.jsonObject().get(data, "humidityRelease")) incomingHumidityRelease = data.floatValue;
+    if (incomingHumidityRelease >= 0.0f && incomingHighHumidity <= 100.0f &&
+        incomingHumidityRelease < incomingHighHumidity)
+    {
+        systemState.highHumidity = incomingHighHumidity;
+        systemState.humidityRelease = incomingHumidityRelease;
+    }
+
     //--------------------------------------------------
     // Water cooling
     //--------------------------------------------------
@@ -921,6 +1296,14 @@ void FirebaseManager::syncRTC()
 void FirebaseManager::readCommands()
 {
     static unsigned long lastCommandRead = 0;
+    static unsigned long lastCommandFailure = 0;
+    static bool commandBackoffActive = false;
+
+    if (commandBackoffActive &&
+        millis() - lastCommandFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
 
     if(millis() - lastCommandRead < COMMAND_READ_INTERVAL)
     {
@@ -937,8 +1320,11 @@ void FirebaseManager::readCommands()
     logFirebaseDuration("Operation command read", millis() - startedAt);
     if(!succeeded)
     {
+        commandBackoffActive = true;
+        lastCommandFailure = millis();
         return;
     }
+    commandBackoffActive = false;
 
     FirebaseJsonData data;
 
@@ -963,6 +1349,41 @@ void FirebaseManager::readCommands()
 
     fbdo.jsonObject().get(data, "protocolVersion");
     protocolVersion = data.intValue;
+
+    //--------------------------------------------------
+    // Duplicate Request
+    //--------------------------------------------------
+    // Checked before any validation/rejection path so a request that fails
+    // protocol/operation/action parsing (e.g. a malformed document) is still
+    // deduplicated by its requestId instead of being reprocessed - and
+    // re-rejected - on every poll.
+
+    if(isDuplicateRequest(requestId))
+    {
+        return;
+    }
+
+    //--------------------------------------------------
+    // Lifecycle Ownership
+    //--------------------------------------------------
+    // systemState.operationRequest belongs to exactly one request - manual or
+    // automatic - until it has been published and archived back to IDLE. An
+    // incoming command must never overwrite that request while it still owns
+    // the lifecycle object, so it is deferred and re-evaluated on a later
+    // poll instead of being validated/rejected now.
+
+    if(isOperationLifecycleOwned())
+    {
+        if(lastDeferredCommandRequestId != requestId)
+        {
+            Serial.print("[COMMAND] Deferred requestId=");
+            Serial.print(requestId);
+            Serial.println(": operation lifecycle busy");
+            lastDeferredCommandRequestId = requestId;
+        }
+
+        return;
+    }
 
     //--------------------------------------------------
     // Protocol Validation
@@ -1013,15 +1434,6 @@ void FirebaseManager::readCommands()
     }
 
     //--------------------------------------------------
-    // Duplicate Request
-    //--------------------------------------------------
-
-    if(isDuplicateRequest(requestId))
-    {
-        return;
-    }
-
-    //--------------------------------------------------
     // Runtime Validation
     //--------------------------------------------------
 
@@ -1054,13 +1466,27 @@ void FirebaseManager::readCommands()
 void FirebaseManager::readActuatorCommands()
 {
     static unsigned long lastCommandRead = 0;
+    static unsigned long lastCommandFailure = 0;
+    static bool commandBackoffActive = false;
+
+    if (commandBackoffActive &&
+        millis() - lastCommandFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
     if(millis() - lastCommandRead < COMMAND_READ_INTERVAL) return;
     lastCommandRead = millis();
 
     const unsigned long startedAt = millis();
     const bool succeeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands");
     logFirebaseDuration("Actuator command read", millis() - startedAt);
-    if(!succeeded) return;
+    if(!succeeded)
+    {
+        commandBackoffActive = true;
+        lastCommandFailure = millis();
+        return;
+    }
+    commandBackoffActive = false;
 
     FirebaseJson& snapshot = fbdo.jsonObject();
     FirebaseJsonData jsonData;
@@ -1246,6 +1672,18 @@ bool FirebaseManager::hasActiveOperation() const
     }
 }
 
+// Unlike hasActiveOperation() (ACCEPTED/RUNNING only), this also covers
+// terminal states that syncOperationState() has not yet published/archived.
+// systemState.operationRequest belongs to exactly one request - manual or
+// automatic - until resetCurrentOperation() returns it to IDLE, so command
+// intake must treat any non-IDLE state as owned and defer instead of
+// overwriting it.
+bool FirebaseManager::isOperationLifecycleOwned() const
+{
+    return systemState.operationRequest.state !=
+        RequestState::IDLE;
+}
+
 bool FirebaseManager::isDuplicateRequest(uint16_t requestId) const
 {
     return requestId ==
@@ -1333,24 +1771,29 @@ bool FirebaseManager::validateOperationRequest(
     }
     else if (operation == OperationType::EC_CORRECTION)
     {
-        const SafetyResult safety = safetyManager.canDoseEC();
+        const bool low = sensors.ec < systemState.minEC;
+        const bool high = sensors.ec > systemState.maxEC;
+        const SafetyResult safety = low
+            ? safetyManager.canDoseEC()
+            : safetyManager.canDiluteEC();
         if (safety != SafetyResult::SAFE)
         {
             reason = safetyManager.getSafetyReason(safety);
             return false;
         }
-        if (sensors.ec >= systemState.minEC)
+        if (!low && !high)
         {
-            reason = "Nutrient dosing rejected: Current EC does not require correction.";
+            reason = "EC correction rejected: Current EC is within the acceptable range.";
             return false;
         }
     }
     else if (operation == OperationType::RESET_SAFETY)
     {
-        const SafetyResult safety = safetyManager.canResetSafety();
-        if (safety != SafetyResult::SAFE)
+        if (!systemState.safetyLock && !systemState.phSubsystemLocked &&
+            !systemState.ecSubsystemLocked && !systemState.refillSubsystemLocked &&
+            !systemState.coolingSubsystemLocked)
         {
-            reason = safetyManager.getSafetyReason(safety);
+            reason = "No safety subsystem is locked.";
             return false;
         }
     }
@@ -1643,41 +2086,40 @@ void FirebaseManager::resetCurrentOperation()
 // Device Uploads
 //==================================================
 
-void FirebaseManager::writeSensors(bool force)
+bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
 {
-    static unsigned long lastSensorUpload = 0;
-
-    if(!force && millis() - lastSensorUpload < UPLOAD_INTERVAL)
+    if(!force && !isSensorUploadDue())
     {
-        return;
+        return true;
     }
     // A failed write is still one heartbeat attempt. Keep retries on the normal
     // 10-second cadence instead of hammering RTDB on every loop iteration.
-    if (!force) lastSensorUpload = millis();
+    if (!force) lastSensorUploadAttempt = millis();
 
     FirebaseJson json;
+    const SensorData& publishedSensors = snapshot ? *snapshot : sensors;
 
     //--------------------------------------------------
     // Environment
     //--------------------------------------------------
 
-    if (!isnan(sensors.temperature)) json.set("airTemperature", sensors.temperature);
-    if (!isnan(sensors.humidity)) json.set("humidity", sensors.humidity);
+    if (!isnan(publishedSensors.temperature)) json.set("airTemperature", publishedSensors.temperature);
+    if (!isnan(publishedSensors.humidity)) json.set("humidity", publishedSensors.humidity);
 
     //--------------------------------------------------
     // Reservoir
     //--------------------------------------------------
 
-    if (!isnan(sensors.waterTemp)) json.set("waterTemperature", sensors.waterTemp);
-    if (isfinite(sensors.waterLevel)) json.set("waterLevel", sensors.waterLevel);
+    if (!isnan(publishedSensors.waterTemp)) json.set("waterTemperature", publishedSensors.waterTemp);
+    if (isfinite(publishedSensors.waterLevel)) json.set("waterLevel", publishedSensors.waterLevel);
 
     //--------------------------------------------------
     // Nutrient
     //--------------------------------------------------
 
-    if (!isnan(sensors.ec)) json.set("ec", sensors.ec);
-    if (!isnan(sensors.tds)) json.set("tds", sensors.tds);
-    if (!isnan(sensors.ph)) json.set("ph", sensors.ph);
+    if (!isnan(publishedSensors.ec)) json.set("ec", publishedSensors.ec);
+    if (!isnan(publishedSensors.tds)) json.set("tds", publishedSensors.tds);
+    if (!isnan(publishedSensors.ph)) json.set("ph", publishedSensors.ph);
 
     //--------------------------------------------------
     // Metadata
@@ -1694,8 +2136,8 @@ void FirebaseManager::writeSensors(bool force)
 
     if(uploadSucceeded)
     {
-        lastSensorUpload = millis();
-        lastSuccessfulSensorUpload = lastSensorUpload;
+        lastSensorUploadAttempt = millis();
+        lastSuccessfulSensorUpload = lastSensorUploadAttempt;
 
         const uint32_t recoveredFailures = consecutiveSensorUploadFailures;
         consecutiveSensorUploadFailures = 0;
@@ -1724,11 +2166,11 @@ void FirebaseManager::writeSensors(bool force)
         if (force)
         {
             Serial.print("[SENSOR-SYNC] waterLevel=");
-            Serial.print(sensors.waterLevel, 2);
+            Serial.print(publishedSensors.waterLevel, 2);
             Serial.print(" ph=");
-            Serial.print(sensors.ph, 2);
+            Serial.print(publishedSensors.ph, 2);
             Serial.print(" ec=");
-            Serial.print(sensors.ec, 2);
+            Serial.print(publishedSensors.ec, 2);
             Serial.print(" t=");
             Serial.println(millis());
         }
@@ -1753,6 +2195,8 @@ void FirebaseManager::writeSensors(bool force)
             }
         }
     }
+
+    return uploadSucceeded;
 }
 
 void FirebaseManager::writeStatus()
@@ -1784,6 +2228,8 @@ void FirebaseManager::writeStatus()
         "mockData",
         systemState.mockSensorsEnabled);
 
+    json.set("sensorTest", systemState.sensorTestEnabled);
+
     //--------------------------------------------------
     // Safety
     //--------------------------------------------------
@@ -1795,6 +2241,11 @@ void FirebaseManager::writeStatus()
     json.set(
         "safetyLock",
         systemState.safetyLock);
+
+    json.set("phSubsystemLocked", systemState.phSubsystemLocked);
+    json.set("ecSubsystemLocked", systemState.ecSubsystemLocked);
+    json.set("refillSubsystemLocked", systemState.refillSubsystemLocked);
+    json.set("coolingSubsystemLocked", systemState.coolingSubsystemLocked);
 
     //--------------------------------------------------
     // Connectivity
@@ -1867,11 +2318,21 @@ void FirebaseManager::writeTelemetry()
 
 bool FirebaseManager::writeAlerts()
 {
+    const bool startupPhaseComplete =
+        systemState.currentMode != SENSOR_STABILIZATION &&
+        systemState.currentMode != STARTUP;
+    const bool sensorFaultPublishingEligible =
+        startupPhaseComplete &&
+        systemState.sensorSourceResolved &&
+        !systemState.mockApplyPending;
+    const bool initialSensorFaultPublishDue =
+        sensorFaultPublishingEligible &&
+        !sensorFaultPublicationInitialized;
     const bool fullUploadDue =
         !alertCacheInitialized ||
         millis() - lastAlertFullUpload >= REALTIME_FALLBACK_INTERVAL;
 
-    if (!alertManager.isDirty() && !fullUploadDue)
+    if (!alertManager.isDirty() && !fullUploadDue && !initialSensorFaultPublishDue)
     {
         return false;
     }
@@ -1879,6 +2340,8 @@ bool FirebaseManager::writeAlerts()
     FirebaseJson json;
     bool hasFields = false;
     bool hasTransition = false;
+    bool sensorFaultIncluded = false;
+    bool sensorFaultChanged = false;
 
 #define ADD_ALERT_FIELD(fieldName) \
     do { \
@@ -1893,12 +2356,29 @@ bool FirebaseManager::writeAlerts()
 
     ADD_ALERT_FIELD(lowWater);
     ADD_ALERT_FIELD(ecLow);
+    ADD_ALERT_FIELD(ecHigh);
     ADD_ALERT_FIELD(phOutOfRange);
     ADD_ALERT_FIELD(phLow);
     ADD_ALERT_FIELD(phHigh);
     ADD_ALERT_FIELD(waterTempOutOfRange);
+    ADD_ALERT_FIELD(lowAirTemperature);
     ADD_ALERT_FIELD(highTemperature);
-    ADD_ALERT_FIELD(sensorFault);
+
+    if (sensorFaultPublishingEligible)
+    {
+        sensorFaultChanged =
+            !sensorFaultPublicationInitialized ||
+            alertState.sensorFault != lastPublishedAlerts.sensorFault;
+
+        if (fullUploadDue || sensorFaultChanged)
+        {
+            json.set("sensorFault", alertState.sensorFault);
+            hasFields = true;
+            sensorFaultIncluded = true;
+        }
+
+        if (sensorFaultChanged) hasTransition = true;
+    }
 
 #undef ADD_ALERT_FIELD
 
@@ -1926,16 +2406,29 @@ bool FirebaseManager::writeAlerts()
 
     LOG_ALERT_TRANSITION(lowWater);
     LOG_ALERT_TRANSITION(ecLow);
+    LOG_ALERT_TRANSITION(ecHigh);
     LOG_ALERT_TRANSITION(phOutOfRange);
     LOG_ALERT_TRANSITION(phLow);
     LOG_ALERT_TRANSITION(phHigh);
     LOG_ALERT_TRANSITION(waterTempOutOfRange);
+    LOG_ALERT_TRANSITION(lowAirTemperature);
     LOG_ALERT_TRANSITION(highTemperature);
-    LOG_ALERT_TRANSITION(sensorFault);
+
+    if (sensorFaultIncluded && sensorFaultChanged)
+    {
+        Serial.print("[ALERT-SYNC] sensorFault=");
+        Serial.print(alertState.sensorFault ? "true" : "false");
+        Serial.print(" t=");
+        Serial.println(millis());
+    }
 
 #undef LOG_ALERT_TRANSITION
 
     lastPublishedAlerts = alertState;
+    if (sensorFaultIncluded)
+    {
+        sensorFaultPublicationInitialized = true;
+    }
     alertCacheInitialized = true;
     if (fullUploadDue) lastAlertFullUpload = millis();
     alertManager.markSynced();
@@ -2203,46 +2696,77 @@ void FirebaseManager::syncMockSensors()
 void FirebaseManager::readMockSensors()
 {
     static unsigned long lastMockRead = 0;
+    static unsigned long lastMockReadFailure = 0;
+    static bool mockReadBackoffActive = false;
+
+    if (mockReadBackoffActive &&
+        millis() - lastMockReadFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
     if(millis() - lastMockRead < MOCK_READ_INTERVAL) return;
     lastMockRead = millis();
 
     if(!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/mockSensors")) {
         // A transient read failure must not silently change sensor authority.
+        mockReadBackoffActive = true;
+        lastMockReadFailure = millis();
         return;
     }
+    mockReadBackoffActive = false;
 
     FirebaseJsonData data;
     FirebaseJson& json = fbdo.jsonObject();
 
     json.get(data, "enabled");
     const bool nextEnabled = data.success && data.boolValue;
+
+    // A successful read with mock mode disabled resolves the effective source
+    // to physical sensors even if optional mock payload fields are incomplete.
+    if (!nextEnabled)
+    {
+        systemState.sensorSourceResolved = true;
+    }
+
     SensorData nextMock = systemState.mockSensors;
 
     // Air Temperature
     json.get(data, "airTemperature");
-    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
-        nextMock.temperature = data.floatValue;
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
+        nextMock.temperature = data.to<float>();
     else 
         nextMock.temperature = NAN;
 
     // Humidity
     json.get(data, "humidity");
-    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
-        nextMock.humidity = data.floatValue;
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
+        nextMock.humidity = data.to<float>();
     else 
         nextMock.humidity = NAN;
 
     // Water Temperature
     json.get(data, "waterTemperature");
-    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
-        nextMock.waterTemp = data.floatValue;
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
+        nextMock.waterTemp = data.to<float>();
     else 
         nextMock.waterTemp = NAN;
 
     // Water Level
     json.get(data, "waterLevel");
-    if (data.success && (data.typeNum == FirebaseJson::JSON_DOUBLE || data.typeNum == FirebaseJson::JSON_INT)) 
-        nextMock.waterLevel = data.floatValue;
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
+        nextMock.waterLevel = data.to<float>();
     else 
         nextMock.waterLevel = NAN;
 
@@ -2298,6 +2822,7 @@ void FirebaseManager::readMockSensors()
         floatValuesDiffer(nextMock.ec, systemState.mockSensors.ec);
 
     systemState.mockSensors = nextMock;
+    systemState.sensorSourceResolved = true;
 
     if (!enabledChanged && !(nextEnabled && payloadChanged))
         return;
@@ -2315,5 +2840,235 @@ void FirebaseManager::readMockSensors()
         Serial.print("[MOCK] Humidity="); Serial.println(nextMock.humidity, 2);
         Serial.print("[MOCK] WaterTemp="); Serial.println(nextMock.waterTemp, 2);
         Serial.print("[MOCK] WaterLevel="); Serial.println(nextMock.waterLevel, 2);
+    }
+}
+
+void FirebaseManager::syncSensorTest()
+{
+    enforceSensorTestTimeout();
+
+    if (wifiManager.isProvisioningMode() || WiFi.status() != WL_CONNECTED || !Firebase.ready())
+        return;
+
+    readSensorTestCommand();
+}
+
+void FirebaseManager::enforceSensorTestTimeout()
+{
+    if (systemState.sensorTestEnabled &&
+        millis() - systemState.sensorTestStartTime >= SENSOR_TEST_TIMEOUT_MS)
+    {
+        sensorTestCommandBlockedUntilFalse = true;
+        setSensorTestEnabled(false, false);
+    }
+}
+
+void FirebaseManager::readSensorTestCommand()
+{
+    static unsigned long lastSensorTestRead = 0;
+    static unsigned long lastSensorTestReadFailure = 0;
+    static bool sensorTestReadBackoffActive = false;
+
+    if (sensorTestReadBackoffActive &&
+        millis() - lastSensorTestReadFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
+    if (millis() - lastSensorTestRead < 2000) return; // 2 seconds interval
+    lastSensorTestRead = millis();
+
+    FirebaseJsonData data;
+    if (!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/sensorTest"))
+    {
+        sensorTestReadBackoffActive = true;
+        lastSensorTestReadFailure = millis();
+        return;
+    }
+
+    sensorTestReadBackoffActive = false;
+    {
+        FirebaseJson& json = fbdo.jsonObject();
+        if (json.get(data, "enabled") && data.success)
+        {
+            const bool nextEnabled = data.boolValue;
+            if (nextEnabled && sensorTestCommandBlockedUntilFalse)
+            {
+                Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/commands/sensorTest/enabled", false);
+                return;
+            }
+
+            if (!nextEnabled) sensorTestCommandBlockedUntilFalse = false;
+            setSensorTestEnabled(nextEnabled);
+        }
+    }
+}
+
+void FirebaseManager::setSensorTestEnabled(bool enabled, bool publishAcknowledgement)
+{
+    if (enabled == systemState.sensorTestEnabled) return;
+
+    systemState.sensorTestEnabled = enabled;
+    if (enabled)
+    {
+        systemState.sensorTestStartTime = millis();
+        Serial.println("[DEV TEST] Physical sensor test ENABLED");
+        Firebase.RTDB.deleteNode(&fbdo, deviceRoot() + "/debug/physicalSensors");
+        if (hasActiveOperation())
+        {
+            updateOperationState(RequestState::FAILED, "Cancelled: physical sensor test enabled");
+            writeCurrentOperation();
+            archiveCurrentOperation();
+            resetCurrentOperation();
+            lastPublishedOperationState = RequestState::IDLE;
+        }
+        actuatorManager.turnOffAll("Sensor test enabled");
+    }
+    else
+    {
+        systemState.sensorTestStartTime = 0;
+        Serial.println("[DEV TEST] Physical sensor test DISABLED");
+        actuatorManager.turnOffAll("Sensor test disabled");
+        automationManager.begin();
+    }
+
+    if (publishAcknowledgement &&
+        WiFi.status() == WL_CONNECTED && Firebase.ready())
+    {
+        Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/status/sensorTest", enabled);
+    }
+}
+
+void FirebaseManager::writeDiagnosticSensors()
+{
+    constexpr unsigned long DIAGNOSTIC_SERIAL_INTERVAL_MS = 1500;
+    constexpr unsigned long DIAGNOSTIC_UPLOAD_INTERVAL_MS = 5000;
+    constexpr unsigned long DIAGNOSTIC_FAILURE_BACKOFF_MS = 10000;
+
+    static unsigned long lastDiagnosticSerialLog = 0;
+    static unsigned long lastDiagnosticUploadAttempt = 0;
+    static unsigned long lastDiagnosticFailure = 0;
+    static bool diagnosticBackoffActive = false;
+
+    const unsigned long now = millis();
+    if (now - lastDiagnosticSerialLog < DIAGNOSTIC_SERIAL_INTERVAL_MS)
+    {
+        return;
+    }
+    lastDiagnosticSerialLog = now;
+
+    FirebaseJson json;
+
+    // Print and set values
+    Serial.println("--- [DEV TEST] Live Readings ---");
+
+    // pH
+    if (!isnan(physicalSensors.ph) && isfinite(physicalSensors.ph) && physicalSensors.ph >= 0.0f && physicalSensors.ph <= 14.0f)
+    {
+        json.set("ph", physicalSensors.ph);
+        Serial.print("[DEV TEST] pH="); Serial.println(physicalSensors.ph, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] pH=INVALID");
+    }
+
+    // EC
+    if (!isnan(physicalSensors.ec) && isfinite(physicalSensors.ec) && physicalSensors.ec >= 0.0f)
+    {
+        json.set("ec", physicalSensors.ec);
+        Serial.print("[DEV TEST] EC="); Serial.println(physicalSensors.ec, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] EC=INVALID");
+    }
+
+    // Air Temperature
+    if (!isnan(physicalSensors.temperature) && isfinite(physicalSensors.temperature) && physicalSensors.temperature >= -40.0f && physicalSensors.temperature <= 100.0f)
+    {
+        json.set("airTemperature", physicalSensors.temperature);
+        Serial.print("[DEV TEST] AirTemp="); Serial.println(physicalSensors.temperature, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] AirTemp=INVALID");
+    }
+
+    // Humidity
+    if (!isnan(physicalSensors.humidity) && isfinite(physicalSensors.humidity) && physicalSensors.humidity >= 0.0f && physicalSensors.humidity <= 100.0f)
+    {
+        json.set("humidity", physicalSensors.humidity);
+        Serial.print("[DEV TEST] Humidity="); Serial.println(physicalSensors.humidity, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] Humidity=INVALID");
+    }
+
+    // Water Temperature
+    if (!isnan(physicalSensors.waterTemp) && isfinite(physicalSensors.waterTemp) && physicalSensors.waterTemp >= 0.0f && physicalSensors.waterTemp <= 100.0f)
+    {
+        json.set("waterTemperature", physicalSensors.waterTemp);
+        Serial.print("[DEV TEST] WaterTemp="); Serial.println(physicalSensors.waterTemp, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] WaterTemp=INVALID");
+    }
+
+    // Water Level
+    if (!isnan(physicalSensors.waterLevel) && isfinite(physicalSensors.waterLevel) && physicalSensors.waterLevel >= 0.0f && physicalSensors.waterLevel <= 100.0f)
+    {
+        json.set("waterLevel", physicalSensors.waterLevel);
+        Serial.print("[DEV TEST] WaterLevel="); Serial.println(physicalSensors.waterLevel, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] WaterLevel=INVALID");
+    }
+
+    // Water Level Distance (raw HC-SR04 reading, diagnostics only)
+    if (!isnan(physicalSensors.waterLevelDistanceCm) && isfinite(physicalSensors.waterLevelDistanceCm))
+    {
+        json.set("waterLevelDistanceCm", physicalSensors.waterLevelDistanceCm);
+        Serial.print("[DEV TEST] WaterLevelDistanceCm="); Serial.println(physicalSensors.waterLevelDistanceCm, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] WaterLevelDistanceCm=INVALID");
+    }
+
+    if (now - lastDiagnosticUploadAttempt < DIAGNOSTIC_UPLOAD_INTERVAL_MS)
+    {
+        return;
+    }
+
+    if (diagnosticBackoffActive &&
+        now - lastDiagnosticFailure < DIAGNOSTIC_FAILURE_BACKOFF_MS)
+    {
+        return;
+    }
+
+    // The normal /sensors write is the authoritative presence heartbeat. It is
+    // called before this low-priority diagnostic path, and diagnostics are
+    // skipped whenever that heartbeat has not succeeded or is due/overdue.
+    if (!hasPublishedHeartbeat ||
+        now - lastSuccessfulSensorUpload >= UPLOAD_INTERVAL)
+    {
+        return;
+    }
+
+    lastDiagnosticUploadAttempt = now;
+    json.set("timestamp", now);
+    if (writeJson(deviceRoot() + "/debug/physicalSensors", json))
+    {
+        diagnosticBackoffActive = false;
+    }
+    else
+    {
+        diagnosticBackoffActive = true;
+        lastDiagnosticFailure = millis();
+        Serial.println("[DEV TEST] Diagnostic upload failed");
+        Serial.println("[DEV TEST] Firebase diagnostic backoff active");
     }
 }

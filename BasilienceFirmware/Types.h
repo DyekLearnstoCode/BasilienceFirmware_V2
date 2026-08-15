@@ -28,6 +28,10 @@ struct SensorData
 
     // Water Level
     float waterLevel = 0; // 0 is valid (empty tank) — kept as-is
+
+    // Diagnostics only: raw HC-SR04 measured distance in centimeters, before
+    // percentage conversion. Never consumed by automation/alerts/safety.
+    float waterLevelDistanceCm = NAN;
 };
 
 
@@ -71,7 +75,11 @@ enum class SafetyResult
 
     INVALID_PH,
 
-    INVALID_EC
+    INVALID_EC,
+
+    SUBSYSTEM_LOCKED,
+
+    RESERVOIR_FULL
 };
 
 
@@ -164,6 +172,13 @@ enum PHDirection
     PH_NONE,
     PH_UP,
     PH_DOWN
+};
+
+enum ECDirection
+{
+    EC_NONE,
+    EC_RAISE,
+    EC_DILUTE
 };
 
 
@@ -277,16 +292,42 @@ struct SystemState
 
     bool safetyLock = false;
 
+    bool phSubsystemLocked = false;
+    bool ecSubsystemLocked = false;
+    bool refillSubsystemLocked = false;
+    bool coolingSubsystemLocked = false;
+
     bool reservoirLocked = false;
 
     bool forceRefill = false;
 
     bool resetSafetyLock = false;
 
+    // Developer Mode physical sensor diagnostics
+    bool sensorTestEnabled = false;
+    unsigned long sensorTestStartTime = 0;
+
     // Remote Mocking
     bool mockSensorsEnabled = false;
     SensorData mockSensors;
     bool mockApplyPending = false;
+
+    // True once the effective sensor source (mock vs. physical) has been
+    // confirmed at least once from Firebase since boot. Shared between
+    // FirebaseManager (which resolves it) and SensorManager/AlertManager
+    // (which must not act on physical readings until it is true) so a
+    // reboot/brownout can't let temporary physical readings drive automation
+    // before a previously-enabled mock mode is restored.
+    bool sensorSourceResolved = false;
+
+    // Armed by AutomationManager::completeCurrentOperation() the instant an
+    // automatic PH_UP/PH_DOWN/EC_CORRECTION reaches COMPLETED locally.
+    // Released by FirebaseManager as soon as that COMPLETED state is
+    // confirmed published to RTDB, or by AutomationManager after a bounded
+    // local grace period if Firebase cannot be reached - so Fogger/Blower
+    // resume waits for the cloud when possible but is never blocked by it.
+    bool chemistryFoggingHoldActive = false;
+    unsigned long chemistryFoggingHoldStartTime = 0;
 
     //==================================================
     // Operations
@@ -327,6 +368,10 @@ struct SystemState
 
     float maxPH = MAX_PH;
 
+    float phTargetMin = PH_TARGET_MIN;
+
+    float phTargetMax = PH_TARGET_MAX;
+
     //==================================================
     // EC
     //==================================================
@@ -336,6 +381,14 @@ struct SystemState
     uint8_t ecAttempts = 0;
 
     float minEC = MIN_EC;
+
+    float maxEC = MAX_EC;
+
+    float ecTargetMin = EC_TARGET_MIN;
+
+    float ecTargetMax = EC_TARGET_MAX;
+
+    ECDirection ecDirection = EC_NONE;
 
     //==================================================
     // Grow Light Schedule
@@ -364,6 +417,15 @@ struct SystemState
     float highAirTemp =
         HIGH_AIR_TEMP;
 
+    float airTempRelease =
+        AIR_TEMP_RELEASE;
+
+    float highHumidity =
+        HIGH_HUMIDITY;
+
+    float humidityRelease =
+        HUMIDITY_RELEASE;
+
     float highWaterTemp =
         HIGH_WATER_TEMP;
 
@@ -385,7 +447,11 @@ struct AlertState
 
     bool highTemperature = false;
 
+    bool lowAirTemperature = false;
+
     bool ecLow = false;
+
+    bool ecHigh = false;
 
     bool phOutOfRange = false;
 
