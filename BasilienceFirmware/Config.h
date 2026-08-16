@@ -18,6 +18,12 @@ constexpr unsigned long CHEMISTRY_FOGGING_HOLD_TIMEOUT_MS = 30000UL;
 // how often it can collide with other blocking work (e.g. Firebase calls).
 constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 1000UL;
 
+// Minimum spacing between HC-SR04 trigger pulses. Without this, readWaterLevel()
+// re-triggers on literally every loop iteration - far faster than the sensor's
+// own echo/reverberation settling time - which is a common cause of spurious
+// pulseIn() timeouts unrelated to the sensor or wiring actually failing.
+constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 300UL;
+
 // Shared short debounce threshold used to tell a transient one-tick sensor
 // hiccup (OneWire/ADC noise, a blocking call landing at the wrong moment)
 // apart from a genuinely failed/disconnected sensor. Applied consistently to

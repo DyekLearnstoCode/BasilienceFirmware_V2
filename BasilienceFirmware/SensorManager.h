@@ -47,6 +47,14 @@ private:
     enum class EcCompensationSource { LIVE, LAST_VALID, FALLBACK_DEFAULT };
     EcCompensationSource lastEcCompensationSource = EcCompensationSource::LIVE;
 
+    // HC-SR04 read scheduling and transient-failure tolerance, mirroring the
+    // water-temperature pattern above. physicalSensors.waterLevel/
+    // waterLevelDistanceCm only become NaN once a scheduled read has failed
+    // WATER_LEVEL_READ_INTERVAL_MS-spaced attempts consecutively for
+    // SENSOR_TRANSIENT_FAILURE_THRESHOLD times.
+    unsigned long lastWaterLevelReadTime = 0;
+    uint8_t waterLevelFailureStreak = 0;
+
     // =====================================================
     // Sensor Reading Functions
     // =====================================================

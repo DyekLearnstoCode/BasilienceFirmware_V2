@@ -235,15 +235,49 @@ void SensorManager::readWaterTemperature()
 
 void SensorManager::readWaterLevel()
 {
+    // The HC-SR04 trigger/echo cycle needs real settling time; re-triggering
+    // on every loop iteration is a common cause of spurious pulseIn()
+    // timeouts unrelated to the sensor or wiring actually failing. Not due
+    // yet simply means the last values are kept - they must never be
+    // invalidated merely because a new read isn't scheduled.
+    if (millis() - lastWaterLevelReadTime < WATER_LEVEL_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastWaterLevelReadTime = millis();
+
     float distance =
         measureDistanceCM();
 
     if (distance < 0 || !isfinite(distance))
     {
-        physicalSensors.waterLevel = NAN;
-        physicalSensors.waterLevelDistanceCm = NAN;
+        if (waterLevelFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            waterLevelFailureStreak++;
+
+            if (waterLevelFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                Serial.print("[SENSOR] Water level transient read failure ");
+                Serial.print(waterLevelFailureStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+            else
+            {
+                Serial.println("[SENSOR] Water level confirmed unavailable");
+                physicalSensors.waterLevel = NAN;
+                physicalSensors.waterLevelDistanceCm = NAN;
+            }
+        }
+        // Already confirmed unavailable - stays NaN, no repeated logging.
         return;
     }
+
+    if (waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        Serial.println("[SENSOR] Water level recovered");
+    }
+    waterLevelFailureStreak = 0;
 
     physicalSensors.waterLevelDistanceCm = distance;
 

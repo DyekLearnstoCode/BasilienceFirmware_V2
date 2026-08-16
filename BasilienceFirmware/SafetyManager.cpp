@@ -43,8 +43,10 @@ namespace
 
     bool validWaterLevel()
     {
-        return isfinite(sensors.waterLevel) &&
+        static uint8_t invalidStreak = 0;
+        const bool rawValid = isfinite(sensors.waterLevel) &&
             sensors.waterLevel >= 0.0f && sensors.waterLevel <= 100.0f;
+        return debouncedValid(rawValid, invalidStreak);
     }
 
     bool validWaterTemperature()

@@ -1,207 +1,159 @@
 {
+    "LoadCell": 0,
     "devices": {
         "BSLN-9X2A-K47P": {
             "actuatorStatus": {
                 "bloomPump": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 },
                 "blower": {
-                    "reason": "Manual stop",
-                    "running": false,
+                    "reason": "",
+                    "running": true,
                     "source": "automatic",
                     "speed": 100,
-                    "startedAt": 19471,
-                    "state": 0
+                    "startedAt": 1472755,
+                    "state": 5,
+                    "strategy": "normal"
                 },
                 "canopyFan": {
                     "reason": "",
-                    "running": false,
-                    "source": "android",
-                    "speed": 100,
-                    "startedAt": 0,
-                    "state": 0
+                    "running": true,
+                    "source": "automatic",
+                    "speed": 50,
+                    "startedAt": 312479,
+                    "state": 5,
+                    "strategy": ""
                 },
-                "fogger": {
-                    "reason": "Manual stop",
+                "circulationPump": {
+                    "reason": "",
                     "running": false,
                     "source": "automatic",
                     "speed": 100,
-                    "startedAt": 19471,
-                    "state": 0
+                    "startedAt": 302441,
+                    "state": 0,
+                    "strategy": ""
+                },
+                "fogger": {
+                    "reason": "",
+                    "running": true,
+                    "source": "automatic",
+                    "speed": 100,
+                    "startedAt": 1472755,
+                    "state": 5,
+                    "strategy": "normal"
                 },
                 "growLight": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 },
                 "growPump": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 },
                 "peltier": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 },
                 "phDownPump": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "automatic",
                     "speed": 100,
-                    "startedAt": 0,
-                    "state": 0
+                    "startedAt": 291809,
+                    "state": 0,
+                    "strategy": ""
                 },
                 "phUpPump": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 },
                 "solenoid": {
                     "reason": "",
                     "running": false,
-                    "source": "android",
+                    "source": "",
                     "speed": 100,
                     "startedAt": 0,
-                    "state": 0
+                    "state": 0,
+                    "strategy": ""
                 }
             },
             "alerts": {
+                "ecHigh": false,
                 "ecLow": false,
                 "highTemperature": false,
+                "lowAirTemperature": false,
                 "lowWater": false,
                 "phHigh": false,
                 "phLow": false,
                 "phOutOfRange": false,
-                "sensorFault": true,
+                "sensorFault": false,
                 "waterTempOutOfRange": false
             },
             "commands": {
-                "bloomPump": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "blower": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "canopyFan": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
                 "current": {
                     "action": "START",
                     "operation": "RESET_SAFETY",
                     "protocolVersion": 1,
-                    "requestId": 1,
-                    "requestTimestamp": 1785499960
-                },
-                "fogger": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "growLight": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "growPump": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "light": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
+                    "requestId": 14,
+                    "requestTimestamp": 1786426159
                 },
                 "manualMode": false,
                 "mockSensors": {
-                    "airTemperature": 24,
+                    "airTemperature": 24.5,
                     "ec": 1.5,
                     "enabled": true,
-                    "humidity": 80,
-                    "ph": 5.5,
-                    "waterLevel": 40,
-                    "waterTemperature": 23
-                },
-                "nutrients": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
-                },
-                "peltier": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "phDown": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
-                },
-                "phDownPump": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "phUp": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
-                },
-                "phUpPump": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
+                    "humidity": 65.5,
+                    "ph": 6,
+                    "waterLevel": 75,
+                    "waterTemperature": 22
                 },
                 "reservoirFan": {
                     "source": "android",
                     "state": false,
                     "timestamp": 1785462241284
                 },
-                "solenoid": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785499831196
-                },
-                "waterEc": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
-                },
-                "waterPump": {
-                    "source": "android",
-                    "state": false,
-                    "timestamp": 1785462241284
+                "sensorTest": {
+                    "enabled": false
+                }
+            },
+            "debug": {
+                "physicalSensors": {
+                    "ec": 0.40488,
+                    "ph": 4.08626,
+                    "timestamp": 221502,
+                    "waterTemperature": 26.0625
                 }
             },
             "deviceInfo": {
                 "deviceName": "Basilience Controller",
                 "firmwareVersion": "2.0.0",
-                "lastSeen": 8202,
-                "online": true
+                "lastSeen": 1625899
             },
             "operations": {
                 "current": {
@@ -234,17 +186,241 @@
                         "state": "REJECTED"
                     },
                     "1": {
-                        "acceptedTimestamp": 7483,
+                        "acceptedTimestamp": 8078,
                         "action": "START",
-                        "completedTimestamp": 12199,
-                        "lastUpdatedTimestamp": 12199,
+                        "completedTimestamp": 13002,
+                        "lastUpdatedTimestamp": 13002,
                         "operation": "RESET_SAFETY",
                         "protocolVersion": 1,
                         "reason": "",
                         "requestId": 1,
-                        "requestTimestamp": 7483,
+                        "requestTimestamp": 8078,
                         "source": "MANUAL",
-                        "startedTimestamp": 9463,
+                        "startedTimestamp": 10299,
+                        "state": "COMPLETED"
+                    },
+                    "2": {
+                        "acceptedTimestamp": 6773,
+                        "action": "START",
+                        "completedTimestamp": 9865,
+                        "lastUpdatedTimestamp": 9865,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 2,
+                        "requestTimestamp": 6773,
+                        "source": "MANUAL",
+                        "startedTimestamp": 8409,
+                        "state": "COMPLETED"
+                    },
+                    "3": {
+                        "acceptedTimestamp": 178527,
+                        "action": "START",
+                        "completedTimestamp": 181069,
+                        "lastUpdatedTimestamp": 181069,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 3,
+                        "requestTimestamp": 178527,
+                        "source": "MANUAL",
+                        "startedTimestamp": 179905,
+                        "state": "COMPLETED"
+                    },
+                    "4": {
+                        "acceptedTimestamp": 5785,
+                        "action": "START",
+                        "completedTimestamp": 8865,
+                        "lastUpdatedTimestamp": 8865,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 4,
+                        "requestTimestamp": 5785,
+                        "source": "MANUAL",
+                        "startedTimestamp": 7389,
+                        "state": "COMPLETED"
+                    },
+                    "5": {
+                        "acceptedTimestamp": 43570,
+                        "action": "START",
+                        "completedTimestamp": 46686,
+                        "lastUpdatedTimestamp": 46686,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 5,
+                        "requestTimestamp": 43570,
+                        "source": "MANUAL",
+                        "startedTimestamp": 45176,
+                        "state": "COMPLETED"
+                    },
+                    "6": {
+                        "acceptedTimestamp": 58942,
+                        "action": "START",
+                        "completedTimestamp": 61928,
+                        "lastUpdatedTimestamp": 61928,
+                        "operation": "REFILL",
+                        "protocolVersion": 1,
+                        "reason": "Sensor fault",
+                        "requestId": 6,
+                        "requestTimestamp": 58942,
+                        "source": "MANUAL",
+                        "startedTimestamp": 60302,
+                        "state": "FAILED"
+                    },
+                    "7": {
+                        "acceptedTimestamp": 0,
+                        "action": "NONE",
+                        "completedTimestamp": 99052,
+                        "lastUpdatedTimestamp": 99052,
+                        "operation": "NONE",
+                        "protocolVersion": 1,
+                        "reason": "Operation already active",
+                        "requestId": 7,
+                        "requestTimestamp": 99052,
+                        "source": "MANUAL",
+                        "startedTimestamp": 0,
+                        "state": "REJECTED"
+                    },
+                    "8": {
+                        "acceptedTimestamp": 111713,
+                        "action": "START",
+                        "completedTimestamp": 114113,
+                        "lastUpdatedTimestamp": 114113,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 8,
+                        "requestTimestamp": 111713,
+                        "source": "MANUAL",
+                        "startedTimestamp": 113062,
+                        "state": "COMPLETED"
+                    },
+                    "9": {
+                        "acceptedTimestamp": 120294,
+                        "action": "START",
+                        "completedTimestamp": 123233,
+                        "lastUpdatedTimestamp": 123233,
+                        "operation": "REFILL",
+                        "protocolVersion": 1,
+                        "reason": "Sensor fault",
+                        "requestId": 9,
+                        "requestTimestamp": 120294,
+                        "source": "MANUAL",
+                        "startedTimestamp": 121743,
+                        "state": "FAILED"
+                    },
+                    "10": {
+                        "acceptedTimestamp": 7473,
+                        "action": "START",
+                        "completedTimestamp": 12320,
+                        "lastUpdatedTimestamp": 12320,
+                        "operation": "REFILL",
+                        "protocolVersion": 1,
+                        "reason": "Sensor fault",
+                        "requestId": 10,
+                        "requestTimestamp": 7473,
+                        "source": "MANUAL",
+                        "startedTimestamp": 8886,
+                        "state": "FAILED"
+                    },
+                    "11": {
+                        "acceptedTimestamp": 0,
+                        "action": "NONE",
+                        "completedTimestamp": 138908,
+                        "lastUpdatedTimestamp": 138908,
+                        "operation": "NONE",
+                        "protocolVersion": 1,
+                        "reason": "Operation already active",
+                        "requestId": 11,
+                        "requestTimestamp": 138908,
+                        "source": "MANUAL",
+                        "startedTimestamp": 0,
+                        "state": "REJECTED"
+                    },
+                    "12": {
+                        "acceptedTimestamp": 36525,
+                        "action": "START",
+                        "completedTimestamp": 40795,
+                        "lastUpdatedTimestamp": 40795,
+                        "operation": "RESET_SAFETY",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 12,
+                        "requestTimestamp": 36525,
+                        "source": "MANUAL",
+                        "startedTimestamp": 38988,
+                        "state": "COMPLETED"
+                    },
+                    "13": {
+                        "acceptedTimestamp": 0,
+                        "action": "NONE",
+                        "completedTimestamp": 339343,
+                        "lastUpdatedTimestamp": 339343,
+                        "operation": "NONE",
+                        "protocolVersion": 1,
+                        "reason": "Operation already active",
+                        "requestId": 13,
+                        "requestTimestamp": 339343,
+                        "source": "MANUAL",
+                        "startedTimestamp": 0,
+                        "state": "REJECTED"
+                    },
+                    "14": {
+                        "acceptedTimestamp": 0,
+                        "action": "NONE",
+                        "completedTimestamp": 314455,
+                        "lastUpdatedTimestamp": 314455,
+                        "operation": "NONE",
+                        "protocolVersion": 1,
+                        "reason": "No safety subsystem is locked.",
+                        "requestId": 14,
+                        "requestTimestamp": 314455,
+                        "source": "MANUAL",
+                        "startedTimestamp": 0,
+                        "state": "REJECTED"
+                    },
+                    "32768": {
+                        "acceptedTimestamp": 250919,
+                        "action": "START",
+                        "completedTimestamp": 312262,
+                        "lastUpdatedTimestamp": 312262,
+                        "operation": "PH_DOWN",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 32768,
+                        "requestTimestamp": 250919,
+                        "source": "AUTOMATIC",
+                        "startedTimestamp": 250946,
+                        "state": "COMPLETED"
+                    },
+                    "32769": {
+                        "acceptedTimestamp": 11652,
+                        "action": "START",
+                        "completedTimestamp": 14897,
+                        "lastUpdatedTimestamp": 14897,
+                        "operation": "REFILL",
+                        "protocolVersion": 1,
+                        "reason": "Sensor fault",
+                        "requestId": 32769,
+                        "requestTimestamp": 11652,
+                        "source": "AUTOMATIC",
+                        "startedTimestamp": 12497,
+                        "state": "FAILED"
+                    },
+                    "32770": {
+                        "acceptedTimestamp": 66157,
+                        "action": "START",
+                        "completedTimestamp": 106923,
+                        "lastUpdatedTimestamp": 106923,
+                        "operation": "PH_DOWN",
+                        "protocolVersion": 1,
+                        "reason": "",
+                        "requestId": 32770,
+                        "requestTimestamp": 66157,
+                        "source": "AUTOMATIC",
+                        "startedTimestamp": 66940,
                         "state": "COMPLETED"
                     },
                     "42687": {
@@ -272,47 +448,60 @@
                 "year": 0
             },
             "sensors": {
-                "airTemperature": 24,
-                "humidity": 80,
-                "timestamp": 22027,
-                "waterLevel": 40,
-                "waterTemperature": 23
+                "airTemperature": 24.5,
+                "ec": 1.5,
+                "humidity": 65.5,
+                "ph": 6,
+                "tds": 750,
+                "timestamp": 1635524,
+                "waterLevel": 75,
+                "waterTemperature": 22
             },
             "settings": {
+                "airTempRelease": 26,
                 "coolerOffTemp": 22.5,
+                "devModeEnabled": true,
+                "ecTargetMax": 1.8,
+                "ecTargetMin": 1.4,
+                "highAirTemp": 28,
+                "highHumidity": 75,
                 "highWaterTemp": 25,
+                "humidityRelease": 70,
                 "lightOffHour": 22,
                 "lightOffMinute": 0,
                 "lightOnHour": 6,
                 "lightOnMinute": 0,
+                "maxEC": 2,
                 "maxPH": 6.5,
-                "phTargetMin": 5.8,
-                "phTargetMax": 6.3,
                 "minEC": 1.2,
-                "maxEC": 2.0,
-                "ecTargetMin": 1.4,
-                "ecTargetMax": 1.8,
                 "minPH": 5.5,
-                "highAirTemp": 28,
-                "airTempRelease": 26,
-                "highHumidity": 75,
-                "humidityRelease": 70,
+                "phTargetMax": 6.3,
+                "phTargetMin": 5.8,
                 "refillStartLevel": 20,
                 "refillStopLevel": 75
             },
             "status": {
-                "currentMode": 1,
+                "coolingSubsystemLocked": false,
+                "currentMode": 2,
+                "ecSubsystemLocked": false,
                 "firebaseConnected": true,
+                "lastServerSeen": 1786786932192,
                 "manualMode": false,
+                "mockData": true,
+                "online": false,
+                "phSubsystemLocked": false,
+                "provisioning": false,
+                "refillSubsystemLocked": false,
                 "reservoirLocked": false,
                 "safetyLock": false,
+                "sensorTest": false,
                 "wifiConnected": true
             },
             "telemetry": {
                 "ecAttempts": 0,
                 "ecDoseTime": 0,
                 "phAttempts": 0,
-                "phDoseTime": 0
+                "phDoseTime": 10000
             }
         }
     },
