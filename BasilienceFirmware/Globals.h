@@ -12,6 +12,10 @@
 #include "DebugManager.h"
 #include "AlertManager.h"
 #include "SafetyManager.h"
+#include "GsmManager.h"
+#include "SmsRecipientCache.h"
+#include "HarvestScheduleCache.h"
+#include "NotificationManager.h"
 
 // ======================================================
 // Shared Data
@@ -30,5 +34,9 @@ extern RTCManager rtcManager;
 extern AlertManager alertManager;
 extern SafetyManager safetyManager;
 extern WiFiManager wifiManager;
+extern GsmManager gsmManager;
+extern SmsRecipientCache smsRecipientCache;
+extern HarvestScheduleCache harvestScheduleCache;
+extern NotificationManager notificationManager;
 
 #endif

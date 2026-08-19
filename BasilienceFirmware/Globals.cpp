@@ -25,3 +25,7 @@ RTCManager rtcManager;
 AlertManager alertManager;
 SafetyManager safetyManager;
 WiFiManager wifiManager;
+GsmManager gsmManager;
+SmsRecipientCache smsRecipientCache;
+HarvestScheduleCache harvestScheduleCache;
+NotificationManager notificationManager;

@@ -31,6 +31,20 @@ bool RTCManager::isConnected()
     return connected;
 }
 
+bool RTCManager::hasValidTime()
+{
+    if (!connected) return false;
+    return !rtc.lostPower();
+}
+
+uint32_t RTCManager::getEpochTime()
+{
+    if (!hasValidTime()) return 0;
+
+    DateTime now = rtc.now();
+    return now.unixtime();
+}
+
 uint8_t RTCManager::getHour()
 {
     if(!connected)

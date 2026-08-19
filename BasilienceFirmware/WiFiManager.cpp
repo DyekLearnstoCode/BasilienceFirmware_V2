@@ -20,7 +20,18 @@ void WiFiManager::begin()
         return;
     }
 
-    connect();
+    // Kick off the connection attempt without blocking setup(). loop() starts
+    // immediately so local sensing/safety/automation run from the first
+    // iteration; update() drives the STA connection to completion in the
+    // background using the same non-blocking retry path as a mid-run drop.
+    Serial.print("[WIFI] Connecting to ");
+    Serial.println(ssid);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    recoveryInProgress = true;
+    lastReconnectAttempt = millis();
+
     initialConnectionAttempt = false;
 }
 
@@ -290,22 +301,18 @@ void WiFiManager::update()
     if (!recoveryInProgress)
     {
         recoveryInProgress = true;
-        recoveryStartedAt = now;
         lastReconnectAttempt = 0;
         Serial.println("[WIFI] Connection lost");
-        Serial.println("[WIFI] Attempting reconnection...");
+        Serial.println("[WIFI] Reconnecting in background - setup AP will not open automatically for a known network");
     }
 
-    if (now - recoveryStartedAt >= RECOVERY_TIMEOUT)
-    {
-        Serial.println("[WIFI] Reconnection timeout");
-        Serial.println("[WIFI] Starting provisioning AP");
-        Serial.println("[WIFI] Saved credentials retained");
-        recoveryInProgress = false;
-        enterAutomaticProvisioningMode();
-        return;
-    }
-
+    // A device with saved credentials keeps retrying STA in the background
+    // indefinitely instead of falling back to the provisioning AP: the
+    // credentials are already known-good, so an outage here is a router/ISP
+    // problem that opening a setup AP cannot fix, and doing so would needlessly
+    // disrupt Firebase connectivity and require manual re-provisioning. The AP
+    // still opens for a device with no saved credentials, or when the user
+    // explicitly requests provisioning from the app.
     if (lastReconnectAttempt != 0 && now - lastReconnectAttempt < RECONNECT_INTERVAL)
     {
         return;
@@ -440,6 +447,41 @@ void WiFiManager::setupAPServer()
         Serial.println("[WIFI] Reconnecting...");
         delay(1000);
         ESP.restart();
+    });
+
+    // Secure Device Auth: one-time migration/provisioning delivery of this
+    // device's bootstrap secret. Only ever reachable because this whole HTTP
+    // server only exists/serves while provisioning mode is active (started
+    // from startAP(), stopped from stopAP()) - there is no separate "enabled"
+    // flag to forget, and no path to reach this route during normal
+    // operation. The secret is never echoed back and never logged; only its
+    // presence/absence is.
+    server.on("/secure-provision", HTTP_POST, [this]() {
+        Serial.println("[AP HTTP] POST /secure-provision");
+        if (!server.hasArg("deviceSecret") || server.arg("deviceSecret").isEmpty()) {
+            Serial.println("[AP HTTP] Invalid secure-provision request");
+            server.send(400, "text/plain", "Missing deviceSecret");
+            Serial.println("[AP HTTP] Response: 400");
+            return;
+        }
+
+        // generateDeviceSecret.js emits 32 random bytes as unpadded base64url,
+        // which is always 43 characters. This bound is intentionally generous
+        // (not an exact-length check) so a minor change to the generator's
+        // encoding does not brick provisioning, while still rejecting empty-
+        // adjacent noise or an oversized payload before it reaches NVS.
+        const size_t secretLen = server.arg("deviceSecret").length();
+        if (secretLen < 16 || secretLen > 128) {
+            Serial.println("[AP HTTP] Invalid secure-provision request (deviceSecret length out of range)");
+            server.send(400, "text/plain", "Invalid deviceSecret length");
+            Serial.println("[AP HTTP] Response: 400");
+            return;
+        }
+
+        firebaseManager.saveDeviceSecretFromProvisioning(server.arg("deviceSecret"));
+
+        server.send(200, "text/plain", "Device secret received.");
+        Serial.println("[AP HTTP] Response: 200 (secret not logged)");
     });
 
     // Captive portal redirect for any unknown requests

@@ -51,6 +51,70 @@ constexpr uint8_t SENSOR_TRANSIENT_FAILURE_THRESHOLD = 3;
     "https://basilience-database-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 // ======================================================
+// Secure Device Auth (per-device bootstrap + refresh-token identity)
+// ======================================================
+
+// TEMPORARY migration flag. false (default) = legacy anonymous Firebase auth
+// remains available as a fallback whenever this device has no bootstrap
+// secret provisioned yet - required so already-fielded devices (including
+// the current test unit, which has not had a secret injected yet) are not
+// locked out the moment this firmware ships. Once every fielded device has
+// been confirmed to hold a secret and successfully bootstrap, set this to
+// true (forbidding the anonymous fallback) BEFORE restrictive RTDB rules are
+// ever deployed - see the Secure Device Auth report's deployment checklist.
+// Never silently left false in a "final" build; its state must always be a
+// deliberate, reported decision.
+constexpr bool SECURE_DEVICE_AUTH_REQUIRED = false;
+
+// Cloud Function HTTPS endpoint that verifies a device's bootstrap secret and
+// mints a Firebase custom token (uid = deviceId). PROPOSED path/region,
+// matching this project's existing asia-southeast1 Firebase region - verify
+// against the actual deployed function URL before physical use; not yet
+// deployed as of this task.
+#define BOOTSTRAP_ENDPOINT_URL "https://asia-southeast1-basilience-database.cloudfunctions.net/deviceAuthBootstrap"
+
+// Google Trust Services GTS Root R1 - fetched directly from Google's own
+// published trust store (https://pki.goog/repo/certs/gtsr1.pem), not
+// transcribed from memory. Cloud Functions/Cloud Run HTTPS endpoints chain up
+// to a Google Trust Services root; this is the long-lived root itself (valid
+// to 2036), not a short-lived leaf certificate, so it should not need
+// frequent rotation - but reconfirm against pki.goog if the bootstrap
+// endpoint ever fails TLS validation unexpectedly.
+constexpr const char* BOOTSTRAP_CA_CERT = R"CERT(
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+)CERT";
+
+// ======================================================
 // SSR Outputs
 // ======================================================
 
@@ -101,7 +165,32 @@ constexpr uint8_t ECHO_PIN = 19;
 constexpr uint8_t RTC_SDA_PIN = 21;
 constexpr uint8_t RTC_SCL_PIN = 22;
 
+// ======================================================
+// GSM / A7680C (SIMCom A76XX family)
+// ======================================================
+// PROPOSED wiring - not yet physically confirmed on any board. These are the
+// only two digital-capable GPIOs left unclaimed by every sensor, actuator,
+// I2C, and UART0 (USB/debug) pin above, avoiding strapping pins 0/2. GSM
+// runtime remains pending until the ESP32 is actually wired to the A7680C on
+// these pins; see the firmware GSM foundation report for the full pin audit.
 
+// A76XX default UART framing is 115200 8N1. Autobaud is supported by the
+// module, but a fixed rate is used here so GsmManager's bounded timeouts
+// don't also have to account for autobaud detection latency/uncertainty.
+constexpr unsigned long GSM_BAUD_RATE = 115200UL;
+constexpr uint8_t GSM_RX_PIN = 16;  // ESP32 RX <- A7680C UTX
+constexpr uint8_t GSM_TX_PIN = 17;  // ESP32 TX -> A7680C URX
+// TEMPORARY hardware bring-up switch - see GsmRawUartTest. When false
+// (default), firmware behavior is completely unchanged: GsmManager and the
+// full notification pipeline run as normal. When true, the production GSM
+// path is not initialized at all and a raw, unparsed UART probe/baud-scan
+// runs instead, to isolate a wiring/baud/power issue from a firmware parser
+// issue. Never leave this true in a normal build - it never sends SMS and
+// never services the notification queue.
+constexpr bool GSM_RAW_UART_TEST = true;
+
+// TEMPORARY PHYSICAL SMS DIAGNOSTIC — replace before testing
+constexpr const char* GSM_TEST_PHONE_NUMBER = "+639939839959";
 // ======================================================
 // Sensor Thresholds
 // ======================================================

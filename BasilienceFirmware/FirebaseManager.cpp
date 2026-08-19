@@ -1,6 +1,8 @@
 #include "FirebaseManager.h"
 #include "Globals.h"
 #include "Arduino.h"
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
 
 namespace
 {
@@ -15,6 +17,19 @@ constexpr unsigned long REALTIME_FALLBACK_INTERVAL = 60000;
 constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
 constexpr unsigned long HEARTBEAT_SUCCESS_LOG_INTERVAL_MS = 60000;
 constexpr unsigned long SENSOR_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
+
+// Consecutive transport-level failures before Firebase health leaves
+// DEGRADED and enters COOLDOWN (no Firebase network calls at all).
+constexpr uint8_t TRANSPORT_FAILURE_COOLDOWN_THRESHOLD = 3;
+constexpr unsigned long COOLDOWN_INITIAL_MS = 15000UL;
+constexpr unsigned long COOLDOWN_MAX_MS = 60000UL;
+// Cached-locally, low-priority background refreshes (SMS recipients,
+// harvest schedule) - within the task's suggested 60-120s range.
+constexpr unsigned long LOW_PRIORITY_READ_INTERVAL_MS = 90000UL;
+// Mirrors COMMAND_FAILURE_BACKOFF_INTERVAL's pattern, applied to the
+// actuatorStatus cloud mirror so a failed write cannot retry on the very
+// next loop() tick regardless of the broader health state.
+constexpr unsigned long ACTUATOR_SYNC_FAILURE_BACKOFF_MS = 5000UL;
 
 //==================================================
 // Firebase Operation Conversions
@@ -257,28 +272,56 @@ void FirebaseManager::begin()
 
     config.database_url = DATABASE_URL;
 
-    if (Firebase.signUp(
-            &config,
-            &auth,
-            "",
-            ""))
+    loadDeviceId();
+    loadActuatorCommandTimestamps();
+
+    // Secure device identity (uid = deviceId) is tried first. Only when
+    // neither a refresh token nor a bootstrap secret is available yet does
+    // this fall back to legacy anonymous auth - and only while
+    // SECURE_DEVICE_AUTH_REQUIRED is false, so already-fielded devices
+    // (including the current test unit, pending its one-time secret
+    // injection) are never locked out by this change alone.
+    bool authenticated = trySecureAuthentication();
+
+    if (authenticated)
     {
-        Serial.println("Firebase SignUp OK");
+        Serial.println("[FIREBASE-AUTH] Secure device identity active");
+        Serial.print("[FIREBASE-AUTH] uid=");
+        Serial.println(deviceId);
+    }
+    else if (SECURE_DEVICE_AUTH_REQUIRED)
+    {
+        Serial.println("[FIREBASE-AUTH] Secure auth unavailable this boot (no device secret provisioned, or bootstrap failed)");
+        Serial.println("[FIREBASE-AUTH] Legacy anonymous auth is disabled (SECURE_DEVICE_AUTH_REQUIRED=true) - Firebase connectivity unavailable this boot");
+        systemState.firebaseConnected = false;
+        // Local automation/safety/actuator/GSM/notification control is
+        // untouched by this return - none of it lives in this class or
+        // depends on Firebase having authenticated.
+        return;
     }
     else
     {
-        Serial.print("Firebase SignUp Failed: ");
-        Serial.println(config.signer.signupError.message.c_str());
+        Serial.println("[SECURITY] Legacy Firebase auth compatibility mode active");
+        if (Firebase.signUp(
+                &config,
+                &auth,
+                "",
+                ""))
+        {
+            Serial.println("Firebase SignUp OK");
+        }
+        else
+        {
+            Serial.print("Firebase SignUp Failed: ");
+            Serial.println(config.signer.signupError.message.c_str());
+        }
+
+        Firebase.begin(
+            &config,
+            &auth);
     }
 
-    Firebase.begin(
-        &config,
-        &auth);
-
     Firebase.reconnectWiFi(true);
-
-        loadDeviceId();
-        loadActuatorCommandTimestamps();
 
 Serial.print("Loaded Device ID: [");
 Serial.print(deviceId);
@@ -605,6 +648,35 @@ void FirebaseManager::update()
         return;
     }
 
+    //--------------------------------------------------
+    // Firebase transport health
+    //--------------------------------------------------
+
+    // COOLDOWN means repeated transport failures already confirmed the
+    // connection is broken - retrying heartbeat/actuator/command calls here
+    // would just block for the same timeout again for nothing. No Firebase
+    // network call happens this cycle except, once the backoff window has
+    // elapsed, exactly one controlled recovery attempt. Local automation,
+    // safety, actuators, GSM, and the NVS notification queue are entirely
+    // unaffected - they already ran before this function was ever called
+    // (see loop(), and Part 12 of the report this task produces).
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN)
+    {
+        if (millis() - cooldownStartedAt >= cooldownDurationMs)
+        {
+            attemptFirebaseRecovery();
+        }
+        return;
+    }
+
+    // DEGRADED (1-2 transport failures, below the COOLDOWN threshold) keeps
+    // essential ops (heartbeat, actuator sync, command reads) on their
+    // normal cadence but suppresses low-priority/optional work below,
+    // reusing the same deferLowPriorityJobs mechanism already used to
+    // protect automatic-operation response latency.
+    const bool deferLowPriorityForHealth =
+        firebaseHealth != FirebaseHealthState::HEALTHY;
+
     // /sensors is the authoritative presence heartbeat. When due, it owns this
     // Firebase opportunity and no optional cloud job is allowed to run first.
     if (isSensorUploadDue())
@@ -646,7 +718,7 @@ void FirebaseManager::update()
     // loop iterations so slow requests cannot accumulate in one update.
     runOneOptionalFirebaseJob(
         systemState.sensorTestEnabled,
-        alertWasDirty || deferLowPriorityForControlResponse);
+        alertWasDirty || deferLowPriorityForControlResponse || deferLowPriorityForHealth);
 }
 
 bool FirebaseManager::isSensorUploadDue() const
@@ -685,7 +757,7 @@ void FirebaseManager::runOneOptionalFirebaseJob(
     bool sensorTestMode,
     bool deferLowPriorityJobs)
 {
-    constexpr uint8_t OPTIONAL_JOB_COUNT = 11;
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 14;
 
     for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
     {
@@ -707,8 +779,11 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         // A new alert transition must not sit behind low-priority synchronization.
         // Advance the cursor past these jobs now; they remain eligible on later
         // non-urgent rotations and therefore cannot be permanently starved.
+        // Recipient/harvest-schedule sync and notification replay (11-13) are
+        // likewise low-priority background work, same treatment as 6-10.
         if (deferLowPriorityJobs &&
-            (job == 6 || job == 7 || job == 8 || job == 9 || job == 10))
+            (job == 6 || job == 7 || job == 8 || job == 9 || job == 10 ||
+             job == 11 || job == 12 || job == 13))
         {
             continue;
         }
@@ -763,6 +838,18 @@ void FirebaseManager::runOneOptionalFirebaseJob(
 
             case 10:
                 writeDiagnosticSensors();
+                return;
+
+            case 11:
+                readSmsRecipients();
+                return;
+
+            case 12:
+                readHarvestSchedule();
+                return;
+
+            case 13:
+                replayQueuedNotification();
                 return;
         }
     }
@@ -957,6 +1044,7 @@ void FirebaseManager::readSettings()
     const unsigned long startedAt = millis();
     const bool succeeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/settings");
     logFirebaseDuration("Settings read", millis() - startedAt);
+    recordFirebaseResult(succeeded);
     if(!succeeded)
     {
         return;
@@ -1234,6 +1322,394 @@ void FirebaseManager::provisionDevice()
         Serial.println(fbdo.errorReason());
     }
 }
+
+//==================================================
+// Secure Device Auth
+//==================================================
+
+bool FirebaseManager::trySecureAuthentication()
+{
+    loadDeviceAuthCredentials();
+
+    if (deviceAuthRefreshToken.length() > 0)
+    {
+        Serial.println("[SECURITY] Stored refresh token found");
+        if (restoreFromRefreshToken(deviceAuthRefreshToken))
+        {
+            Serial.println("[SECURITY] Refresh-token authentication succeeded");
+            return true;
+        }
+        Serial.println("[SECURITY] Refresh-token authentication failed");
+    }
+
+    if (deviceAuthSecret.length() > 0)
+    {
+        Serial.println("[SECURITY] Stored device secret found");
+        if (bootstrapSecureAuth(deviceAuthSecret))
+        {
+            return true;
+        }
+        Serial.println("[FIREBASE-AUTH] Bootstrap failed");
+    }
+
+    return false;
+}
+
+bool FirebaseManager::restoreFromRefreshToken(const String& refreshToken)
+{
+    // A string that is not shaped like a JWT (header.payload.signature) is
+    // auto-detected by this library as a bare refresh token and triggers a
+    // refresh-grant sign-in directly against Google's securetoken endpoint -
+    // confirmed against FirebaseCore.cpp's own signer logic, not assumed
+    // from documentation alone. No bootstrap call is made on this path.
+    Firebase.setCustomToken(&config, refreshToken);
+    Firebase.begin(&config, &auth);
+
+    // Bounded wait, consistent with this same begin() sequence's existing
+    // tolerance for a one-time blocking network step at Wi-Fi-connect time
+    // (the anonymous signUp() this replaces already blocked synchronously
+    // here) - not a new blocking pattern, and not part of the per-iteration
+    // main loop this firmware keeps non-blocking elsewhere.
+    unsigned long startedAt = millis();
+    while (!Firebase.ready() && millis() - startedAt < 10000UL)
+    {
+        delay(100);
+    }
+
+    if (!Firebase.ready())
+    {
+        return false;
+    }
+
+    // The refresh-grant response can rotate the refresh token, not just the
+    // short-lived ID token. Re-persisting here (in addition to the bootstrap
+    // path) ensures NVS always holds whatever token the library is currently
+    // using, instead of a possibly-superseded one from a prior boot.
+    const char* rotatedRefreshToken = Firebase.getRefreshToken();
+    if (rotatedRefreshToken != nullptr && strlen(rotatedRefreshToken) > 0
+        && refreshToken != rotatedRefreshToken)
+    {
+        saveRefreshToken(String(rotatedRefreshToken));
+        Serial.println("[SECURITY] Refresh token persisted");
+    }
+
+    return true;
+}
+
+bool FirebaseManager::bootstrapSecureAuth(const String& secret)
+{
+    String mac = WiFi.macAddress();
+    if (mac.isEmpty() || mac == "00:00:00:00:00:00")
+    {
+        // begin() only runs once Wi-Fi is connected, by which point
+        // WiFi.mode(WIFI_STA) has long been set and the MAC is stable - this
+        // is a defensive guard against the well-known all-zero transient
+        // value, not an expected path here.
+        Serial.println("[FIREBASE-AUTH] MAC address not yet valid; deferring bootstrap");
+        return false;
+    }
+
+    NetworkClientSecure secureClient;
+    secureClient.setCACert(BOOTSTRAP_CA_CERT);
+
+    HTTPClient http;
+    http.setTimeout(15000);
+    if (!http.begin(secureClient, BOOTSTRAP_ENDPOINT_URL))
+    {
+        Serial.println("[FIREBASE-AUTH] Unable to open bootstrap connection");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+
+    FirebaseJson payload;
+    payload.set("mac", mac);
+    payload.set("deviceSecret", secret);
+    String body;
+    payload.toString(body);
+
+    Serial.println("[SECURITY] Requesting device bootstrap token");
+    int httpCode = http.POST(body);
+    // The secret existed only in `payload`/`body`, local to this function -
+    // cleared immediately after send; never logged, never echoed anywhere.
+    body = "";
+    payload.clear();
+
+    if (httpCode != 200)
+    {
+        Serial.print("[FIREBASE-AUTH] Bootstrap rejected, HTTP ");
+        Serial.println(httpCode);
+        http.end();
+        return false;
+    }
+
+    String response = http.getString();
+    http.end();
+
+    FirebaseJson responseJson;
+    responseJson.setJsonData(response);
+    FirebaseJsonData field;
+
+    String customToken;
+    if (responseJson.get(field, "customToken")) customToken = field.stringValue;
+
+    // deviceId is not secret (it is already the Firestore claim code shown
+    // to Admins during claiming) - returned alongside the token purely so a
+    // first-time device that has not yet persisted a deviceId can learn the
+    // server-resolved one without a separate /provisioning read.
+    String resolvedDeviceId;
+    if (responseJson.get(field, "deviceId")) resolvedDeviceId = field.stringValue;
+
+    response = "";
+
+    if (customToken.isEmpty())
+    {
+        Serial.println("[FIREBASE-AUTH] Bootstrap response missing token");
+        return false;
+    }
+    Serial.println("[SECURITY] Bootstrap succeeded");
+
+    if (deviceId.isEmpty() && !resolvedDeviceId.isEmpty())
+    {
+        saveDeviceId(resolvedDeviceId);
+    }
+
+    Firebase.setCustomToken(&config, customToken);
+    customToken = "";
+    Firebase.begin(&config, &auth);
+
+    unsigned long startedAt = millis();
+    while (!Firebase.ready() && millis() - startedAt < 10000UL)
+    {
+        delay(100);
+    }
+
+    if (!Firebase.ready())
+    {
+        Serial.println("[FIREBASE-AUTH] Sign-in with minted token did not complete");
+        return false;
+    }
+    Serial.println("[SECURITY] Firebase custom-token authentication succeeded");
+
+    const char* newRefreshToken = Firebase.getRefreshToken();
+    if (newRefreshToken != nullptr && strlen(newRefreshToken) > 0)
+    {
+        saveRefreshToken(String(newRefreshToken));
+        Serial.println("[SECURITY] Refresh token persisted");
+    }
+
+    return true;
+}
+
+void FirebaseManager::loadDeviceAuthCredentials()
+{
+    preferences.begin("device_auth", true);
+    deviceAuthSecret = preferences.getString("device_secret", "");
+    deviceAuthRefreshToken = preferences.getString("refresh_token", "");
+    preferences.end();
+}
+
+void FirebaseManager::saveRefreshToken(const String& token)
+{
+    preferences.begin("device_auth", false);
+    preferences.putString("refresh_token", token);
+    preferences.end();
+    deviceAuthRefreshToken = token;
+}
+
+void FirebaseManager::saveDeviceSecretFromProvisioning(const String& secret)
+{
+    preferences.begin("device_auth", false);
+    preferences.putString("device_secret", secret);
+    // A freshly-injected secret invalidates whatever refresh token (if any)
+    // belonged to the previous credential generation - force a fresh
+    // bootstrap on next boot rather than risk mixing old/new identity state.
+    preferences.remove("refresh_token");
+    preferences.end();
+    deviceAuthSecret = secret;
+    deviceAuthRefreshToken = "";
+    Serial.println("[FIREBASE-AUTH] Device secret received via local provisioning - will bootstrap on next boot");
+}
+
+//==================================================
+// Firebase transport health (timeout cascade / backoff / recovery)
+//==================================================
+
+bool FirebaseManager::isTransportFailureReason(const String& reason) const
+{
+    if (reason.isEmpty()) return false;
+
+    String lower = reason;
+    lower.toLowerCase();
+
+    // Grounded in the exact strings FB_Const.h's errorReason() can return
+    // (verified against the vendored library source, not guessed):
+    // "response payload read timed out", "connection refused",
+    // "send request failed", "not connected", "connection lost",
+    // "no http server", "response read failed.", "upload timed out",
+    // "upload data sent error", "incomplete SSL client data",
+    // "request timed out", "gateway timeout", "bad gateway",
+    // "service unavailable", "internal server error". Deliberately excludes
+    // permission/shape/application-level strings like "bad request",
+    // "unauthorized", "forbidden", "not found", "path not exist", "data
+    // type mismatch" - those never touch firebaseHealth.
+    static const char* transportMarkers[] = {
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection lost",
+        "not connected",
+        "no http server",
+        "response read failed",
+        "send request failed",
+        "incomplete ssl",
+        "upload data sent error",
+        "bad gateway",
+        "service unavailable",
+        "internal server error"
+    };
+
+    for (size_t i = 0; i < sizeof(transportMarkers) / sizeof(transportMarkers[0]); i++)
+    {
+        if (lower.indexOf(transportMarkers[i]) >= 0) return true;
+    }
+    return false;
+}
+
+void FirebaseManager::recordFirebaseResult(bool success)
+{
+    // Deliberately separate from consecutiveSensorUploadFailures (the
+    // existing presence/heartbeat counter): that one only tracks
+    // writeSensors() specifically and drives its own local "[PRESENCE] ..."
+    // logging, and device-offline detection is entirely backend-owned
+    // (Cloud Functions evaluating lastServerSeen staleness) rather than
+    // client-declared - so it is left completely untouched here. This
+    // streak tracks every RTDB call site instead, purely to gate this
+    // client's own retry/backoff behavior, and never writes any RTDB path
+    // or triggers any notification itself.
+    if (success)
+    {
+        if (firebaseHealth == FirebaseHealthState::DEGRADED)
+        {
+            Serial.println("[FIREBASE-HEALTH] DEGRADED -> HEALTHY");
+        }
+        transportFailureStreak = 0;
+        firebaseHealth = FirebaseHealthState::HEALTHY;
+        return;
+    }
+
+    // COOLDOWN/RECOVERING already reflect a confirmed-unhealthy transport;
+    // a single call's outcome while in those states cannot un-confirm it
+    // (that is what the bounded recovery attempt is for), and no further
+    // Firebase calls should even occur while COOLDOWN is active.
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN ||
+        firebaseHealth == FirebaseHealthState::RECOVERING)
+    {
+        return;
+    }
+
+    String reason = fbdo.errorReason();
+    if (!isTransportFailureReason(reason))
+    {
+        // Application-level failure (permission denied, missing optional
+        // path, malformed data, rejected operation command, etc.) - does
+        // not indicate a broken connection, so it does not move health.
+        return;
+    }
+
+    transportFailureStreak++;
+    Serial.print("[FIREBASE-HEALTH] transport failure #");
+    Serial.print(transportFailureStreak);
+    Serial.print(": ");
+    Serial.println(reason);
+
+    if (firebaseHealth == FirebaseHealthState::HEALTHY)
+    {
+        firebaseHealth = FirebaseHealthState::DEGRADED;
+        Serial.println("[FIREBASE-HEALTH] HEALTHY -> DEGRADED");
+    }
+
+    if (transportFailureStreak >= TRANSPORT_FAILURE_COOLDOWN_THRESHOLD)
+    {
+        enterFirebaseCooldown();
+    }
+}
+
+void FirebaseManager::enterFirebaseCooldown()
+{
+    firebaseHealth = FirebaseHealthState::COOLDOWN;
+    cooldownStartedAt = millis();
+
+    if (cooldownDurationMs == 0)
+    {
+        cooldownDurationMs = COOLDOWN_INITIAL_MS;
+    }
+    else
+    {
+        cooldownDurationMs = min(cooldownDurationMs * 2, COOLDOWN_MAX_MS);
+        Serial.print("[FIREBASE-HEALTH] Backoff increased to ");
+        Serial.print(cooldownDurationMs);
+        Serial.println(" ms");
+    }
+
+    Serial.print("[FIREBASE-HEALTH] Entering cooldown ");
+    Serial.print(cooldownDurationMs);
+    Serial.println(" ms");
+    // Logged once per cooldown entry, not per skipped loop() iteration -
+    // update() otherwise returns silently on every pass while COOLDOWN
+    // holds, which could be many times per second.
+    Serial.println("[FIREBASE-HEALTH] Skipping low-priority sync during cooldown");
+}
+
+bool FirebaseManager::attemptFirebaseRecovery()
+{
+    firebaseHealth = FirebaseHealthState::RECOVERING;
+    Serial.println("[FIREBASE-HEALTH] Recovery attempt");
+
+    // Close/release the possibly-stuck internal SSL client before
+    // re-establishing a session - fbdo.stopWiFiClient() is the verified
+    // public API for this (Firebase.h's own reset(FirebaseConfig*) was
+    // considered and rejected: its doc explicitly says it resets stored
+    // auth credentials, which would violate "restore auth state without
+    // losing credentials").
+    fbdo.stopWiFiClient();
+    fbdo.clear();
+
+    // Re-run exactly the same auth flow begin() uses at boot: secure
+    // identity first (refresh token, then secret bootstrap - both read the
+    // same persisted NVS credentials, untouched by recovery), falling back
+    // to legacy anonymous auth only in migration compatibility mode. No
+    // credentials are cleared or regenerated by this path.
+    bool authenticated = trySecureAuthentication();
+    if (!authenticated && !SECURE_DEVICE_AUTH_REQUIRED)
+    {
+        if (Firebase.signUp(&config, &auth, "", ""))
+        {
+            Firebase.begin(&config, &auth);
+        }
+    }
+
+    Firebase.reconnectWiFi(true);
+
+    unsigned long startedAt = millis();
+    while (!Firebase.ready() && millis() - startedAt < 10000UL)
+    {
+        delay(100);
+    }
+
+    if (Firebase.ready())
+    {
+        Serial.println("[FIREBASE-HEALTH] Recovery succeeded");
+        firebaseHealth = FirebaseHealthState::HEALTHY;
+        transportFailureStreak = 0;
+        cooldownDurationMs = 0;
+        return true;
+    }
+
+    Serial.println("[FIREBASE-HEALTH] Recovery failed");
+    enterFirebaseCooldown();
+    return false;
+}
+
 //==================================================
 // Time Synchronization
 //==================================================
@@ -1318,6 +1794,7 @@ void FirebaseManager::readCommands()
         &fbdo,
         deviceRoot() + "/commands/current");
     logFirebaseDuration("Operation command read", millis() - startedAt);
+    recordFirebaseResult(succeeded);
     if(!succeeded)
     {
         commandBackoffActive = true;
@@ -1480,6 +1957,7 @@ void FirebaseManager::readActuatorCommands()
     const unsigned long startedAt = millis();
     const bool succeeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands");
     logFirebaseDuration("Actuator command read", millis() - startedAt);
+    recordFirebaseResult(succeeded);
     if(!succeeded)
     {
         commandBackoffActive = true;
@@ -2437,6 +2915,21 @@ bool FirebaseManager::writeAlerts()
 
 void FirebaseManager::writeActuators()
 {
+    // This is called unconditionally on every update() pass (unlike the
+    // round-robin optional jobs), so a failed write previously had nothing
+    // stopping it from retrying - blocking for a full request timeout - on
+    // literally the next loop() tick, forever, since actuatorManager stays
+    // "dirty" until a write actually succeeds. This backoff mirrors
+    // readCommands()'s existing COMMAND_FAILURE_BACKOFF_INTERVAL pattern.
+    static unsigned long lastActuatorSyncFailureAt = 0;
+    static bool actuatorSyncBackoffActive = false;
+
+    if (actuatorSyncBackoffActive &&
+        millis() - lastActuatorSyncFailureAt < ACTUATOR_SYNC_FAILURE_BACKOFF_MS)
+    {
+        return;
+    }
+
     FirebaseJson json;
     const bool fullUploadDue =
         !actuatorCacheInitialized ||
@@ -2491,6 +2984,8 @@ void FirebaseManager::writeActuators()
 
     if (updateJson(deviceRoot() + "/actuatorStatus", json))
     {
+        actuatorSyncBackoffActive = false;
+
         for (int i = 0; i < ACTUATOR_COUNT; i++)
         {
             if (changed[i])
@@ -2511,6 +3006,15 @@ void FirebaseManager::writeActuators()
         actuatorCacheInitialized = true;
         if (fullUploadDue) lastActuatorFullUpload = millis();
         actuatorManager.markStatusSynced();
+    }
+    else
+    {
+        // Local actuator state is untouched and remains authoritative;
+        // actuatorManager stays dirty (markStatusSynced() was not called),
+        // so the same latest state is retried - not replayed history - once
+        // the backoff (or a broader COOLDOWN) clears.
+        actuatorSyncBackoffActive = true;
+        lastActuatorSyncFailureAt = millis();
     }
 }
 
@@ -2558,6 +3062,147 @@ void FirebaseManager::writeDeviceInfo()
 }
 
 //==================================================
+// Offline notification pipeline
+//==================================================
+
+void FirebaseManager::readSmsRecipients()
+{
+    // Cached in NVS via SmsRecipientCache and does not need frequent reads -
+    // previously had no cadence gate at all here (only the round-robin
+    // optional-job rotation limited it), which is exactly the "9595 ms every
+    // rotation" pattern this task is fixing.
+    static unsigned long lastSmsRecipientsRead = 0;
+    if (millis() - lastSmsRecipientsRead < LOW_PRIORITY_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastSmsRecipientsRead = millis();
+
+    const unsigned long startedAt = millis();
+    bool succeeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/smsRecipients");
+    logFirebaseDuration("SMS recipients read", millis() - startedAt);
+    recordFirebaseResult(succeeded);
+    if (!succeeded)
+    {
+        // Failed read - the last known-good cache is left untouched.
+        return;
+    }
+
+    FirebaseJson& snapshot = fbdo.jsonObject();
+    String phones[MAX_SMS_RECIPIENTS];
+    uint8_t count = 0;
+
+    int type;
+    String key, value;
+    size_t len = snapshot.iteratorBegin();
+    for (size_t i = 0; i < len; i++)
+    {
+        snapshot.iteratorGet(i, type, key, value);
+        if (type != FirebaseJson::JSON_OBJECT) continue; // each child is {phone, enabled[, role]}
+
+        FirebaseJson child(value);
+        FirebaseJsonData field;
+
+        bool enabled = true;
+        if (child.get(field, "enabled")) enabled = field.boolValue;
+        if (!enabled) continue;
+
+        if (child.get(field, "phone") && count < MAX_SMS_RECIPIENTS)
+        {
+            phones[count++] = field.stringValue;
+        }
+    }
+    snapshot.iteratorEnd();
+
+    // A genuinely empty object (0 eligible children) is an authoritative
+    // snapshot too - distinct from the failed-read early return above - and
+    // SmsRecipientCache treats a 0-count call as a valid clear.
+    smsRecipientCache.applySnapshot(phones, count);
+}
+
+void FirebaseManager::readHarvestSchedule()
+{
+    // Same reasoning as readSmsRecipients(): cached locally, no need for a
+    // reduced polling cadence tied to the round-robin rotation alone.
+    static unsigned long lastHarvestScheduleRead = 0;
+    if (millis() - lastHarvestScheduleRead < LOW_PRIORITY_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastHarvestScheduleRead = millis();
+
+    const unsigned long startedAt = millis();
+    bool succeeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/harvestSchedule");
+    logFirebaseDuration("Harvest schedule read", millis() - startedAt);
+    recordFirebaseResult(succeeded);
+    if (!succeeded)
+    {
+        // Failed read - the last known-good schedule is left untouched.
+        return;
+    }
+
+    FirebaseJson& snapshot = fbdo.jsonObject();
+    FirebaseJsonData field;
+
+    bool active = false;
+    if (snapshot.get(field, "active")) active = field.boolValue;
+
+    String cycleId;
+    if (snapshot.get(field, "cycleId")) cycleId = field.stringValue;
+
+    int cycleNumber = 0;
+    if (snapshot.get(field, "cycleNumber")) cycleNumber = field.intValue;
+
+    uint32_t nextHarvestAt = 0;
+    if (snapshot.get(field, "nextHarvestAt")) nextHarvestAt = (uint32_t)field.intValue;
+
+    // No active cycle (or the projection producer explicitly cleared it) is
+    // an authoritative "nothing due" snapshot, not a failure.
+    harvestScheduleCache.applySnapshot(cycleId, cycleNumber, nextHarvestAt, active);
+}
+
+void FirebaseManager::replayQueuedNotification()
+{
+    NotificationEvent event;
+    if (!notificationManager.getNextCloudReplayEvent(event)) return;
+
+    if (notificationManager.isCloudReplayStale(event.eventId, 5UL * 60UL * 1000UL))
+    {
+        // (Re)submit the full, idempotent event content. A resubmission
+        // after a stale window (e.g. the Cloud Function missed it, or the
+        // ESP rebooted mid-replay) simply overwrites the same node with the
+        // same content - safe, since the destination write is idempotent by
+        // eventId on the Cloud Function side.
+        FirebaseJson payload;
+        payload.set("type", notificationEventTypeName(event.type));
+        payload.set("severity", notificationSeverityName(event.severity));
+        payload.set("title", event.title);
+        payload.set("message", event.message);
+        payload.set("occurredAt", (int)event.occurredAtEpoch);
+        payload.set("timestampValid", event.timestampValid);
+        payload.set("smsFallbackUsed",
+            event.smsStatus == SmsDeliveryStatus::DELIVERED || event.smsStatus == SmsDeliveryStatus::PARTIAL);
+
+        const unsigned long startedAt = millis();
+        bool ok = writeJson(deviceRoot() + "/notificationQueue/" + event.eventId, payload);
+        logFirebaseDuration("Notification replay write", millis() - startedAt);
+        if (ok) notificationManager.markCloudReplaySubmitted(event.eventId);
+        return;
+    }
+
+    // Already submitted and still fresh - just poll for the Cloud
+    // Function's ack rather than resubmitting every rotation.
+    const unsigned long startedAt = millis();
+    bool succeeded = Firebase.RTDB.getString(&fbdo, deviceRoot() + "/notificationQueue/" + event.eventId + "/status");
+    logFirebaseDuration("Notification ack poll", millis() - startedAt);
+    recordFirebaseResult(succeeded);
+    if (succeeded && fbdo.stringData() == "acked")
+    {
+        notificationManager.markCloudReplayAcked(event.eventId);
+    }
+}
+
+//==================================================
 // Utilities
 //==================================================
 
@@ -2570,6 +3215,8 @@ bool FirebaseManager::writeJson(
             &fbdo,
             path,
             &json);
+
+    recordFirebaseResult(success);
 
     if(!success)
     {
@@ -2590,6 +3237,8 @@ bool FirebaseManager::updateJson(
             &fbdo,
             path,
             &json);
+
+    recordFirebaseResult(success);
 
     if(!success)
     {
@@ -2707,7 +3356,9 @@ void FirebaseManager::readMockSensors()
     if(millis() - lastMockRead < MOCK_READ_INTERVAL) return;
     lastMockRead = millis();
 
-    if(!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/mockSensors")) {
+    const bool mockReadSucceeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/mockSensors");
+    recordFirebaseResult(mockReadSucceeded);
+    if(!mockReadSucceeded) {
         // A transient read failure must not silently change sensor authority.
         mockReadBackoffActive = true;
         lastMockReadFailure = millis();
@@ -2878,7 +3529,9 @@ void FirebaseManager::readSensorTestCommand()
     lastSensorTestRead = millis();
 
     FirebaseJsonData data;
-    if (!Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/sensorTest"))
+    const bool sensorTestReadSucceeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/sensorTest");
+    recordFirebaseResult(sensorTestReadSucceeded);
+    if (!sensorTestReadSucceeded)
     {
         sensorTestReadBackoffActive = true;
         lastSensorTestReadFailure = millis();

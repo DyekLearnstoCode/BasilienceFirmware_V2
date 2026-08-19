@@ -59,7 +59,6 @@ private:
     String password;
 
     unsigned long lastReconnectAttempt = 0;
-    unsigned long recoveryStartedAt = 0;
     unsigned long lastAPReconnectAttempt = 0;
     unsigned long apReconnectStartedAt = 0;
     static constexpr unsigned long RECONNECT_INTERVAL = 5000;
