@@ -111,28 +111,16 @@ void ActuatorManager::begin()
 
     for (int i = 0; i < ACTUATOR_COUNT; i++)
     {
-        // TEMPORARY: while the raw GSM UART diagnostic is active, GPIO16/17
-        // (CANOPY_FAN_PIN/PELTIER_PIN) are reused as GsmRawUartTest's RX/TX
-        // pins - see Config.h. Neither pin may be configured or written to
-        // by this subsystem during that window, so it never contends with
-        // GsmRawUartTest for the same physical lines. Logical bookkeeping
-        // below still initializes normally either way.
-        const bool gsmOwnsThisPin =
-            GSM_RAW_UART_TEST && (i == CANOPY_FAN || i == PELTIER);
-
-        if (!gsmOwnsThisPin)
+        if (i == CANOPY_FAN)
         {
-            if (i == CANOPY_FAN)
-            {
-                // ESP32 Core 3.x API
-                ledcAttach(getPin((Actuator)i), 5000, 8); // pin, freq, resolution
-                ledcWrite(getPin((Actuator)i), 0); // pin, duty
-            }
-            else
-            {
-                pinMode(getPin((Actuator)i), OUTPUT);
-                digitalWrite(getPin((Actuator)i), LOW);
-            }
+            // ESP32 Core 3.x API
+            ledcAttach(getPin((Actuator)i), 5000, 8); // pin, freq, resolution
+            ledcWrite(getPin((Actuator)i), 0); // pin, duty
+        }
+        else
+        {
+            pinMode(getPin((Actuator)i), OUTPUT);
+            digitalWrite(getPin((Actuator)i), LOW);
         }
 
         actuatorStates[i] = false;
@@ -146,12 +134,7 @@ void ActuatorManager::begin()
 
 void ActuatorManager::turnOn(Actuator actuator)
 {
-    // See begin() - GPIO16/17 belong exclusively to GsmRawUartTest while
-    // the raw UART diagnostic is active.
-    const bool gsmOwnsThisPin =
-        GSM_RAW_UART_TEST && (actuator == CANOPY_FAN || actuator == PELTIER);
-
-    if (actuator != CANOPY_FAN && !gsmOwnsThisPin)
+    if (actuator != CANOPY_FAN)
     {
         digitalWrite(getPin(actuator), HIGH);
     }
@@ -162,21 +145,13 @@ void ActuatorManager::turnOn(Actuator actuator)
 
 void ActuatorManager::turnOff(Actuator actuator)
 {
-    // See begin() - GPIO16/17 belong exclusively to GsmRawUartTest while
-    // the raw UART diagnostic is active.
-    const bool gsmOwnsThisPin =
-        GSM_RAW_UART_TEST && (actuator == CANOPY_FAN || actuator == PELTIER);
-
-    if (!gsmOwnsThisPin)
+    if (actuator == CANOPY_FAN)
     {
-        if (actuator == CANOPY_FAN)
-        {
-            ledcWrite(getPin(actuator), 0);
-        }
-        else
-        {
-            digitalWrite(getPin(actuator), LOW);
-        }
+        ledcWrite(getPin(actuator), 0);
+    }
+    else
+    {
+        digitalWrite(getPin(actuator), LOW);
     }
 
     actuatorStates[actuator] = false;
@@ -755,10 +730,7 @@ void ActuatorManager::update()
                     }
                     else
                     {
-                        // See begin() - GPIO17 belongs exclusively to
-                        // GsmRawUartTest while the raw UART diagnostic is
-                        // active; no PWM write reaches it in that window.
-                        if (a == CANOPY_FAN && !GSM_RAW_UART_TEST)
+                        if (a == CANOPY_FAN)
                         {
                             uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
                             ledcWrite(getPin(a), pwmValue);

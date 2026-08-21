@@ -168,29 +168,16 @@ constexpr uint8_t RTC_SCL_PIN = 22;
 // ======================================================
 // GSM / A7680C (SIMCom A76XX family)
 // ======================================================
-// PROPOSED wiring - not yet physically confirmed on any board. These are the
-// only two digital-capable GPIOs left unclaimed by every sensor, actuator,
-// I2C, and UART0 (USB/debug) pin above, avoiding strapping pins 0/2. GSM
-// runtime remains pending until the ESP32 is actually wired to the A7680C on
-// these pins; see the firmware GSM foundation report for the full pin audit.
+// Confirmed non-conflicting production wiring - does not overlap with any
+// sensor, actuator, I2C, or UART0 (USB/debug) pin above.
+constexpr uint8_t GSM_RX_PIN = 36;  // ESP32 RX <- A7680C UTX
+constexpr uint8_t GSM_TX_PIN = 23;  // ESP32 TX -> A7680C URX
 
 // A76XX default UART framing is 115200 8N1. Autobaud is supported by the
 // module, but a fixed rate is used here so GsmManager's bounded timeouts
 // don't also have to account for autobaud detection latency/uncertainty.
 constexpr unsigned long GSM_BAUD_RATE = 115200UL;
-constexpr uint8_t GSM_RX_PIN = 16;  // ESP32 RX <- A7680C UTX
-constexpr uint8_t GSM_TX_PIN = 17;  // ESP32 TX -> A7680C URX
-// TEMPORARY hardware bring-up switch - see GsmRawUartTest. When false
-// (default), firmware behavior is completely unchanged: GsmManager and the
-// full notification pipeline run as normal. When true, the production GSM
-// path is not initialized at all and a raw, unparsed UART probe/baud-scan
-// runs instead, to isolate a wiring/baud/power issue from a firmware parser
-// issue. Never leave this true in a normal build - it never sends SMS and
-// never services the notification queue.
-constexpr bool GSM_RAW_UART_TEST = true;
 
-// TEMPORARY PHYSICAL SMS DIAGNOSTIC — replace before testing
-constexpr const char* GSM_TEST_PHONE_NUMBER = "+639939839959";
 // ======================================================
 // Sensor Thresholds
 // ======================================================
