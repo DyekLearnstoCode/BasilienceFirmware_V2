@@ -41,7 +41,16 @@ void AutomationManager::update()
     // Support actuators are reconciled for every FSM state, including operation
     // requests that return early below. Both physical and mock inputs have already
     // been normalized into the same effective sensors structure before this call.
+    //
+    // This is deliberately ahead of the cultivation gate: reservoir cooling and
+    // the circulation it depends on are hardware protection, not cultivation,
+    // and must run whether or not a growth cycle exists.
     updateCooling();
+
+    // Observes the active-cycle flag and acts on its transitions. Also runs
+    // ahead of the operation lifecycle below so a chemistry dose that must not
+    // continue is stopped before its state handler can command a pump.
+    updateCultivationGate();
 
     //--------------------------------------------------
     // Operation lifecycle
@@ -90,12 +99,180 @@ void AutomationManager::update()
     }
 
     //--------------------------------------------------
+    // Cultivation gate
+    //
+    // Placed after the always-run duties above and before any cultivation
+    // state processing. Gating processCurrentState() as a whole - rather than
+    // handleNormal() alone - is what also stops processReadyLocalRegulation(),
+    // which can otherwise start refill and pH/EC correction from
+    // SENSOR_STABILIZATION and STARTUP.
+    //--------------------------------------------------
+
+    if(!harvestScheduleCache.isActive())
+    {
+        handleCultivationPaused();
+        return;
+    }
+
+    //--------------------------------------------------
     // State Machine
     //--------------------------------------------------
 
     processCurrentState();
 
 } //Core Framework
+
+//==================================================
+// Cultivation cycle gate
+//==================================================
+
+void AutomationManager::updateCultivationGate()
+{
+    const bool active = harvestScheduleCache.isActive();
+
+    if(!cultivationStateInitialized)
+    {
+        // First evaluation after boot. The flag came from NVS, so this is
+        // equally valid with no network at all.
+        cultivationStateInitialized = true;
+        cultivationActive = active;
+
+        if(active)
+        {
+            Serial.print("[CYCLE] Restored active cycle from NVS: ");
+            Serial.print(harvestScheduleCache.getCycleId());
+            Serial.print(" (#");
+            Serial.print(harvestScheduleCache.getCycleNumber());
+            Serial.println(")");
+            Serial.println("[AUTOMATION] Cultivation enabled (offline-capable)");
+        }
+        else
+        {
+            Serial.println("[CYCLE] No persisted active cycle");
+            Serial.println("[AUTOMATION] Cultivation paused - no active growth cycle");
+        }
+    }
+    else if(active != cultivationActive)
+    {
+        cultivationActive = active;
+
+        if(active)
+        {
+            Serial.print("[CYCLE] Active cycle: ");
+            Serial.print(harvestScheduleCache.getCycleId());
+            Serial.print(" (#");
+            Serial.print(harvestScheduleCache.getCycleNumber());
+            Serial.println(")");
+            Serial.println("[AUTOMATION] Cultivation enabled");
+
+            // Re-enter through stabilization rather than jumping to NORMAL:
+            // it re-validates the current readings, lets validateSystem()
+            // divert to REFILLING if the reservoir is already low, and stops a
+            // stale reading from triggering an immediate dose.
+            startupPhase = STARTUP_FOG_ON;
+            fogCycleOn = true;
+            activeFogStrategy = "";
+            fogTimerStart = millis();
+            changeState(SENSOR_STABILIZATION);
+        }
+        else
+        {
+            Serial.println("[CYCLE] Cycle completed or inactive");
+            Serial.println("[AUTOMATION] Cultivation paused");
+
+            // Fog timers must not keep counting as though a cycle were still
+            // running; a later activation starts them fresh.
+            fogCycleOn = true;
+            activeFogStrategy = "";
+        }
+    }
+
+    if(!active)
+    {
+        // Runs every iteration while paused, not only on the transition, so a
+        // stabilization retry cannot slip a fresh dose through afterwards.
+        stopCultivationChemistry();
+    }
+}
+
+// Stops chemistry that must not continue once the cycle is inactive.
+//
+// Deliberately does NOT use abortCurrentOperation(): that routes through
+// failCurrentSubsystem(), which latches phSubsystemLocked/ecSubsystemLocked and
+// would leave the device needing an admin safety reset after an ordinary cycle
+// completion. failCurrentOperation() closes the request without touching any
+// subsystem lock.
+//
+// Stabilization and an in-flight refill are intentionally absent: they are
+// short, self-terminating, and reach a defined end state on their own.
+void AutomationManager::stopCultivationChemistry()
+{
+    const SystemMode mode = systemState.currentMode;
+
+    if(mode != DOSING_PH && mode != DOSING_EC)
+    {
+        return;
+    }
+
+    const String reason = "Growth cycle is no longer active";
+
+    if(mode == DOSING_PH)
+    {
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis(), 100, "", reason);
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis(), 100, "", reason);
+        systemState.phDirection = PH_NONE;
+        systemState.phAttempts = 0;
+        Serial.println("[CYCLE] pH dosing stopped - cycle no longer active");
+    }
+    else
+    {
+        actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis(), 100, "", reason);
+        actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis(), 100, "", reason);
+        systemState.ecDirection = EC_NONE;
+        systemState.ecAttempts = 0;
+        Serial.println("[CYCLE] Nutrient dosing stopped - cycle no longer active");
+    }
+
+    failCurrentOperation(reason);
+
+    // The reservoir was held for this correction only; releasing it here stops
+    // completion from leaving the lock stuck true.
+    systemState.reservoirLocked = false;
+
+    changeState(NORMAL);
+}
+
+// Idle reconciliation while no growth cycle is active.
+//
+// Every command below is an OFF for an actuator that is already off in the
+// steady state, and ActuatorManager::requestCommand() discards a repeated OFF
+// for something not running - so this does not write every loop. It also never
+// overrides a manual command: requestCommand() ignores automatic requests for
+// an actuator the user has manually taken in Manual Mode.
+void AutomationManager::handleCultivationPaused()
+{
+    suspendAutomaticRootFogging("No active growth cycle");
+
+    actuatorManager.requestCommand(GROW_LIGHT, false, "automatic", millis());
+
+    actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
+    actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
+    actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+    actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+
+    // An active refill routes through the operation lifecycle and returns
+    // before this handler, so reaching here means no refill is in progress.
+    actuatorManager.requestCommand(SOLENOID, false, "automatic", millis());
+
+    // Ventilation is kept at a safe baseline rather than stopped, and the
+    // existing DHT fail-safe (full speed when the environment reading is
+    // unavailable) is preserved.
+    const bool environmentUnavailable =
+        isnan(sensors.temperature) || isnan(sensors.humidity);
+
+    actuatorManager.requestCommand(
+        CANOPY_FAN, true, "automatic", millis(), environmentUnavailable ? 100 : 50);
+}
 
 void AutomationManager::setManualCoolingDemand(bool active)
 {
@@ -844,10 +1021,6 @@ void AutomationManager::updateCooling()
     const bool ecStabilizationActive =
         systemState.currentMode == STABILIZING_EC;
 
-    constexpr uint8_t DEMAND_PELTIER = 0x01;
-    constexpr uint8_t DEMAND_PH = 0x02;
-    constexpr uint8_t DEMAND_EC = 0x04;
-
     uint8_t demandMask = 0;
     if (coolingDemandActive || manualCoolingDemandActive) demandMask |= DEMAND_PELTIER;
     if (phStabilizationActive) demandMask |= DEMAND_PH;
@@ -942,16 +1115,34 @@ void AutomationManager::updateCooling()
     }
 }
 
+bool AutomationManager::isCirculationRequired() const
+{
+    return lastCirculationDemandMask != 0;
+}
+
+// User-facing explanation for a refused manual OFF. Reports the most
+// safety-relevant demand first and never exposes the mask itself.
+const char* AutomationManager::circulationRequirementReason() const
+{
+    if (lastCirculationDemandMask & DEMAND_PELTIER)
+        return "Circulation is required during water cooling.";
+    if (lastCirculationDemandMask & DEMAND_PH)
+        return "Circulation is required during pH stabilization.";
+    if (lastCirculationDemandMask & DEMAND_EC)
+        return "Circulation is required during EC stabilization.";
+    return "Circulation is required by an active automatic operation.";
+}
+
 String AutomationManager::getCirculationReason(uint8_t demandMask) const
 {
     String reason;
-    if (demandMask & 0x01) reason = "temperature_circulation";
-    if (demandMask & 0x02)
+    if (demandMask & DEMAND_PELTIER) reason = "temperature_circulation";
+    if (demandMask & DEMAND_PH)
     {
         if (!reason.isEmpty()) reason += "+";
         reason += "ph_stabilization";
     }
-    if (demandMask & 0x04)
+    if (demandMask & DEMAND_EC)
     {
         if (!reason.isEmpty()) reason += "+";
         reason += "ec_stabilization";

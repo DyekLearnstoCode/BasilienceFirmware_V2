@@ -4,6 +4,7 @@
 #include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Preferences.h>
 
 #include "AnalogSampler.h"
 
@@ -34,6 +35,23 @@ private:
     bool sensorSourceReported = false;
     bool lastReportedMockSource = false;
     bool sensorSourceWaitingLogged = false;
+
+    // Sensor-source persistence. The effective source (mock vs. physical) is
+    // decided locally at boot from NVS so a cold boot with no Wi-Fi/Firebase
+    // still reaches a definite source and local automation can run. Firebase
+    // remains authoritative once reachable and reconciles this value.
+    static constexpr const char* SOURCE_NVS_NAMESPACE = "sensorsrc";
+    static constexpr const char* SOURCE_NVS_KEY = "mockEnabled";
+    Preferences sourcePreferences;
+
+    // Boot-restored mock source waiting for its first payload of this session.
+    // Armed only by resolveLocalSensorSource(); a mock session enabled from
+    // the app after boot never arms it.
+    bool mockBootWaitingForPayload = false;
+    unsigned long mockBootWaitStartedAt = 0;
+
+    void resolveLocalSensorSource();
+    void updateMockBootWait();
 
     // Water-temperature read scheduling and transient-failure tolerance.
     // physicalSensors.waterTemp only becomes NaN once a scheduled read has
@@ -72,6 +90,19 @@ private:
     void readPH();
 
     void applyEffectiveSensors();
+
+public:
+    // Called by FirebaseManager when the authoritative remote setting is read,
+    // so the next offline boot starts from the same source. Writes only on an
+    // actual change.
+    void persistSensorSource(bool mockEnabled);
+
+    // A complete, validated mock payload was parsed during THIS session, so a
+    // boot-restored mock source is confirmed live and stops waiting.
+    void notifyMockPayloadReceived();
+
+    // The cloud explicitly turned mock mode off; any boot wait is moot.
+    void cancelMockBootWait();
 };
 
 #endif

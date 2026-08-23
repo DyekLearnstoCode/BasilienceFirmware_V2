@@ -184,10 +184,29 @@ void ActuatorManager::turnOffAll(const String& reason)
 
 void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed, const String& strategy, const String& reason)
 {
-    if (actuator == CIRCULATION_PUMP && source != "automatic")
+    // The circulation pump serves several subsystems at once, so a manual ON
+    // is always meaningful and needs no threshold check. A manual OFF is the
+    // only direction that can be unsafe: automatic cooling and pH/EC
+    // stabilization physically depend on the pump running, so an automatic
+    // demand outranks a manual stop. The demand mask that drives the pump is
+    // the single source of truth for that - see
+    // AutomationManager::isCirculationRequired().
+    if (actuator == CIRCULATION_PUMP && !state && isManualSource(source))
     {
-        Serial.println("[CIRCULATION] Manual command ignored; pump is automation-managed");
-        return;
+        if (automationManager.isCirculationRequired())
+        {
+            const char* why = automationManager.circulationRequirementReason();
+
+            Serial.print("[CIRCULATION] Manual OFF rejected: ");
+            Serial.println(why);
+
+            // The pump keeps running and its state is unchanged; only the
+            // reason is published so the app can explain the refusal and
+            // re-sync its switch from real actuator status.
+            statuses[actuator].reason = why;
+            statusDirty = true;
+            return;
+        }
     }
 
     // Ignore automatic schedule commands when this actuator is manually overridden in manual mode
@@ -225,6 +244,13 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
         {
             Serial.println("[MANUAL] ignored: actuator is not manually running");
             return;
+        }
+
+        if (actuator == CIRCULATION_PUMP && manuallyOverridden[actuator] != state)
+        {
+            Serial.println(state
+                ? "[CIRCULATION] Manual demand added"
+                : "[CIRCULATION] Manual demand removed");
         }
 
         manuallyOverridden[actuator] = state;

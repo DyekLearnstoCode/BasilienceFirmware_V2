@@ -17,6 +17,19 @@ public:
         MANUAL
     };
 
+    // Explicit STA connection state. Previously this was implied by a pair of
+    // booleans, which made it possible to re-issue WiFi.begin()/WiFi.mode()
+    // while a previous association attempt was still in flight - the condition
+    // that produces "wifi:sta is connecting, cannot set config". With the state
+    // named, CONNECTING is a period during which the radio is only polled.
+    enum class WifiState
+    {
+        IDLE,
+        CONNECTING,
+        CONNECTED,
+        RETRY_WAIT
+    };
+
     void begin();
 
     bool connect();
@@ -54,9 +67,29 @@ private:
     void enterAutomaticProvisioningMode();
     void startAP(ProvisioningMode mode, bool suspendFirebase);
 
+    // The single saved-credential STA initiation path. Nothing else in the
+    // normal retry loop may call WiFi.begin()/WiFi.mode().
+    void startConnectionAttempt();
+
+    // Shared CONNECTED transition: clears the cumulative recovery window and
+    // logs the connection once.
+    void enterConnectedState();
+
     Preferences preferences;
     String ssid;
     String password;
+
+    WifiState wifiState = WifiState::IDLE;
+
+    // Start of the current single association attempt - drives the per-attempt
+    // timeout only.
+    unsigned long connectionStartedAt = 0;
+
+    // Start of the current *cumulative* outage window. Set once when the saved
+    // network is first confirmed unusable and deliberately NOT reset by each
+    // individual 5-second retry, so the fallback timeout measures the whole
+    // outage rather than one attempt. Cleared only by a successful connection.
+    unsigned long recoveryStartedAt = 0;
 
     unsigned long lastReconnectAttempt = 0;
     unsigned long lastAPReconnectAttempt = 0;

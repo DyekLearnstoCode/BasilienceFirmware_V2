@@ -23,19 +23,76 @@ void WiFiManager::begin()
     // Kick off the connection attempt without blocking setup(). loop() starts
     // immediately so local sensing/safety/automation run from the first
     // iteration; update() drives the STA connection to completion in the
-    // background using the same non-blocking retry path as a mid-run drop.
-    Serial.print("[WIFI] Connecting to ");
-    Serial.println(ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
-
-    recoveryInProgress = true;
-    lastReconnectAttempt = millis();
+    // background through the same state machine a mid-run drop uses.
+    startConnectionAttempt();
 
     initialConnectionAttempt = false;
 }
 
+// The ONLY saved-credential STA initiation path in normal operation. Every
+// association attempt - first boot, retry after timeout, retry after a drop -
+// goes through here exactly once per attempt, which is what guarantees the
+// radio is never reconfigured while a previous attempt is still in flight.
+void WiFiManager::startConnectionAttempt()
+{
+    if (!hasCredentials())
+    {
+        wifiState = WifiState::IDLE;
+        return;
+    }
 
+    Serial.print("[WIFI] Connecting to ");
+    Serial.println(ssid);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    connectionStartedAt = millis();
+    lastReconnectAttempt = connectionStartedAt;
+    wifiState = WifiState::CONNECTING;
+
+    // The cumulative outage window starts with the FIRST attempt of an
+    // outage, not after it fails - "how long has this device been off the
+    // network" is the question the fallback timeout is meant to answer. The
+    // zero-check is what makes it cumulative: every later retry passes
+    // through here and must leave the original start time alone.
+    if (recoveryStartedAt == 0)
+    {
+        recoveryStartedAt = connectionStartedAt;
+    }
+
+    Serial.println("[WIFI] Connection attempt in progress...");
+}
+
+void WiFiManager::enterConnectedState()
+{
+    wifiState = WifiState::CONNECTED;
+    connectionStartedAt = 0;
+    lastReconnectAttempt = 0;
+
+    // A successful association ends the cumulative outage window; the next
+    // outage starts measuring from scratch.
+    recoveryStartedAt = 0;
+    systemState.wifiConnected = true;
+
+    if (recoveryInProgress)
+    {
+        Serial.println("[WIFI] Saved network restored");
+        recoveryInProgress = false;
+    }
+
+    Serial.println("[WIFI] Connected");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+}
+
+
+// LEGACY - not part of the connection state machine and unreachable in this
+// build: its only caller chain is reconnect() <- updateCredentialsSafely(),
+// which has no callers. Left in place deliberately (no dead-code cleanup in
+// this task). It must not be wired back up without being rewritten on top of
+// startConnectionAttempt(); it blocks for up to RECOVERY_TIMEOUT and would
+// bypass every guarantee below.
 bool WiFiManager::connect()
 {
     if (!hasCredentials())
@@ -104,6 +161,7 @@ void WiFiManager::disconnect()
 
     Serial.println("WiFi Disconnected");
 }
+// LEGACY - see connect() above. Unreachable in this build.
 bool WiFiManager::reconnect()
 {
     disconnect();
@@ -283,44 +341,109 @@ void WiFiManager::update()
         return;
     }
 
-    systemState.wifiConnected =
-        WiFi.status() == WL_CONNECTED;
-
-    if (systemState.wifiConnected)
-    {
-        if (recoveryInProgress)
-        {
-            Serial.println("[WIFI] Saved network restored");
-            Serial.println("[WIFI] Returning to normal operation");
-            recoveryInProgress = false;
-        }
-        return;
-    }
+    // ------------------------------------------------------------------
+    // STA connection state machine.
+    //
+    // Exactly one association attempt is ever in flight. While CONNECTING the
+    // radio is only polled - WiFi.begin()/WiFi.mode()/WiFi.config() are never
+    // re-issued - which is what removes "wifi:sta is connecting, cannot set
+    // config". Every state below is non-blocking: it either observes status or
+    // starts a single attempt, then returns to loop() so sensing, safety,
+    // automation, actuators, schedules, notifications and GSM keep running.
+    // ------------------------------------------------------------------
 
     const unsigned long now = millis();
-    if (!recoveryInProgress)
-    {
-        recoveryInProgress = true;
-        lastReconnectAttempt = 0;
-        Serial.println("[WIFI] Connection lost");
-        Serial.println("[WIFI] Reconnecting in background - setup AP will not open automatically for a known network");
-    }
+    const bool linkUp = (WiFi.status() == WL_CONNECTED);
 
-    // A device with saved credentials keeps retrying STA in the background
-    // indefinitely instead of falling back to the provisioning AP: the
-    // credentials are already known-good, so an outage here is a router/ISP
-    // problem that opening a setup AP cannot fix, and doing so would needlessly
-    // disrupt Firebase connectivity and require manual re-provisioning. The AP
-    // still opens for a device with no saved credentials, or when the user
-    // explicitly requests provisioning from the app.
-    if (lastReconnectAttempt != 0 && now - lastReconnectAttempt < RECONNECT_INTERVAL)
+    systemState.wifiConnected = linkUp;
+
+    // Covers a link that came up in any non-CONNECTED state, including one
+    // restored by the provisioning-mode AP+STA retry just before stopAP().
+    if (linkUp && wifiState != WifiState::CONNECTED)
     {
+        enterConnectedState();
         return;
     }
 
-    lastReconnectAttempt = now;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
+    switch (wifiState)
+    {
+        case WifiState::IDLE:
+            // Nothing has been started yet (or provisioning handed control
+            // back). Only begin if there is actually something to connect to;
+            // a credential-less device is owned by provisioning, not by this.
+            if (hasCredentials())
+            {
+                startConnectionAttempt();
+            }
+            break;
+
+        case WifiState::CONNECTING:
+        {
+            // Poll only. No radio reconfiguration happens in this state.
+            if (now - connectionStartedAt < RECOVERY_TIMEOUT)
+            {
+                break;
+            }
+
+            Serial.println("[WIFI] Connection attempt timed out");
+
+            // End the failed association before the next attempt. Credentials
+            // are held in NVS and in this object; disconnect(false, false)
+            // neither erases them nor powers the radio down.
+            WiFi.disconnect(false, false);
+
+            // The outage window was opened by startConnectionAttempt(); this
+            // only records that the saved network is now confirmed unusable.
+            recoveryInProgress = true;
+
+            wifiState = WifiState::RETRY_WAIT;
+            lastReconnectAttempt = now;
+            break;
+        }
+
+        case WifiState::CONNECTED:
+            // linkUp was false to reach here: an established link dropped.
+            Serial.println("[WIFI] Connection lost");
+
+            if (recoveryStartedAt == 0)
+            {
+                recoveryStartedAt = now;
+            }
+            recoveryInProgress = true;
+
+            wifiState = WifiState::RETRY_WAIT;
+            lastReconnectAttempt = now;
+            Serial.println("[WIFI] Reconnecting in background");
+            break;
+
+        case WifiState::RETRY_WAIT:
+        {
+            // Cumulative, not per-attempt: a saved network that stays
+            // unreachable for the whole recovery window hands over to the
+            // existing provisioning AP, so a device whose stored SSID/password
+            // has gone stale can still be recovered without a re-flash.
+            if (recoveryStartedAt != 0 &&
+                now - recoveryStartedAt >= RECOVERY_TIMEOUT)
+            {
+                Serial.println("[WIFI] Saved network unavailable");
+                enterAutomaticProvisioningMode();
+
+                // Provisioning now owns the radio; this machine stands down
+                // until it hands control back.
+                wifiState = WifiState::IDLE;
+                connectionStartedAt = 0;
+                recoveryStartedAt = 0;
+                break;
+            }
+
+            if (now - lastReconnectAttempt >= RECONNECT_INTERVAL)
+            {
+                Serial.println("[WIFI] Retrying saved network");
+                startConnectionAttempt();
+            }
+            break;
+        }
+    }
 }
 
 void WiFiManager::enterAutomaticProvisioningMode()

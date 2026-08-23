@@ -10,6 +10,15 @@ public:
     void update();
     void setManualCoolingDemand(bool active);
 
+    // Read-only view of the circulation demand mask maintained by
+    // updateCooling(). ActuatorManager consults these before allowing a manual
+    // OFF so a user cannot stop circulation that an automatic operation is
+    // relying on. This is the same mask that drives the pump and the existing
+    // "[CIRCULATION] Demand added/removed" diagnostics - not a second copy of
+    // the demand conditions.
+    bool isCirculationRequired() const;
+    const char* circulationRequirementReason() const;
+
         void createOperationRequest(
         uint16_t requestId,
         OperationType operation,
@@ -18,6 +27,22 @@ public:
 
 private:
     uint16_t generateAutoRequestId();
+
+    //==================================================
+    // Cultivation cycle gate
+    //
+    // harvestScheduleCache.isActive() is the authoritative flag - it is the
+    // NVS-persisted mirror of the Firestore active cycle and already survives
+    // an offline reboot. The members below are only a previous-state detector
+    // so transitions can be logged and acted on once, never every loop.
+    //==================================================
+
+    bool cultivationActive = false;
+    bool cultivationStateInitialized = false;
+
+    void updateCultivationGate();
+    void handleCultivationPaused();
+    void stopCultivationChemistry();
 
     //==================================================
     // Startup
@@ -45,6 +70,13 @@ private:
     bool manualCoolingDemandActive = false;
     bool circulationDiagnosticsInitialized = false;
     uint8_t lastCirculationDemandMask = 0;
+
+    // Bits of lastCirculationDemandMask. Defined here rather than inside
+    // updateCooling() so the demand mask has exactly one definition shared by
+    // the producer and the read-only accessors above.
+    static constexpr uint8_t DEMAND_PELTIER = 0x01;
+    static constexpr uint8_t DEMAND_PH = 0x02;
+    static constexpr uint8_t DEMAND_EC = 0x04;
     bool lastCirculationRunning = false;
     bool lastPeltierRunning = false;
     ActuatorCommandState lastCirculationState = ActuatorCommandState::OFF;

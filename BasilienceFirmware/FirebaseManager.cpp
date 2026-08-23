@@ -23,9 +23,16 @@ constexpr unsigned long SENSOR_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 constexpr uint8_t TRANSPORT_FAILURE_COOLDOWN_THRESHOLD = 3;
 constexpr unsigned long COOLDOWN_INITIAL_MS = 15000UL;
 constexpr unsigned long COOLDOWN_MAX_MS = 60000UL;
-// Cached-locally, low-priority background refreshes (SMS recipients,
-// harvest schedule) - within the task's suggested 60-120s range.
+// Cached-locally, low-priority background refreshes (SMS recipients) -
+// within the task's suggested 60-120s range.
 constexpr unsigned long LOW_PRIORITY_READ_INTERVAL_MS = 90000UL;
+// The harvestSchedule projection carries the active-cycle flag that gates all
+// cultivation automation, so a change to it is a control-state transition, not
+// reporting metadata: an Admin creating or completing a cycle must not wait a
+// low-priority rotation for the device to react. The payload is five small
+// fields, and this cadence still only applies while Firebase is HEALTHY - the
+// existing DEGRADED/COOLDOWN deferral is untouched.
+constexpr unsigned long HARVEST_SCHEDULE_READ_INTERVAL_MS = 5000UL;
 // Mirrors COMMAND_FAILURE_BACKOFF_INTERVAL's pattern, applied to the
 // actuatorStatus cloud mirror so a failed write cannot retry on the very
 // next loop() tick regardless of the broader health state.
@@ -3122,10 +3129,10 @@ void FirebaseManager::readSmsRecipients()
 
 void FirebaseManager::readHarvestSchedule()
 {
-    // Same reasoning as readSmsRecipients(): cached locally, no need for a
-    // reduced polling cadence tied to the round-robin rotation alone.
+    // Cached locally like readSmsRecipients(), but on its own faster cadence:
+    // this projection is the cultivation gate, not background metadata.
     static unsigned long lastHarvestScheduleRead = 0;
-    if (millis() - lastHarvestScheduleRead < LOW_PRIORITY_READ_INTERVAL_MS)
+    if (millis() - lastHarvestScheduleRead < HARVEST_SCHEDULE_READ_INTERVAL_MS)
     {
         return;
     }
@@ -3374,9 +3381,16 @@ void FirebaseManager::readMockSensors()
 
     // A successful read with mock mode disabled resolves the effective source
     // to physical sensors even if optional mock payload fields are incomplete.
+    // Persisting here (not only in the change branch below) means a malformed
+    // mock payload can never leave the stored source pointing at MOCK.
     if (!nextEnabled)
     {
         systemState.sensorSourceResolved = true;
+        sensorManager.persistSensorSource(false);
+
+        // The cloud has explicitly turned mock mode off, so a boot-restored
+        // mock source no longer has anything to wait for.
+        sensorManager.cancelMockBootWait();
     }
 
     SensorData nextMock = systemState.mockSensors;
@@ -3475,8 +3489,27 @@ void FirebaseManager::readMockSensors()
     systemState.mockSensors = nextMock;
     systemState.sensorSourceResolved = true;
 
+    // Reaching this point means every field parsed and validated, so this is a
+    // fresh valid payload for THIS session - the only thing that confirms a
+    // boot-restored mock source. Malformed payloads return earlier and
+    // deliberately do not count.
+    if (nextEnabled)
+    {
+        sensorManager.notifyMockPayloadReceived();
+    }
+
     if (!enabledChanged && !(nextEnabled && payloadChanged))
         return;
+
+    if (enabledChanged)
+    {
+        // Firebase is authoritative once reachable. Record the new source so
+        // the next offline boot starts from it rather than from a stale one.
+        sensorManager.persistSensorSource(nextEnabled);
+
+        Serial.print("[AUTOMATION] Sensor source reconciled from Firebase: ");
+        Serial.println(nextEnabled ? "MOCK" : "PHYSICAL");
+    }
 
     systemState.mockSensorsEnabled = nextEnabled;
     systemState.mockApplyPending = true;

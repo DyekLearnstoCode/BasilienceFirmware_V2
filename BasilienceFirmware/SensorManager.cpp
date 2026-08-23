@@ -46,6 +46,67 @@ void SensorManager::begin()
     ecSampler.begin();
 
     phSampler.begin();
+
+    resolveLocalSensorSource();
+}
+
+// Decides the effective sensor source locally, at boot, without any network.
+//
+// Firebase used to be the only thing that could ever set sensorSourceResolved,
+// so a unit that cold-booted with no Wi-Fi held every effective reading at NaN
+// forever and local automation never engaged. The mock flag is now persisted
+// in NVS, which means the same integrity guarantee (a previously-enabled mock
+// session must not be silently replaced by physical readings after a reboot)
+// can be honoured from local storage instead of from the cloud.
+//
+// PHYSICAL is the safe default: an unknown or never-written flag resolves to
+// real sensors, never to simulated ones.
+void SensorManager::resolveLocalSensorSource()
+{
+    bool mockEnabled = false;
+
+    if (sourcePreferences.begin(SOURCE_NVS_NAMESPACE, true))
+    {
+        mockEnabled = sourcePreferences.getBool(SOURCE_NVS_KEY, false);
+        sourcePreferences.end();
+    }
+
+    systemState.mockSensorsEnabled = mockEnabled;
+    systemState.sensorSourceResolved = true;
+
+    // Prime the change-detection used by applyEffectiveSensors() so the source
+    // is announced exactly once here rather than again on the first update().
+    sensorSourceReported = true;
+    lastReportedMockSource = mockEnabled;
+
+    if (mockEnabled)
+    {
+        // Mock readings are never persisted, so a mock session that survives a
+        // reboot starts with no values, and physical readings must never
+        // backfill mock mode. Rather than idle forever if the payload never
+        // arrives, arm a bounded wait that reverts to physical sensors.
+        mockBootWaitingForPayload = true;
+        mockBootWaitStartedAt = millis();
+
+        Serial.println("[AUTOMATION] Sensor source=MOCK (persisted)");
+        Serial.println("[AUTOMATION] Waiting for fresh mock payload...");
+    }
+    else
+    {
+        Serial.println("[AUTOMATION] Sensor source=PHYSICAL (local)");
+    }
+}
+
+void SensorManager::persistSensorSource(bool mockEnabled)
+{
+    if (!sourcePreferences.begin(SOURCE_NVS_NAMESPACE, false)) return;
+
+    // Write only on a real change - this runs from the periodic mock read.
+    if (sourcePreferences.getBool(SOURCE_NVS_KEY, false) != mockEnabled)
+    {
+        sourcePreferences.putBool(SOURCE_NVS_KEY, mockEnabled);
+    }
+    sourcePreferences.end();
 }
 
 void SensorManager::update()
@@ -67,8 +128,47 @@ void SensorManager::update()
     applyEffectiveSensors();
 }
 
+// Bounded recovery for a boot-restored mock source. Runs every tick and is
+// independent of connectivity, so it still fires with no Wi-Fi at all.
+void SensorManager::updateMockBootWait()
+{
+    if (!mockBootWaitingForPayload) return;
+
+    // Unsigned subtraction - safe across the millis() rollover.
+    if (millis() - mockBootWaitStartedAt < MOCK_BOOT_PAYLOAD_TIMEOUT) return;
+
+    mockBootWaitingForPayload = false;
+
+    systemState.mockSensorsEnabled = false;
+    persistSensorSource(false);
+
+    // Drop the empty mock dataset so nothing stale can be read back if mock
+    // mode is later re-enabled before a payload arrives.
+    systemState.mockSensors = SensorData();
+    systemState.mockSensors.waterLevel = NAN;
+
+    Serial.println("[AUTOMATION] Mock payload timeout - reverting to PHYSICAL sensors");
+}
+
+void SensorManager::notifyMockPayloadReceived()
+{
+    if (!mockBootWaitingForPayload) return;
+
+    mockBootWaitingForPayload = false;
+    Serial.println("[AUTOMATION] Fresh mock payload received - remaining in MOCK mode");
+}
+
+void SensorManager::cancelMockBootWait()
+{
+    mockBootWaitingForPayload = false;
+}
+
 void SensorManager::applyEffectiveSensors()
 {
+    // Evaluated before the source is selected below, so the tick that times
+    // out already publishes physical readings rather than waiting one more.
+    updateMockBootWait();
+
     // Mock mode's enabled/disabled state lives only in Firebase and is not
     // restored locally at boot (systemState.mockSensorsEnabled defaults to
     // false), so right after a reboot/brownout we don't yet know whether a
@@ -77,6 +177,10 @@ void SensorManager::applyEffectiveSensors()
     // effective reading explicitly invalid instead of defaulting to physical
     // - a plausible-looking physical reading at this point (e.g. an
     // unsettled water level) must never trigger automation/alerts.
+    // Defensive only. resolveLocalSensorSource() resolves the source during
+    // begin(), before the first update(), so this no longer gates a cold boot
+    // on Firebase; it remains as a guard against any future path that clears
+    // the flag.
     if (!systemState.sensorSourceResolved)
     {
         sensors = SensorData();

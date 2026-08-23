@@ -24,6 +24,17 @@ constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 1000UL;
 // pulseIn() timeouts unrelated to the sensor or wiring actually failing.
 constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 300UL;
 
+// How long a unit that booted into a PERSISTED mock source waits for a fresh
+// mock payload before giving up and reverting to physical sensors.
+//
+// Mock readings are deliberately never persisted, so a unit that reboots with
+// mock mode still stored has no values to work from. Without this bound it
+// would sit idle indefinitely whenever the cloud never came back. This applies
+// ONLY to that boot-restored-without-payload window - it is not a general mock
+// inactivity timer, and a mock session enabled explicitly after boot is never
+// subject to it.
+constexpr unsigned long MOCK_BOOT_PAYLOAD_TIMEOUT = 120000UL; // 2 minutes
+
 // Shared short debounce threshold used to tell a transient one-tick sensor
 // hiccup (OneWire/ADC noise, a blocking call landing at the wrong moment)
 // apart from a genuinely failed/disconnected sensor. Applied consistently to
