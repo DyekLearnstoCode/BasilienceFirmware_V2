@@ -49,6 +49,8 @@ void AlertManager::update()
 
     updateTemperatureAlert();
 
+    updateHumidityAlert();
+
     updateWaterTemperatureAlert();
 
     updatePHAlert();
@@ -60,35 +62,70 @@ void AlertManager::update()
 
 void AlertManager::updateLowWaterAlert()
 {
-    const bool lowWater =
-        isfinite(sensors.waterLevel) &&
-        sensors.waterLevel <
-        systemState.refillStartLevel;
+    const bool valid = isfinite(sensors.waterLevel);
 
-    setAlert("lowWater", alertState.lowWater, lowWater);
+    // CONTROL signal - stays on refillStartLevel because automatic refill is
+    // driven by it. Retargeting this at minWaterLevel would change when the
+    // valve opens, which is a control change, not a reporting one.
+    setAlert("lowWater", alertState.lowWater,
+        valid && sensors.waterLevel < systemState.refillStartLevel);
+
+    // TARGET-RANGE classification, reported alongside it.
+    setAlert("waterLevelLow", alertState.waterLevelLow,
+        valid && sensors.waterLevel < systemState.minWaterLevel);
+
+    setAlert("waterLevelHigh", alertState.waterLevelHigh,
+        valid && sensors.waterLevel > systemState.maxWaterLevel);
 }
 
 void AlertManager::updateTemperatureAlert()
 {
     const bool valid = isfinite(sensors.temperature);
 
+    // Both sides now come from the configured target range. Previously the low
+    // side compared against the hard-coded COLD_FOG_TEMPERATURE constant, which
+    // was a fogging-strategy value rather than a user-facing bound. Canopy fan
+    // control is unaffected: handleCanopyClimate() reads highAirTemp /
+    // airTempRelease directly and never consults these flags.
     setAlert(
         "lowAirTemperature",
         alertState.lowAirTemperature,
-        valid && sensors.temperature < COLD_FOG_TEMPERATURE);
+        valid && sensors.temperature < systemState.minAirTemp);
 
     setAlert(
         "highTemperature",
         alertState.highTemperature,
-        valid && sensors.temperature > systemState.highAirTemp);
+        valid && sensors.temperature > systemState.maxAirTemp);
+}
+
+void AlertManager::updateHumidityAlert()
+{
+    const bool valid = isfinite(sensors.humidity);
+
+    setAlert("humidityLow", alertState.humidityLow,
+        valid && sensors.humidity < systemState.minHumidity);
+
+    setAlert("humidityHigh", alertState.humidityHigh,
+        valid && sensors.humidity > systemState.maxHumidity);
 }
 
 void AlertManager::updateWaterTemperatureAlert()
 {
+    // A missing reading is not an out-of-range reading: the old form compared
+    // NaN directly, which silently evaluated false and reported "in range" for
+    // a dead sensor. Peltier control is unaffected - updateCooling() reads
+    // highWaterTemp / coolerOffTemp directly.
+    const bool valid = isfinite(sensors.waterTemp);
+
     setAlert(
         "waterTempOutOfRange",
         alertState.waterTempOutOfRange,
-        sensors.waterTemp > systemState.highWaterTemp);
+        valid && sensors.waterTemp > systemState.maxWaterTemp);
+
+    setAlert(
+        "waterTempLow",
+        alertState.waterTempLow,
+        valid && sensors.waterTemp < systemState.minWaterTemp);
 }
 
 

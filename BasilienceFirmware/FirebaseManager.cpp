@@ -449,6 +449,17 @@ void FirebaseManager::initializeDatabase()
         json.set("highHumidity", systemState.highHumidity);
         json.set("humidityRelease", systemState.humidityRelease);
 
+        // Target (acceptable) ranges - what "in range" means for Monitoring,
+        // alerts and Reports. Separate from the control thresholds above.
+        json.set("minAirTemp", systemState.minAirTemp);
+        json.set("maxAirTemp", systemState.maxAirTemp);
+        json.set("minHumidity", systemState.minHumidity);
+        json.set("maxHumidity", systemState.maxHumidity);
+        json.set("minWaterTemp", systemState.minWaterTemp);
+        json.set("maxWaterTemp", systemState.maxWaterTemp);
+        json.set("minWaterLevel", systemState.minWaterLevel);
+        json.set("maxWaterLevel", systemState.maxWaterLevel);
+
         writeJson(
             deviceRoot() + "/settings",
             json);
@@ -464,6 +475,35 @@ void FirebaseManager::initializeDatabase()
             {
                 Serial.println("[SETTINGS] Seeded missing highAirTemp");
             }
+        }
+
+        // An already-provisioned device predates the target-range fields, so
+        // seed any that are absent rather than leaving them unset. Existing
+        // values are never overwritten.
+        FirebaseJsonData rangeProbe;
+        FirebaseJson missingRanges;
+        bool seededRange = false;
+        const char* rangeKeys[8] = {
+            "minAirTemp", "maxAirTemp", "minHumidity", "maxHumidity",
+            "minWaterTemp", "maxWaterTemp", "minWaterLevel", "maxWaterLevel"
+        };
+        const float rangeValues[8] = {
+            systemState.minAirTemp, systemState.maxAirTemp,
+            systemState.minHumidity, systemState.maxHumidity,
+            systemState.minWaterTemp, systemState.maxWaterTemp,
+            systemState.minWaterLevel, systemState.maxWaterLevel
+        };
+        for (uint8_t i = 0; i < 8; i++)
+        {
+            if (!fbdo.jsonObject().get(rangeProbe, rangeKeys[i]) || !rangeProbe.success)
+            {
+                missingRanges.set(rangeKeys[i], rangeValues[i]);
+                seededRange = true;
+            }
+        }
+        if (seededRange && updateJson(deviceRoot() + "/settings", missingRanges))
+        {
+            Serial.println("[SETTINGS] Seeded missing target ranges");
         }
 
         FirebaseJsonData settingData;
@@ -1129,6 +1169,25 @@ void FirebaseManager::readSettings()
         systemState.ecTargetMin = incomingECTargetMin;
         systemState.ecTargetMax = incomingECTargetMax;
     }
+
+    //--------------------------------------------------
+    // Target (acceptable) ranges
+    //
+    // A missing field keeps the current/compiled value - an old device whose
+    // settings document predates these fields keeps working on defaults. A
+    // pair is applied only when it is physically sensible AND min < max, so a
+    // malformed or inverted remote edit is rejected and the last valid range
+    // survives.
+    //--------------------------------------------------
+
+    applyTargetRange("minAirTemp", "maxAirTemp",
+        systemState.minAirTemp, systemState.maxAirTemp, -40.0f, 80.0f);
+    applyTargetRange("minHumidity", "maxHumidity",
+        systemState.minHumidity, systemState.maxHumidity, 0.0f, 100.0f);
+    applyTargetRange("minWaterTemp", "maxWaterTemp",
+        systemState.minWaterTemp, systemState.maxWaterTemp, 0.0f, 100.0f);
+    applyTargetRange("minWaterLevel", "maxWaterLevel",
+        systemState.minWaterLevel, systemState.maxWaterLevel, 0.0f, 100.0f);
 
     //--------------------------------------------------
     // Reservoir
@@ -3125,6 +3184,46 @@ void FirebaseManager::readSmsRecipients()
     // snapshot too - distinct from the failed-read early return above - and
     // SmsRecipientCache treats a 0-count call as a valid clear.
     smsRecipientCache.applySnapshot(phones, count);
+}
+
+// Applies one min/max target-range pair from the settings snapshot currently
+// held in fbdo. Shared by all four ranges so they cannot drift apart in how
+// they validate. Logs only when a value is actually rejected, so a healthy
+// device stays quiet.
+void FirebaseManager::applyTargetRange(const char* minKey, const char* maxKey,
+                                       float& minTarget, float& maxTarget,
+                                       float physicalMin, float physicalMax)
+{
+    FirebaseJsonData data;
+
+    float incomingMin = minTarget;
+    float incomingMax = maxTarget;
+
+    const bool hasMin = fbdo.jsonObject().get(data, minKey) && data.success;
+    if (hasMin) incomingMin = data.floatValue;
+
+    const bool hasMax = fbdo.jsonObject().get(data, maxKey) && data.success;
+    if (hasMax) incomingMax = data.floatValue;
+
+    if (!hasMin && !hasMax) return; // nothing published yet - keep defaults
+
+    const bool valid =
+        isfinite(incomingMin) && isfinite(incomingMax) &&
+        incomingMin >= physicalMin && incomingMax <= physicalMax &&
+        incomingMax > incomingMin;
+
+    if (!valid)
+    {
+        Serial.print("[SETTINGS] Rejected target range ");
+        Serial.print(minKey);
+        Serial.print("/");
+        Serial.print(maxKey);
+        Serial.println(" - keeping last valid values");
+        return;
+    }
+
+    minTarget = incomingMin;
+    maxTarget = incomingMax;
 }
 
 void FirebaseManager::readHarvestSchedule()

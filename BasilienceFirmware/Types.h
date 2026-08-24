@@ -411,6 +411,27 @@ struct SystemState
         REFILL_STOP_LEVEL;
 
     //==================================================
+    // Target (acceptable) ranges
+    //
+    // What "in range" means for Monitoring, alerts and Reports. Distinct from
+    // the actuator control/hysteresis thresholds further below - see Config.h.
+    // pH and EC already have their canonical pairs above (minPH/maxPH,
+    // minEC/maxEC) and are not duplicated here.
+    //==================================================
+
+    float minAirTemp = TARGET_MIN_AIR_TEMP;
+    float maxAirTemp = TARGET_MAX_AIR_TEMP;
+
+    float minHumidity = TARGET_MIN_HUMIDITY;
+    float maxHumidity = TARGET_MAX_HUMIDITY;
+
+    float minWaterTemp = TARGET_MIN_WATER_TEMP;
+    float maxWaterTemp = TARGET_MAX_WATER_TEMP;
+
+    float minWaterLevel = TARGET_MIN_WATER_LEVEL;
+    float maxWaterLevel = TARGET_MAX_WATER_LEVEL;
+
+    //==================================================
     // Temperature
     //==================================================
 
@@ -459,7 +480,21 @@ struct AlertState
 
     bool phHigh = false;
 
+    // Above maxWaterTemp. Name kept for compatibility with the existing Cloud
+    // Function producer and the Android readers that already consume it.
     bool waterTempOutOfRange = false;
+    // Below minWaterTemp - new directional counterpart.
+    bool waterTempLow = false;
+
+    // Humidity had no alert flags at all before target ranges existed.
+    bool humidityLow = false;
+    bool humidityHigh = false;
+
+    // Target-range classification for water level. Deliberately separate from
+    // lowWater above, which is the CONTROL signal that triggers automatic
+    // refill and must keep following refillStartLevel.
+    bool waterLevelLow = false;
+    bool waterLevelHigh = false;
 
     bool sensorFault = false;
 };

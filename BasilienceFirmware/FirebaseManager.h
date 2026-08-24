@@ -292,6 +292,13 @@ private:
     // Reads /devices/{deviceId}/harvestSchedule and hands the result to
     // harvestScheduleCache.applySnapshot(). Same failed-read contract as
     // readSmsRecipients().
+    // Applies one validated min/max target-range pair from the settings
+    // snapshot. Missing keys keep the current value; an inverted or
+    // out-of-bounds pair is rejected wholesale.
+    void applyTargetRange(const char* minKey, const char* maxKey,
+                          float& minTarget, float& maxTarget,
+                          float physicalMin, float physicalMax);
+
     void readHarvestSchedule();
 
     // Advances cloud replay of the notificationManager's durable queue by

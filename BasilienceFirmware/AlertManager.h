@@ -30,6 +30,8 @@ private:
 
     void updateTemperatureAlert();
 
+    void updateHumidityAlert();
+
     void updateWaterTemperatureAlert();
 
     void updatePHAlert();
