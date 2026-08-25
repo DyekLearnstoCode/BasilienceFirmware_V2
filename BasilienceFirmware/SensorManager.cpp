@@ -194,6 +194,40 @@ void SensorManager::applyEffectiveSensors()
         return;
     }
 
+    // A persisted-MOCK boot has no mock readings of its own yet - mock values
+    // are never persisted, so systemState.mockSensors is still the plain
+    // default-constructed SensorData() at this point. That default is a
+    // legitimate "no data" placeholder everywhere except waterLevel, which
+    // defaults to 0 because 0 IS a valid real-sensor reading (empty tank -
+    // see SensorData's own comment). Left alone here, that placeholder 0
+    // reads as a genuine "tank empty" to every isfinite()-based safety check
+    // (validWaterLevel() et al.), which is exactly what let automatic REFILL
+    // fire the solenoid off boot-restored mock state before any payload had
+    // ever arrived. Hold every effective field explicitly invalid - same
+    // technique as the sensorSourceResolved guard above - until either a
+    // fresh, validated payload arrives (notifyMockPayloadReceived(), which
+    // FirebaseManager::readMockSensors() only calls after pH/EC and the rest
+    // have all parsed successfully) or updateMockBootWait() above reverts to
+    // PHYSICAL after its own timeout. Local safety shutdowns are untouched:
+    // they command actuators OFF unconditionally and never gate on `sensors`
+    // validity, so this only withholds permission to act, never the ability
+    // to stand down. RTC/cycle restoration and grow-light scheduling are
+    // unaffected too - grow light is driven purely by RTC time, not by any
+    // field in `sensors`.
+    if (systemState.mockSensorsEnabled && mockBootWaitingForPayload)
+    {
+        sensors = SensorData();
+        sensors.waterLevel = NAN;
+
+        if (!mockBootWaitHeldLogged)
+        {
+            Serial.println("[AUTOMATION] Mock boot wait - holding automation safe until fresh payload arrives");
+            mockBootWaitHeldLogged = true;
+        }
+        return;
+    }
+    mockBootWaitHeldLogged = false;
+
     // Automation, alerts, safety, and Firebase publication all consume this one
     // effective dataset. Physical sampling remains active in physicalSensors
     // regardless of mock mode (Developer Sensor Test reads it directly), but

@@ -35,6 +35,7 @@ private:
     bool sensorSourceReported = false;
     bool lastReportedMockSource = false;
     bool sensorSourceWaitingLogged = false;
+    bool mockBootWaitHeldLogged = false;
 
     // Sensor-source persistence. The effective source (mock vs. physical) is
     // decided locally at boot from NVS so a cold boot with no Wi-Fi/Firebase
@@ -103,6 +104,14 @@ public:
 
     // The cloud explicitly turned mock mode off; any boot wait is moot.
     void cancelMockBootWait();
+
+    // True only for a boot-restored mock session that hasn't received its
+    // first fresh payload yet (armed by resolveLocalSensorSource(), cleared
+    // by notifyMockPayloadReceived()/cancelMockBootWait()/the boot-wait
+    // timeout). Lets other modules (AlertManager) recognize this as an
+    // intentional, transient initialization state rather than a real fault -
+    // does not itself change what applyEffectiveSensors() publishes.
+    bool isMockBootWaiting() const { return mockBootWaitingForPayload; }
 };
 
 #endif

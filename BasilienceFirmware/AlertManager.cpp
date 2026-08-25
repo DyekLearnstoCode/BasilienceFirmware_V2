@@ -39,8 +39,15 @@ void AlertManager::update()
     // Mirrors the same gate SensorManager applies to the effective sensor
     // dataset: while the mock-vs-physical source is still unresolved after
     // boot, sensors are held invalid, and no alert (including sensorFault)
-    // should be derived from that transient window either.
-    if (!systemState.sensorSourceResolved)
+    // should be derived from that transient window either. A boot-restored
+    // mock session waiting for its first fresh payload is the same
+    // situation - SensorManager::applyEffectiveSensors() is deliberately
+    // publishing an all-NaN placeholder so automatic actuators fail closed
+    // (unchanged, not touched here), and that placeholder must not also be
+    // misread as a genuine sensor fault. Both checks only ever return early
+    // - actuator/safety gating (SafetyManager's isfinite() checks against
+    // the still-NaN `sensors`) is untouched by this file.
+    if (!systemState.sensorSourceResolved || sensorManager.isMockBootWaiting())
     {
         return;
     }

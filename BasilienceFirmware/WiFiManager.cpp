@@ -545,11 +545,32 @@ void WiFiManager::update()
 
     systemState.wifiConnected = linkUp;
 
-    // Covers a link that came up in any non-CONNECTED state, including one
-    // restored by the provisioning-mode AP+STA retry just before stopAP().
-    if (linkUp && wifiState != WifiState::CONNECTED)
+    // ROOT CAUSE of the "Connection lost" / "reconnect handled by ESP32
+    // auto-reconnect" storm seen on real hardware with no corresponding
+    // [WIFI-EVENT] Disconnected logs: this guard used to only return early
+    // when linkUp was true AND the state wasn't already CONNECTED. When the
+    // state WAS already CONNECTED, that second clause was always false, so
+    // the guard never short-circuited - execution fell straight into
+    // switch(wifiState)'s CONNECTED case on every single update() call
+    // regardless of linkUp. That case unconditionally treats being reached
+    // as "an established link dropped" (see its own comment below), so it
+    // printed "Connection lost" and moved to RETRY_WAIT even while still
+    // genuinely connected; the very next update() then saw linkUp still
+    // true with wifiState now RETRY_WAIT, took the branch below (correctly,
+    // for what it actually detects), and printed "reconnect handled by
+    // ESP32 auto-reconnect" - a complete, self-inflicted, radio-independent
+    // CONNECTED<->RETRY_WAIT oscillation with no real disconnect, no real
+    // reconnect, and nothing for the STA event handler to ever report.
+    // Steady-state "still connected" must be a plain no-op, never fall into
+    // the switch at all - covers a link that came up in any non-CONNECTED
+    // state too, including one restored by the provisioning-mode AP+STA
+    // retry just before stopAP().
+    if (linkUp)
     {
-        enterConnectedState();
+        if (wifiState != WifiState::CONNECTED)
+        {
+            enterConnectedState();
+        }
         return;
     }
 
