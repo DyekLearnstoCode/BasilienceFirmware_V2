@@ -29,3 +29,4 @@ GsmManager gsmManager;
 SmsRecipientCache smsRecipientCache;
 HarvestScheduleCache harvestScheduleCache;
 NotificationManager notificationManager;
+FoggingEventQueue foggingEventQueue;

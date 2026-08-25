@@ -1478,6 +1478,19 @@ void AutomationManager::processFogCycle()
 //Grow Light Schedule Handling
 void AutomationManager::updateGrowLightSchedule()
 {
+    // Confirmed defect (see the RTC report): getHour()/getMinute() only
+    // check RTCManager::isConnected(), not hasValidTime() - so a DS3231
+    // that lost power still returns whatever it currently reads, and this
+    // schedule would silently run against that garbage "current time"
+    // instead of the real one. Leave the grow light in its current
+    // commanded state rather than guess; matches the same
+    // hasValidTime()-guard NotificationManager already uses for its own
+    // time-dependent decisions.
+    if (!rtcManager.hasValidTime())
+    {
+        return;
+    }
+
     bool lightEnabled =
         isWithinSchedule(
             systemState.lightOnHour,

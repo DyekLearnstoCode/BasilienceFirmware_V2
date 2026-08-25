@@ -16,6 +16,7 @@
 #include "SmsRecipientCache.h"
 #include "HarvestScheduleCache.h"
 #include "NotificationManager.h"
+#include "FoggingEventQueue.h"
 
 // ======================================================
 // Shared Data
@@ -38,5 +39,6 @@ extern GsmManager gsmManager;
 extern SmsRecipientCache smsRecipientCache;
 extern HarvestScheduleCache harvestScheduleCache;
 extern NotificationManager notificationManager;
+extern FoggingEventQueue foggingEventQueue;
 
 #endif

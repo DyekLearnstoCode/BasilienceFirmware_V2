@@ -1,3 +1,4 @@
+
 #include "Config.h"
 #include "Types.h"
 #include "Globals.h"
@@ -34,8 +35,23 @@ void setup()
     Serial.println("[CONTROL] Local automation and safety ready");
 
     wifiManager.begin();
-    Serial.print("ESP32 MAC: ");
-    Serial.println(WiFi.macAddress());
+
+    // WiFi.macAddress() reads back all-zero here whenever this boot has no
+    // saved credentials (goes straight into WiFi.mode(WIFI_AP)-only
+    // provisioning, so the STA netif is never started) - see the task
+    // report for the full trace. getFormattedMacAddress()/getMacAddress()
+    // read the hardware MAC directly via esp_read_mac(), which works
+    // regardless of WiFi mode/state.
+    // A "" result means readHardwareStaMac() already logged
+    // "[IDENTITY] ERROR: ..." - nothing further to print here.
+    String staMac = firebaseManager.getFormattedMacAddress();
+    if (!staMac.isEmpty())
+    {
+        Serial.print("[IDENTITY] STA MAC: ");
+        Serial.println(staMac);
+        Serial.print("[IDENTITY] Provisioning key: ");
+        Serial.println(firebaseManager.getMacAddress());
+    }
 
     Serial.println("[GSM] Production GSM manager active");
 
@@ -51,6 +67,12 @@ void setup()
     smsRecipientCache.begin();
     harvestScheduleCache.begin();
     notificationManager.begin();
+
+    // Must come after actuatorManager.begin() above: reboot-recovery checks
+    // whether the last confirmed state was ON, and by this point FOGGER has
+    // already been physically/locally reset to OFF, so any recovery
+    // closeout event this records is accurate.
+    foggingEventQueue.begin();
 }
 
 void loop()

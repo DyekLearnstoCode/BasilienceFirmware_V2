@@ -44,6 +44,20 @@ public:
     // bootstrap attempt (does not itself trigger an immediate re-auth).
     void saveDeviceSecretFromProvisioning(const String& secret);
 
+    // Human-readable "AA:BB:CC:DD:EE:FF" form of the hardware STA MAC, read
+    // via esp_read_mac(ESP_MAC_WIFI_STA) - valid even before WiFi.mode() has
+    // ever been called (e.g. first-boot AP-only provisioning, where
+    // WiFi.macAddress() is known to read back all-zero). Returns "" if the
+    // hardware MAC could not be resolved; never returns an all-zero MAC.
+    String getFormattedMacAddress();
+
+    // Normalized "AABBCCDDEEFF" (uppercase, no separators) form of the same
+    // hardware STA MAC - unchanged output format from before this fix, only
+    // the source underneath changed. Returns "" if the hardware MAC could
+    // not be resolved; never returns an all-zero MAC. This is the form used
+    // for the Firebase /provisioning/{mac}/deviceToken lookup.
+    String getMacAddress();
+
 private:
 
     //==================================================
@@ -170,7 +184,17 @@ private:
     void setSensorTestEnabled(bool enabled, bool publishAcknowledgement = true);
 
     void provisionDevice();
-    String getMacAddress();
+
+    // Reads the 6 raw STA MAC bytes via esp_read_mac(ESP_MAC_WIFI_STA),
+    // which works regardless of WiFi.mode()/WiFi.begin() state - unlike
+    // WiFi.macAddress(), which reads back all-zero whenever the STA
+    // interface has never been brought up (confirmed root cause: a device
+    // with no saved credentials boots straight into WiFi.mode(WIFI_AP)
+    // provisioning, so the STA netif is never started and
+    // WiFi.macAddress() has nothing to report). Logs "[IDENTITY] ERROR:
+    // Unable to resolve hardware Wi-Fi MAC" and returns false (out left
+    // untouched) if the read fails or comes back all-zero.
+    bool readHardwareStaMac(uint8_t out[6]);
 
     //==================================================
     // Secure Device Auth (bootstrap + refresh-token identity)
@@ -305,6 +329,13 @@ private:
     // exactly one step (one (re)submission or one ack poll) per call - never
     // more than one event in flight at a time.
     void replayQueuedNotification();
+
+    // Same one-event-in-flight, one-step-per-call shape as
+    // replayQueuedNotification() above, for FoggingEventQueue instead of
+    // NotificationManager. Writes to the append-only
+    // devices/{deviceId}/foggingEventQueue path, never to actuatorStatus -
+    // see the task report for why those must stay separate.
+    void replayQueuedFoggingEvent();
 };
 
 #endif

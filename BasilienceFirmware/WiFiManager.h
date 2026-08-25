@@ -61,6 +61,11 @@ public:
     void startManualProvisioning();
     void stopAP();
 
+    // Diagnostic-only: name of the state machine's currently tracked state,
+    // read by the WiFi event handler for "previous state" context on a
+    // disconnect log. Never used for control flow.
+    const char* stateName() const;
+
 private:
     bool loadCredentials();
     void setupAPServer();
@@ -74,6 +79,18 @@ private:
     // Shared CONNECTED transition: clears the cumulative recovery window and
     // logs the connection once.
     void enterConnectedState();
+
+    // The only path that may call WiFi.disconnect() from this class. Marks
+    // the disconnect as firmware-initiated (a file-scope flag in
+    // WiFiManager.cpp, read once by onWiFiEvent) before issuing it, so the
+    // resulting ARDUINO_EVENT_WIFI_STA_DISCONNECTED log can say whether this
+    // firmware asked for the drop or something external caused it.
+    void disconnectRadio(bool wifioff, bool eraseap);
+
+    // Diagnostic-only "[WIFI] state X -> Y reason=..." transition log,
+    // additive alongside the existing bespoke messages at each transition -
+    // never replaces them, so nothing already parsing those strings breaks.
+    void logStateChange(const char* from, const char* to, const char* reason) const;
 
     Preferences preferences;
     String ssid;

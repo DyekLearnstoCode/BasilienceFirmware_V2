@@ -3,6 +3,7 @@
 #include "Arduino.h"
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
+#include <esp_mac.h>
 
 namespace
 {
@@ -328,7 +329,25 @@ void FirebaseManager::begin()
             &auth);
     }
 
-    Firebase.reconnectWiFi(true);
+    // ROOT CAUSE of the observed reconnect loop (see task report): true here
+    // lets the Firebase client library independently call WiFi.reconnect()
+    // from inside FirebaseCore::resumeNetwork() whenever ITS OWN
+    // networkReady() check happens to read a momentary non-CONNECTED status
+    // during any RTDB call - and WiFi.reconnect() (STAClass::reconnect() in
+    // the ESP32 core) unconditionally calls esp_wifi_disconnect() first if
+    // still associated, forcibly dropping a connection that may not have
+    // actually failed. That is a second, uncoordinated reconnect owner
+    // fighting WiFiManager's own state machine, which already guarantees
+    // exactly one association attempt in flight - it is why the same DHCP
+    // lease kept getting reacquired with no "[WIFI] Connecting to..." log
+    // line from WiFiManager: the library was reconnecting the radio itself,
+    // outside WiFiManager entirely. false makes WiFiManager the sole owner
+    // of Wi-Fi reconnection; the library now only observes connectivity
+    // (failing/degrading Firebase operations when Wi-Fi is actually down)
+    // instead of acting on it. reconnectWiFi() is deprecated in this
+    // library version in favor of reconnectNetwork(), used here instead.
+    // Same fix applied at the other call site in attemptFirebaseRecovery().
+    Firebase.reconnectNetwork(false);
 
 Serial.print("Loaded Device ID: [");
 Serial.print(deviceId);
@@ -577,44 +596,16 @@ void FirebaseManager::initializeDatabase()
             json);
     }
 
-    //--------------------------------------------------
-    // RTC
-    //--------------------------------------------------
-
-    if(!Firebase.RTDB.getJSON(
-        &fbdo,
-        deviceRoot() + "/rtc"))
-    {
-        json.clear();
-
-        json.set(
-            "month",
-            rtcManager.getMonth());
-
-        json.set(
-            "day",
-            rtcManager.getDay());
-
-        json.set(
-            "year",
-            rtcManager.getYear());
-
-        json.set(
-            "hour",
-            rtcManager.getHour());
-
-        json.set(
-            "minute",
-            rtcManager.getMinute());
-
-        json.set(
-            "second",
-            rtcManager.getSecond());
-
-        writeJson(
-            deviceRoot() + "/rtc",
-            json);
-    }
+    // RTC: no seeding block here anymore. The removed code used to write
+    // this device's own (possibly post-power-loss, meaningless) DS3231
+    // reading to /devices/{deviceId}/rtc whenever that node was absent -
+    // and syncRTC() below then read that SAME node back and called
+    // rtc.adjust() on it. Nothing else in this system (confirmed: no
+    // Cloud Function, no Android screen) ever wrote a genuinely trustworthy
+    // value there, so the whole thing was a circular echo that could
+    // silently clear the DS3231's lostPower flag on garbage data - see the
+    // RTC report for the full trace. RTC status is now published read-only
+    // to /devices/{deviceId}/status/rtc by writeStatus() instead.
 }
 
 //==================================================
@@ -804,7 +795,7 @@ void FirebaseManager::runOneOptionalFirebaseJob(
     bool sensorTestMode,
     bool deferLowPriorityJobs)
 {
-    constexpr uint8_t OPTIONAL_JOB_COUNT = 14;
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 15;
 
     for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
     {
@@ -826,11 +817,13 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         // A new alert transition must not sit behind low-priority synchronization.
         // Advance the cursor past these jobs now; they remain eligible on later
         // non-urgent rotations and therefore cannot be permanently starved.
-        // Recipient/harvest-schedule sync and notification replay (11-13) are
-        // likewise low-priority background work, same treatment as 6-10.
+        // Recipient/harvest-schedule sync and notification/fogging replay
+        // (11-14) are likewise low-priority background work, same treatment
+        // as 6-10 - sensors/safety/actuator sync/commands/heartbeats must
+        // never be starved by history replay.
         if (deferLowPriorityJobs &&
             (job == 6 || job == 7 || job == 8 || job == 9 || job == 10 ||
-             job == 11 || job == 12 || job == 13))
+             job == 11 || job == 12 || job == 13 || job == 14))
         {
             continue;
         }
@@ -897,6 +890,10 @@ void FirebaseManager::runOneOptionalFirebaseJob(
 
             case 13:
                 replayQueuedNotification();
+                return;
+
+            case 14:
+                replayQueuedFoggingEvent();
                 return;
         }
     }
@@ -1353,17 +1350,59 @@ void FirebaseManager::readSettings()
 }
 
 
+bool FirebaseManager::readHardwareStaMac(uint8_t out[6])
+{
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK)
+    {
+        Serial.println("[IDENTITY] ERROR: Unable to resolve hardware Wi-Fi MAC");
+        return false;
+    }
+
+    bool allZero = true;
+    for (int i = 0; i < 6; i++)
+    {
+        if (mac[i] != 0) { allZero = false; break; }
+    }
+    if (allZero)
+    {
+        Serial.println("[IDENTITY] ERROR: Unable to resolve hardware Wi-Fi MAC");
+        return false;
+    }
+
+    memcpy(out, mac, 6);
+    return true;
+}
+
 String FirebaseManager::getMacAddress()
 {
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    mac.toUpperCase();
-    return mac;
+    uint8_t mac[6];
+    if (!readHardwareStaMac(mac)) return "";
+    char buf[13];
+    snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
+}
+
+String FirebaseManager::getFormattedMacAddress()
+{
+    uint8_t mac[6];
+    if (!readHardwareStaMac(mac)) return "";
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
 }
 
 void FirebaseManager::provisionDevice()
 {
     String mac = getMacAddress();
+    if (mac.isEmpty())
+    {
+        // Never derive a provisioning lookup from a zero/unresolvable MAC.
+        Serial.println("[IDENTITY] ERROR: Provisioning deferred - hardware MAC unavailable");
+        return;
+    }
     String path = "/provisioning/" + mac + "/deviceToken";
 
     Serial.println("Checking provisioning...");
@@ -1464,13 +1503,15 @@ bool FirebaseManager::restoreFromRefreshToken(const String& refreshToken)
 
 bool FirebaseManager::bootstrapSecureAuth(const String& secret)
 {
-    String mac = WiFi.macAddress();
-    if (mac.isEmpty() || mac == "00:00:00:00:00:00")
+    // Wire format sent to BOOTSTRAP_ENDPOINT_URL below is unchanged
+    // (colon-separated, e.g. "AA:BB:CC:DD:EE:FF") - only the underlying
+    // source is now the hardware-level read, not WiFi.macAddress().
+    String mac = getFormattedMacAddress();
+    if (mac.isEmpty())
     {
         // begin() only runs once Wi-Fi is connected, by which point
         // WiFi.mode(WIFI_STA) has long been set and the MAC is stable - this
-        // is a defensive guard against the well-known all-zero transient
-        // value, not an expected path here.
+        // remains a defensive guard, not an expected path here.
         Serial.println("[FIREBASE-AUTH] MAC address not yet valid; deferring bootstrap");
         return false;
     }
@@ -1754,7 +1795,9 @@ bool FirebaseManager::attemptFirebaseRecovery()
         }
     }
 
-    Firebase.reconnectWiFi(true);
+    // Same reasoning as FirebaseManager::begin() above: WiFiManager, not
+    // this library, owns Wi-Fi reconnection.
+    Firebase.reconnectNetwork(false);
 
     unsigned long startedAt = millis();
     while (!Firebase.ready() && millis() - startedAt < 10000UL)
@@ -1779,56 +1822,41 @@ bool FirebaseManager::attemptFirebaseRecovery()
 //==================================================
 // Time Synchronization
 //==================================================
+// PREVIOUSLY: this read /devices/{deviceId}/rtc back from RTDB and called
+// rtc.adjust() on whatever it found there. That node was, in turn, only
+// ever seeded by this SAME device's own DS3231 reading (see the removed
+// block in initializeDatabase()) - there is no NTP client, no Android
+// screen, and no Cloud Function anywhere in this system that ever writes a
+// genuinely trustworthy time to that path (confirmed by inspecting both).
+// So the "sync" was a circular echo of the device's own clock, and worse:
+// rtc.adjust() unconditionally clears the DS3231's lostPower flag, so a
+// device that booted with a lost/garbage time would get that garbage
+// "confirmed" as valid on the very next boot, permanently hiding the fact
+// it was never actually correct.
+//
+// NOW: actual recovery (bounded SNTP, gated on Wi-Fi already being
+// connected) lives in RTCManager::update(), driven independently of
+// Firebase's own lifecycle - RTC validity has nothing to do with whether
+// Firebase happens to be connected, only with Wi-Fi and the DS3231 itself.
+// This function, called once from begin(), is left as a one-time status
+// report at Firebase-boot time, not a second place that writes the clock -
+// there is exactly one writer of rtc.adjust() now (RTCManager).
 void FirebaseManager::syncRTC()
 {
+    Serial.println("[RTC] synchronization requested");
 
-    if(!Firebase.RTDB.getJSON(
-        &fbdo,
-        deviceRoot() + "/rtc"))
+    if (rtcManager.hasValidTime())
     {
-        Serial.println(
-            "RTC SYNC FAILED");
-
+        // lostPower()==false only proves the DS3231 isn't reporting a
+        // power-loss/oscillator-stop condition - it is not proof the
+        // retained value is correct, so this is deliberately not phrased
+        // as "trusted."
+        Serial.println("[RTC] Existing RTC time retained; no power-loss condition reported");
         return;
     }
 
-    FirebaseJsonData data;
-
-    uint16_t year = 0;
-    uint8_t month = 0;
-    uint8_t day = 0;
-    uint8_t hour = 0;
-    uint8_t minute = 0;
-    uint8_t second = 0;
-
-    fbdo.jsonObject().get(data, "year");
-    year = data.intValue;
-
-    fbdo.jsonObject().get(data, "month");
-    month = data.intValue;
-
-    fbdo.jsonObject().get(data, "day");
-    day = data.intValue;
-
-    fbdo.jsonObject().get(data, "hour");
-    hour = data.intValue;
-
-    fbdo.jsonObject().get(data, "minute");
-    minute = data.intValue;
-
-    fbdo.jsonObject().get(data, "second");
-    second = data.intValue;
-
-    rtcManager.setDateTime(
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second);
-
-    Serial.println(
-        "RTC SYNC SUCCESS");
+    Serial.println("[RTC] synchronization failed: DS3231 reports power loss; "
+                    "awaiting network time recovery once Wi-Fi is available");
 }
 
 //==================================================
@@ -2038,7 +2066,12 @@ void FirebaseManager::readActuatorCommands()
     // Check for manualMode flag
     if (snapshot.get(jsonData, "manualMode"))
     {
-        systemState.manualMode = jsonData.boolValue;
+        const bool newManualMode = jsonData.boolValue;
+        if (newManualMode != systemState.manualMode)
+        {
+            Serial.println(newManualMode ? "[MANUAL] Manual Mode enabled" : "[MANUAL] Manual Mode disabled");
+        }
+        systemState.manualMode = newManualMode;
     }
     const bool startProvisioningRequested =
         snapshot.get(jsonData, "startProvisioning") && jsonData.success && jsonData.boolValue;
@@ -2137,7 +2170,22 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
 
         const Actuator actuator = static_cast<Actuator>(i);
         const String commandPath = deviceRoot() + "/commands/" + getActuatorName(actuator);
-        const bool isNew = timestamps[i] > lastActuatorCommandTimestamps[i];
+        const uint64_t previousTimestamp = lastActuatorCommandTimestamps[i];
+        const bool isNew = timestamps[i] > previousTimestamp;
+
+        if (dispatchCommands && sources[i] == "manual")
+        {
+            Serial.print("[MANUAL] command key=");
+            Serial.print(getActuatorName(actuator));
+            Serial.print(" state=");
+            Serial.print(states[i] ? 1 : 0);
+            Serial.print(" timestamp=");
+            Serial.println((unsigned long long)timestamps[i]);
+            Serial.print("[MANUAL] previousTimestamp=");
+            Serial.println((unsigned long long)previousTimestamp);
+            Serial.print("[MANUAL] freshness=");
+            Serial.println(isNew ? "fresh" : "stale");
+        }
 
         if (isNew)
         {
@@ -2803,6 +2851,52 @@ void FirebaseManager::writeStatus()
         "firebaseConnected",
         systemState.firebaseConnected);
 
+    //--------------------------------------------------
+    // RTC - diagnostic-only status snapshot of this device's DS3231. Never
+    // an authoritative "current time" for anything outside this device;
+    // see syncRTC() for why no cloud value ever gets written back into it.
+    // Piggybacks on this existing status upload's own cadence rather than
+    // adding a separate Firebase job just for the clock.
+    //--------------------------------------------------
+
+    json.set("rtc/connected", rtcManager.isConnected());
+    json.set("rtc/valid", rtcManager.hasValidTime());
+    // "RTC_RETAINED" | "NTP" | "INVALID" - where this boot's time actually
+    // came from. See RTCManager::getSyncSourceName().
+    json.set("rtc/syncSource", rtcManager.getSyncSourceName());
+    if (rtcManager.hasValidTime())
+    {
+        // epochUtc = true absolute UTC Unix epoch (RTCManager::getEpochTime()
+        // corrects for the DS3231's local storage - see its contract in
+        // RTCManager.h). year/month/day/hour/minute/second below are the
+        // DS3231's raw stored fields, i.e. Asia/Manila LOCAL civil time
+        // (UTC+08:00) - NOT UTC. Renamed from the previous "epoch" to
+        // "epochUtc" to make this split unambiguous at the RTDB level, not
+        // just in code comments; safe to rename because this whole /status/rtc
+        // structure was only added in the immediately prior task and has no
+        // existing Android/Cloud Function reader yet (confirmed by search).
+        json.set("rtc/epochUtc", (double)rtcManager.getEpochTime());
+        json.set("rtc/year", rtcManager.getYear());
+        json.set("rtc/month", rtcManager.getMonth());
+        json.set("rtc/day", rtcManager.getDay());
+        json.set("rtc/hour", rtcManager.getHour());
+        json.set("rtc/minute", rtcManager.getMinute());
+        json.set("rtc/second", rtcManager.getSecond());
+    }
+    else
+    {
+        // No date/time fields when invalid - an absent field can't be
+        // mistaken for a real (e.g. 1970/epoch-0) reading the way a
+        // present-but-zero one could.
+        json.set("rtc/epochUtc", 0);
+    }
+    // lastSyncAt was removed: it held millis() (device uptime), which is
+    // neither a calendar time nor an actual last-successful-sync moment -
+    // exactly the confusion the RTC finalization task flagged. /status
+    // itself has no existing authoritative update timestamp to reuse, so
+    // this is a straight removal rather than a rename to a field nothing
+    // would consume.
+
     const unsigned long uploadStartedAt = millis();
     const bool uploadSucceeded = updateJson(deviceRoot() + "/status", json);
     logFirebaseDuration("Status upload", millis() - uploadStartedAt);
@@ -3039,6 +3133,19 @@ void FirebaseManager::writeActuators()
         json.set(name + "/source", current.source);
         json.set(name + "/strategy", current.strategy);
         json.set(name + "/reason", current.reason);
+
+        // Single-producer compatibility marker (task-mandated): its presence
+        // tells the legacy state-trigger Cloud Function (logFoggerActivity)
+        // that THIS firmware already recorded the transition through its own
+        // durable queue and replay path, so it must defer instead of writing
+        // a second foggingLogs document for the same transition. Legacy
+        // firmware never sets this field, so that Cloud Function's existing
+        // behavior is unchanged for older devices.
+        if (a == FOGGER)
+        {
+            json.set(name + "/lastFoggingEventId", foggingEventQueue.getLastEventId());
+        }
+
         hasFields = true;
     }
 
@@ -3305,6 +3412,48 @@ void FirebaseManager::replayQueuedNotification()
     if (succeeded && fbdo.stringData() == "acked")
     {
         notificationManager.markCloudReplayAcked(event.eventId);
+    }
+}
+
+// Append-only history replay for FoggingEventQueue - deliberately never
+// touches actuatorStatus/fogger (see task report: replaying historical
+// ON/OFF through the current-state node would let a stale replay flip what
+// Monitoring/live UI read as the fogger's PRESENT state).
+void FirebaseManager::replayQueuedFoggingEvent()
+{
+    FoggingQueueEvent event;
+    String eventId;
+    if (!foggingEventQueue.getNextReplayEvent(event, eventId)) return;
+
+    if (foggingEventQueue.isReplayStale(eventId, 5UL * 60UL * 1000UL))
+    {
+        // (Re)submit the full, idempotent event content - safe to resend
+        // identical content on retry/reboot since the Cloud Function side is
+        // idempotent by this same eventId.
+        FirebaseJson payload;
+        payload.set("event", event.eventType == (uint8_t)FoggingEventType::ON ? "ON" : "OFF");
+        payload.set("occurredAt", (int)event.occurredAtEpoch);
+        payload.set("timestampValid", event.timestampValid);
+        payload.set("source", foggingSourceCodeString((FoggingSourceCode)event.sourceCode));
+        payload.set("strategy", foggingStrategyCodeString((FoggingStrategyCode)event.strategyCode));
+        payload.set("reason", foggingReasonCodeString((FoggingReasonCode)event.reasonCode));
+
+        const unsigned long startedAt = millis();
+        bool ok = writeJson(deviceRoot() + "/foggingEventQueue/" + eventId, payload);
+        logFirebaseDuration("Fogging event replay write", millis() - startedAt);
+        if (ok) foggingEventQueue.markReplaySubmitted(eventId);
+        return;
+    }
+
+    // Already submitted and still fresh - just poll for the Cloud
+    // Function's ack rather than resubmitting every rotation.
+    const unsigned long startedAt = millis();
+    bool succeeded = Firebase.RTDB.getString(&fbdo, deviceRoot() + "/foggingEventQueue/" + eventId + "/status");
+    logFirebaseDuration("Fogging event ack poll", millis() - startedAt);
+    recordFirebaseResult(succeeded);
+    if (succeeded && fbdo.stringData() == "acked")
+    {
+        foggingEventQueue.markReplayAcked(eventId);
     }
 }
 

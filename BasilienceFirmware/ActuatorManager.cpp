@@ -807,6 +807,17 @@ void ActuatorManager::update()
                 Serial.print(" ");
                 Serial.println(actuatorStateLogName(status.state));
             }
+
+            // History-correctness hook: FOGGER's `running` flip is the
+            // CONFIRMED transition (ACTIVATING->RUNNING / STOPPING->OFF
+            // above), never the request in COMMAND_RECEIVED/VALIDATING - so
+            // this fires once per actual physical transition, matching what
+            // Fogging Reports must reconstruct sessions from.
+            if (a == FOGGER && previousStatus.running != status.running)
+            {
+                foggingEventQueue.recordConfirmedTransition(
+                    status.running, status.source, status.strategy, status.reason);
+            }
         }
     }
 }

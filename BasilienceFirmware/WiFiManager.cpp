@@ -2,8 +2,86 @@
 
 #include "Globals.h"
 
+// Forward declaration: defined below, registered from begin() before any
+// connection attempt so every STA event - including the very first - is
+// captured with its disconnect reason code.
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+
+namespace
+{
+    // Set immediately before every WiFi.disconnect() this class issues
+    // itself (see WiFiManager::disconnectRadio), read and cleared once by
+    // onWiFiEvent's DISCONNECTED case. If a disconnect event arrives with
+    // this NOT set, the drop was not requested by this firmware (AP-side
+    // deauth, RF loss, or - before this fix - a third party such as the
+    // Firebase client library calling WiFi.reconnect() on its own).
+    bool g_selfInitiatedDisconnectPending = false;
+
+    // Best-effort decode of the ESP-IDF wifi_err_reason_t values actually
+    // defined in this SDK (esp_wifi_types_generic.h) - not exhaustive, but
+    // covers every reason this diagnosis is likely to actually see. Falls
+    // back to "unknown" rather than guessing.
+    const char* wifiDisconnectReasonName(uint8_t reason)
+    {
+        switch (reason)
+        {
+            case 1:   return "UNSPECIFIED";
+            case 2:   return "AUTH_EXPIRE";
+            case 3:   return "AUTH_LEAVE";
+            case 4:   return "ASSOC_EXPIRE/DISASSOC_INACTIVITY";
+            case 5:   return "ASSOC_TOOMANY";
+            case 6:   return "NOT_AUTHED";
+            case 7:   return "NOT_ASSOCED";
+            case 8:   return "ASSOC_LEAVE";               // station-initiated leave (e.g. esp_wifi_disconnect())
+            case 9:   return "ASSOC_NOT_AUTHED";
+            case 10:  return "DISASSOC_PWRCAP_BAD";
+            case 11:  return "DISASSOC_SUPCHAN_BAD";
+            case 13:  return "IE_INVALID";
+            case 14:  return "MIC_FAILURE";
+            case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+            case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+            case 39:  return "TIMEOUT";
+            case 46:  return "PEER_INITIATED";
+            case 47:  return "AP_INITIATED";
+            case 200: return "BEACON_TIMEOUT";
+            case 201: return "NO_AP_FOUND";
+            case 202: return "AUTH_FAIL";
+            case 203: return "ASSOC_FAIL";
+            case 204: return "HANDSHAKE_TIMEOUT";
+            case 205: return "CONNECTION_FAIL";
+            case 206: return "AP_TSF_RESET";
+            case 207: return "ROAMING";
+            default:  return "unknown";
+        }
+    }
+}
+
 void WiFiManager::begin()
 {
+    WiFi.onEvent(onWiFiEvent);
+
+    // ROOT CAUSE of "[WIFI] reconnect handled by ESP32 auto-reconnect" still
+    // appearing on real hardware after the previous fix: that earlier fix
+    // (Firebase.reconnectNetwork(false)) only stopped the Firebase client
+    // library's own reconnect calls. It never touched the ESP32 Arduino
+    // core's OWN native auto-reconnect, which is a SEPARATE mechanism -
+    // STAClass's constructor defaults _autoReconnect to true
+    // (libraries/WiFi/src/STA.cpp:231, ESP32 core 3.1.3), and nothing in
+    // this firmware ever called setAutoReconnect(false) to turn it off.
+    // On a disconnect with a "reconnectable" reason, STA.cpp's internal
+    // _onStaArduinoEvent (~line 156-164) synchronously calls disconnect()
+    // then connect() itself, entirely outside WiFiManager's state machine -
+    // the exact second reconnect owner this architecture is supposed to
+    // rule out. That same synchronous re-entrant disconnect()/connect()
+    // pair is also the most likely reason the [WIFI-EVENT] logs (connected,
+    // got-IP, AND disconnected - all three, not just disconnected) never
+    // printed cleanly: the event object/dispatch gets reused before this
+    // firmware's own onWiFiEvent() has a clean chance to run. This call is
+    // set once, here, at boot - the flag lives on the WiFi singleton
+    // constructed at static-init time, so WiFi.mode()/WiFi.begin() calls
+    // later never reset it back to its default-true state.
+    WiFi.setAutoReconnect(false);
+
     preferences.begin("wifi", false);
     firebaseResumePending = preferences.getBool("resumeFirebase", false);
     if (firebaseResumePending)
@@ -41,8 +119,11 @@ void WiFiManager::startConnectionAttempt()
         return;
     }
 
+    const char* previousState = stateName();
+
     Serial.print("[WIFI] Connecting to ");
     Serial.println(ssid);
+    Serial.println("[WIFI] reconnect initiated by firmware");
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), password.c_str());
@@ -50,6 +131,7 @@ void WiFiManager::startConnectionAttempt()
     connectionStartedAt = millis();
     lastReconnectAttempt = connectionStartedAt;
     wifiState = WifiState::CONNECTING;
+    logStateChange(previousState, "CONNECTING", "startConnectionAttempt");
 
     // The cumulative outage window starts with the FIRST attempt of an
     // outage, not after it fails - "how long has this device been off the
@@ -66,6 +148,18 @@ void WiFiManager::startConnectionAttempt()
 
 void WiFiManager::enterConnectedState()
 {
+    const char* previousState = stateName();
+
+    // RETRY_WAIT only ever exits into CONNECTING via startConnectionAttempt()
+    // (see its state machine in update()) - so reaching CONNECTED directly
+    // from RETRY_WAIT, without ever passing through CONNECTING, means
+    // something other than this firmware's own retry logic re-established
+    // the link (ESP32/library-level auto-reconnect). Diagnostic only.
+    if (wifiState == WifiState::RETRY_WAIT)
+    {
+        Serial.println("[WIFI] reconnect handled by ESP32 auto-reconnect");
+    }
+
     wifiState = WifiState::CONNECTED;
     connectionStartedAt = 0;
     lastReconnectAttempt = 0;
@@ -84,6 +178,7 @@ void WiFiManager::enterConnectedState()
     Serial.println("[WIFI] Connected");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
+    logStateChange(previousState, "CONNECTED", "enterConnectedState");
 }
 
 
@@ -155,12 +250,105 @@ bool WiFiManager::connect()
 
 void WiFiManager::disconnect()
 {
-    WiFi.disconnect();
+    disconnectRadio(false, false);
 
     systemState.wifiConnected = false;
 
     Serial.println("WiFi Disconnected");
 }
+
+void WiFiManager::disconnectRadio(bool wifioff, bool eraseap)
+{
+    g_selfInitiatedDisconnectPending = true;
+    WiFi.disconnect(wifioff, eraseap);
+}
+
+const char* WiFiManager::stateName() const
+{
+    switch (wifiState)
+    {
+        case WifiState::IDLE:       return "IDLE";
+        case WifiState::CONNECTING: return "CONNECTING";
+        case WifiState::CONNECTED:  return "CONNECTED";
+        case WifiState::RETRY_WAIT: return "RETRY_WAIT";
+    }
+    return "UNKNOWN";
+}
+
+void WiFiManager::logStateChange(const char* from, const char* to, const char* reason) const
+{
+    Serial.print("[WIFI] state ");
+    Serial.print(from);
+    Serial.print(" -> ");
+    Serial.print(to);
+    Serial.print(" reason=");
+    Serial.println(reason);
+}
+
+// Transition/event logging only - never spammed per-loop. GOT_IP/STA
+// CONNECTED are single events per association; DISCONNECTED carries full
+// diagnostic context since that is the one this whole task exists to
+// explain.
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event)
+    {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.print("[WIFI-EVENT] STA connected t=");
+            Serial.println(millis());
+            break;
+
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("[WIFI-EVENT] Got IP: ");
+            Serial.print(WiFi.localIP());
+            Serial.print(" t=");
+            Serial.println(millis());
+            break;
+
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        {
+            const uint8_t reason = info.wifi_sta_disconnected.reason;
+            const bool selfInitiated = g_selfInitiatedDisconnectPending;
+            g_selfInitiatedDisconnectPending = false;
+
+            Serial.print("[WIFI-EVENT] Disconnected reason=");
+            Serial.print(reason);
+            Serial.print(" (");
+            Serial.print(wifiDisconnectReasonName(reason));
+            Serial.println(")");
+
+            Serial.print("[WIFI-EVENT]   origin=");
+            Serial.println(selfInitiated ? "firmware-initiated" : "external");
+
+            Serial.print("[WIFI-EVENT]   previous state=");
+            Serial.println(wifiManager.stateName());
+
+            // RSSI is only meaningful while associated; ESP32 Arduino
+            // returns 0 once the STA has already dropped, which this
+            // reports plainly rather than presenting as a real reading.
+            const int rssi = WiFi.RSSI();
+            Serial.print("[WIFI-EVENT]   rssi=");
+            if (rssi == 0) Serial.println("n/a");
+            else Serial.println(rssi);
+
+            // Best-effort context, not a live "is a request in flight right
+            // now" flag (FirebaseManager has no such flag to read, and
+            // adding one across every RTDB call site is out of scope for a
+            // Wi-Fi diagnosis) - reflects the last known Firebase health
+            // state at the moment of this disconnect.
+            Serial.print("[WIFI-EVENT]   firebaseConnected=");
+            Serial.println(systemState.firebaseConnected ? "true" : "false");
+
+            Serial.print("[WIFI-EVENT]   t=");
+            Serial.println(millis());
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
 // LEGACY - see connect() above. Unreachable in this build.
 bool WiFiManager::reconnect()
 {
@@ -323,7 +511,7 @@ void WiFiManager::update()
             if (now - apReconnectStartedAt >= RECOVERY_TIMEOUT)
             {
                 Serial.println("[WIFI] Saved network still unavailable; provisioning remains active");
-                WiFi.disconnect(false, false);
+                disconnectRadio(false, false);
                 apReconnectInProgress = false;
             }
             return;
@@ -390,12 +578,13 @@ void WiFiManager::update()
             // End the failed association before the next attempt. Credentials
             // are held in NVS and in this object; disconnect(false, false)
             // neither erases them nor powers the radio down.
-            WiFi.disconnect(false, false);
+            disconnectRadio(false, false);
 
             // The outage window was opened by startConnectionAttempt(); this
             // only records that the saved network is now confirmed unusable.
             recoveryInProgress = true;
 
+            logStateChange("CONNECTING", "RETRY_WAIT", "connection attempt timed out");
             wifiState = WifiState::RETRY_WAIT;
             lastReconnectAttempt = now;
             break;
@@ -411,6 +600,7 @@ void WiFiManager::update()
             }
             recoveryInProgress = true;
 
+            logStateChange("CONNECTED", "RETRY_WAIT", "link dropped");
             wifiState = WifiState::RETRY_WAIT;
             lastReconnectAttempt = now;
             Serial.println("[WIFI] Reconnecting in background");
@@ -430,6 +620,7 @@ void WiFiManager::update()
 
                 // Provisioning now owns the radio; this machine stands down
                 // until it hands control back.
+                logStateChange("RETRY_WAIT", "IDLE", "recovery window exhausted, handing off to provisioning");
                 wifiState = WifiState::IDLE;
                 connectionStartedAt = 0;
                 recoveryStartedAt = 0;
@@ -456,7 +647,7 @@ void WiFiManager::enterAutomaticProvisioningMode()
     }
 
     // Stop the failed STA association before assigning the radio to the setup AP.
-    WiFi.disconnect(true, false);
+    disconnectRadio(true, false);
     startAP(ProvisioningMode::FALLBACK, !initialConnectionAttempt);
 }
 
