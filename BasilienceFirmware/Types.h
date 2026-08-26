@@ -150,6 +150,11 @@ struct ActuatorCommand
     String strategy = "";
     String reason = "";
     uint32_t timestamp = 0;
+    // One-shot manual-override intent for THIS command only (see
+    // ActuatorManager::validateCommand). Never persists past the command it
+    // arrived on - a later command with this unset/false returns to normal
+    // soft-rule enforcement.
+    bool overrideRequested = false;
 };
 
 struct ActuatorStatus
@@ -161,6 +166,12 @@ struct ActuatorStatus
     String source = "";
     String strategy = "";
     String reason = "";
+    // Mirrors the overrideRequested carried by the command currently
+    // occupying this actuator, so validateCommand's continuous RUNNING-state
+    // re-check (which reads status, not the transient command) can honor the
+    // same override for the actuator's whole run, and so actuatorStatus can
+    // publish it for the app to display.
+    bool overrideActive = false;
 };
 
 //==================================================

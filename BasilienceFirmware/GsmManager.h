@@ -3,13 +3,22 @@
 
 #include <Arduino.h>
 
-// Foundation driver for a SIMCom A76XX-family module (A7680C). Owns the
+// Foundation driver for a SIMCom SIM800L GSM/GPRS module. Owns the
 // dedicated GSM UART and a millis()-driven state machine so cultivation
 // control (sensors/automation/safety/actuators) is never blocked while the
 // module boots, registers, or sends an SMS - update() never calls delay() or
 // spins in a wait loop. GsmManager knows nothing about Firebase, user roles,
 // or alert/delivery policy: it only sends text a caller supplies to a number
 // a caller supplies, one at a time, and reports why if it couldn't.
+//
+// The AT/SMS command set here (AT, AT+CPIN?, AT+CMGF=1, AT+CMGS) is standard
+// Hayes/3GPP TS 27.005 and behaves identically across GSM modules; the one
+// exception was the registration query, which used to be AT+CEREG? (EPS/LTE
+// registration - the previous target module, an A76XX/A7680C, is LTE Cat1).
+// SIM800L is 2G/GPRS-only and has no EPS stack, so registration is now
+// checked with the legacy circuit-switched AT+CREG? instead - the response
+// shape (+CREG: <n>,<stat>) and status codes are the same as CEREG's, so the
+// parsing logic needed no change beyond the command/tag string itself.
 class GsmManager
 {
 public:
@@ -84,6 +93,22 @@ private:
 
     unsigned long stageStartedAt = 0;
 
+    // SIM800L's actual UART baud on this specific board isn't known in
+    // advance - unlike the previous module, there's no single confirmed
+    // fixed rate for it, and there is no way to ask it (AT+IPR) without
+    // already talking to it at its current rate. Rather than hardcode a
+    // guess, WAITING_FOR_MODULE cycles the UART through a short list of
+    // candidate bauds, giving each MODULE_PROBE_RETRY_INTERVAL_MS to answer
+    // "AT" with "OK" before moving to the next - same bounded, non-blocking
+    // retry shape this state already used for a single baud, just applied
+    // across a small list instead of one fixed value. 115200 (this
+    // firmware's existing default) is tried first so an already-correctly-
+    // configured module still responds on the very first attempt.
+    static constexpr unsigned long BAUD_CANDIDATES[] = {115200UL, 9600UL, 57600UL, 38400UL};
+    static constexpr uint8_t BAUD_CANDIDATE_COUNT =
+        sizeof(BAUD_CANDIDATES) / sizeof(BAUD_CANDIDATES[0]);
+    uint8_t baudCandidateIndex = 0;
+
     // Every duration below is a bound on how long GsmManager will wait for a
     // given AT response before retrying or giving up - never an indefinite
     // wait. None of them block loop(): update() checks millis() and returns.
@@ -99,6 +124,7 @@ private:
     void sendCommand(const char* command);
     void beginSendStage(SendStage stage);
     void finishSend(SendResult result);
+    void beginSerialAtCurrentBaudCandidate();
 
     void updateWaitingForModule(unsigned long now);
     void updateCheckingSim(unsigned long now);

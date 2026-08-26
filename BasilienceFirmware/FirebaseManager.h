@@ -87,6 +87,21 @@ private:
     unsigned long lastSettingsRead = 0;
     unsigned long lastSensorUploadAttempt = 0;
     uint8_t optionalFirebaseJobCursor = 0;
+    // Timestamp of the last time any low-priority cloud-maintenance job
+    // (telemetry, device info, diagnostic sensors, SMS recipients, harvest
+    // schedule, notification/fogging ACK replay) actually ran - shared
+    // across all of them by design (the smallest mechanism that still
+    // guarantees SOME of them get serviced periodically). Used only to give
+    // manual-interaction deferral a bounded grace window instead of an
+    // unbounded suppression - see shouldDeferLowPriorityForManualInteraction().
+    unsigned long lastLowPriorityCloudJobAt = 0;
+    // Timestamp of the last fresh manual actuator or operation command
+    // firmware actually observed (a new write under /commands/{actuator} or
+    // a new, non-duplicate /commands/current request) - set in
+    // consumeActuatorCommandSnapshot() and readCommands() respectively. The
+    // tighter, event-driven half of the manual-interaction defer signal: see
+    // update()'s deferLowPriorityForManualInteraction.
+    unsigned long lastManualCommandActivityAt = 0;
     uint16_t lastProtectedAutomaticRequestId = 0;
     uint8_t automaticControlPassesRemaining = 0;
 
@@ -153,7 +168,8 @@ private:
     void logFirebaseDuration(const char* operation, unsigned long durationMs) const;
     bool isSensorUploadDue() const;
     bool shouldDeferOptionalJobsForControlResponse();
-    void runOneOptionalFirebaseJob(bool sensorTestMode, bool deferLowPriorityJobs);
+    void runOneOptionalFirebaseJob(bool sensorTestMode, bool deferLowPriorityJobs,
+                                   bool deferLowPriorityForManualInteraction);
     void enforceSensorTestTimeout();
     void captureAutomaticTerminalSnapshot();
     void syncOperationState();

@@ -177,17 +177,19 @@ constexpr uint8_t RTC_SDA_PIN = 21;
 constexpr uint8_t RTC_SCL_PIN = 22;
 
 // ======================================================
-// GSM / A7680C (SIMCom A76XX family)
+// GSM / SIM800L
 // ======================================================
 // Confirmed non-conflicting production wiring - does not overlap with any
-// sensor, actuator, I2C, or UART0 (USB/debug) pin above.
-constexpr uint8_t GSM_RX_PIN = 36;  // ESP32 RX <- A7680C UTX
-constexpr uint8_t GSM_TX_PIN = 23;  // ESP32 TX -> A7680C URX
+// sensor, actuator, I2C, or UART0 (USB/debug) pin above. Unchanged from the
+// previous A76XX-family module - same pins, same UART framing (8N1).
+constexpr uint8_t GSM_RX_PIN = 36;  // ESP32 RX <- SIM800L TXD
+constexpr uint8_t GSM_TX_PIN = 23;  // ESP32 TX -> SIM800L RXD
 
-// A76XX default UART framing is 115200 8N1. Autobaud is supported by the
-// module, but a fixed rate is used here so GsmManager's bounded timeouts
-// don't also have to account for autobaud detection latency/uncertainty.
-constexpr unsigned long GSM_BAUD_RATE = 115200UL;
+// No single fixed baud here: unlike the previous module, SIM800L's actual
+// UART rate on a given board isn't known in advance (varies by unit/firmware
+// and isn't queryable without already talking to it at that rate), so
+// GsmManager::WAITING_FOR_MODULE probes a short list of candidate bauds
+// (GsmManager.h: BAUD_CANDIDATES) instead of assuming one. See GsmManager.h.
 
 // ======================================================
 // Sensor Thresholds

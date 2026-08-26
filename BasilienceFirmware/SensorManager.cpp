@@ -47,6 +47,18 @@ void SensorManager::begin()
 
     phSampler.begin();
 
+    // SensorData's default waterLevel=0 is deliberately a valid real-world
+    // reading (empty tank), unlike every other field here which defaults to
+    // NaN - so it's the one field where "never sampled yet" and "genuinely
+    // measured empty" are otherwise indistinguishable. Before readWaterLevel()
+    // has ever completed a successful measurement (or reached its own
+    // confirmed-unavailable threshold), physicalSensors.waterLevel must not
+    // read as a plausible 0% to validWaterLevel()/isfinite() and unlock
+    // refill/fog/dosing/cooling on a placeholder. This does not touch what a
+    // REAL measured 0% means afterward - readWaterLevel()'s success path
+    // unconditionally overwrites this with the actual computed percentage.
+    physicalSensors.waterLevel = NAN;
+
     resolveLocalSensorSource();
 }
 

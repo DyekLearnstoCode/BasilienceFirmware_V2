@@ -18,6 +18,17 @@ constexpr unsigned long REALTIME_FALLBACK_INTERVAL = 60000;
 constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
 constexpr unsigned long HEARTBEAT_SUCCESS_LOG_INTERVAL_MS = 60000;
 constexpr unsigned long SENSOR_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
+// Manual Mode can stay on for minutes at a time - this bounds how long the
+// low-priority cloud-maintenance jobs (telemetry, device info, diagnostic
+// sensors, SMS recipients, harvest schedule, notification/fogging ACK
+// replay) can be deferred in a row while it's active, so queues/telemetry
+// still get occasional service instead of going dark for the whole session.
+constexpr unsigned long MANUAL_MODE_LOW_PRIORITY_GRACE_MS = 20000;
+// Tighter window around an actually-observed fresh manual command: an
+// expensive low-priority job must not START within this many ms of one,
+// regardless of how long the broader MANUAL_MODE_LOW_PRIORITY_GRACE_MS
+// window still has left to run - see update().
+constexpr unsigned long MANUAL_COMMAND_ACTIVITY_WINDOW_MS = 5000;
 
 // Consecutive transport-level failures before Firebase health leaves
 // DEGRADED and enters COOLDOWN (no Firebase network calls at all).
@@ -724,7 +735,27 @@ void FirebaseManager::update()
         return;
     }
 
-    // Preserve event-driven actuator publication immediately behind heartbeat.
+    // HIGH PRIORITY: manual actuator control response. Checked directly on
+    // every update() call (not via the optional-job round-robin below) so a
+    // pending app command is never left waiting behind a low-priority job's
+    // rotation slot - only its own existing COMMAND_READ_INTERVAL/backoff
+    // statics still govern how often either actually performs a Firebase
+    // call, so this changes ordering/latency only, not call frequency. The
+    // independent per-actuator esp_timer deadline (see ActuatorManager) is
+    // what protects physical timing during a stall; this is a responsiveness
+    // improvement on top of that, not a second safety mechanism.
+    // Preserves the pre-existing sensorTestEnabled suppression that used to
+    // be enforced by these two jobs' skip-list entries in the round-robin
+    // below (job == 2/3 there) - normal cultivation commands stay suppressed
+    // during the physical sensor diagnostic mode, unchanged.
+    if (!systemState.sensorTestEnabled)
+    {
+        readActuatorCommands();
+        readCommands();
+    }
+
+    // Preserve event-driven actuator publication immediately behind heartbeat
+    // and command reads.
     writeActuators();
 
     // A slow actuator-status transition may itself consume the remaining
@@ -752,11 +783,34 @@ void FirebaseManager::update()
         return;
     }
 
+    // Reduces the chance a known-slow, low-priority job (fogging/notification
+    // ACK poll especially - the field-observed source of the longest stalls)
+    // STARTS close to an actual manual command. Gated on
+    // lastManualCommandActivityAt (set only when a fresh command is actually
+    // observed - see consumeActuatorCommandSnapshot()/readCommands()) rather
+    // than bare manualMode: manualMode can stay on for minutes with no
+    // command in flight, which was too coarse a signal - a low-priority job
+    // starting seconds before an eventual tap was still exposed to the same
+    // 10-70s stall risk. This is deliberately narrower than
+    // deferLowPriorityJobs below (which also covers readSettings/writeStatus
+    // for the control-response/health cases): those two stay on their normal
+    // cadence here because they carry safety-relevant state (safetyLock,
+    // reservoirLocked, target ranges) Android's manual-control UI depends on.
+    // Bounded by MANUAL_MODE_LOW_PRIORITY_GRACE_MS so a flurry of commands
+    // spaced under 5s apart still can't suppress these jobs indefinitely -
+    // see runOneOptionalFirebaseJob().
+    const bool recentManualCommandActivity =
+        millis() - lastManualCommandActivityAt < MANUAL_COMMAND_ACTIVITY_WINDOW_MS;
+    const bool deferLowPriorityForManualInteraction =
+        recentManualCommandActivity &&
+        (millis() - lastLowPriorityCloudJobAt < MANUAL_MODE_LOW_PRIORITY_GRACE_MS);
+
     // Every remaining synchronous read/write is distributed across subsequent
     // loop iterations so slow requests cannot accumulate in one update.
     runOneOptionalFirebaseJob(
         systemState.sensorTestEnabled,
-        alertWasDirty || deferLowPriorityForControlResponse || deferLowPriorityForHealth);
+        alertWasDirty || deferLowPriorityForControlResponse || deferLowPriorityForHealth,
+        deferLowPriorityForManualInteraction);
 }
 
 bool FirebaseManager::isSensorUploadDue() const
@@ -793,9 +847,14 @@ bool FirebaseManager::shouldDeferOptionalJobsForControlResponse()
 
 void FirebaseManager::runOneOptionalFirebaseJob(
     bool sensorTestMode,
-    bool deferLowPriorityJobs)
+    bool deferLowPriorityJobs,
+    bool deferLowPriorityForManualInteraction)
 {
-    constexpr uint8_t OPTIONAL_JOB_COUNT = 15;
+    // Actuator/operation command reads (formerly jobs 2/3 here) moved to
+    // their own always-checked fast path directly in update(), immediately
+    // behind heartbeat - see the comment there. Every remaining job below
+    // shifted down by 2 accordingly; this list is otherwise unchanged.
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 13;
 
     for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
     {
@@ -803,13 +862,15 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         optionalFirebaseJobCursor = (optionalFirebaseJobCursor + 1) % OPTIONAL_JOB_COUNT;
 
         // Normal cultivation commands/alerts remain suppressed during the
-        // existing physical sensor diagnostic mode.
+        // existing physical sensor diagnostic mode. Command reads (formerly
+        // job 2/3) are now suppressed at their new call site in update()
+        // instead of here.
         if (sensorTestMode &&
-            (job == 0 || job == 1 || job == 2 || job == 3 || job == 6))
+            (job == 0 || job == 1 || job == 4))
         {
             continue;
         }
-        if (!sensorTestMode && job == 10)
+        if (!sensorTestMode && job == 8)
         {
             continue;
         }
@@ -818,14 +879,37 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         // Advance the cursor past these jobs now; they remain eligible on later
         // non-urgent rotations and therefore cannot be permanently starved.
         // Recipient/harvest-schedule sync and notification/fogging replay
-        // (11-14) are likewise low-priority background work, same treatment
-        // as 6-10 - sensors/safety/actuator sync/commands/heartbeats must
+        // (9-12) are likewise low-priority background work, same treatment
+        // as 4-8 - sensors/safety/actuator sync/commands/heartbeats must
         // never be starved by history replay.
         if (deferLowPriorityJobs &&
-            (job == 6 || job == 7 || job == 8 || job == 9 || job == 10 ||
-             job == 11 || job == 12 || job == 13 || job == 14))
+            (job == 4 || job == 5 || job == 6 || job == 7 || job == 8 ||
+             job == 9 || job == 10 || job == 11 || job == 12))
         {
             continue;
+        }
+
+        // Narrower manual-interaction deferral: telemetry (6), device info
+        // (7), diagnostic sensors (8), SMS recipients (9), notification (11)
+        // and fogging (12) ACK replay - the known-slow, purely-optional jobs.
+        // readSettings (4) and writeStatus (5) are deliberately exempt (see
+        // update()). Harvest schedule (10) is exempt only once a cached
+        // active schedule already exists - a device with none yet must still
+        // be able to learn of one while Manual Mode happens to be on.
+        if (deferLowPriorityForManualInteraction &&
+            (job == 6 || job == 7 || job == 8 || job == 9 || job == 11 || job == 12 ||
+             (job == 10 && harvestScheduleCache.isActive())))
+        {
+            continue;
+        }
+
+        // This job is about to actually run (survived every skip check
+        // above) - reset the grace-window clock so the NEXT manual-mode
+        // check starts a fresh bounded deferral instead of compounding.
+        if (job == 6 || job == 7 || job == 8 || job == 9 || job == 10 ||
+            job == 11 || job == 12)
+        {
+            lastLowPriorityCloudJobAt = millis();
         }
 
         switch (job)
@@ -841,22 +925,14 @@ void FirebaseManager::runOneOptionalFirebaseJob(
                 return;
 
             case 2:
-                readCommands();
-                return;
-
-            case 3:
-                readActuatorCommands();
-                return;
-
-            case 4:
                 readSensorTestCommand();
                 return;
 
-            case 5:
+            case 3:
                 readMockSensors();
                 return;
 
-            case 6:
+            case 4:
                 if (millis() - lastSettingsRead >= SETTINGS_READ_INTERVAL)
                 {
                     lastSettingsRead = millis();
@@ -864,35 +940,35 @@ void FirebaseManager::runOneOptionalFirebaseJob(
                 }
                 return;
 
-            case 7:
+            case 5:
                 writeStatus();
                 return;
 
-            case 8:
+            case 6:
                 writeTelemetry();
                 return;
 
-            case 9:
+            case 7:
                 writeDeviceInfo();
                 return;
 
-            case 10:
+            case 8:
                 writeDiagnosticSensors();
                 return;
 
-            case 11:
+            case 9:
                 readSmsRecipients();
                 return;
 
-            case 12:
+            case 10:
                 readHarvestSchedule();
                 return;
 
-            case 13:
+            case 11:
                 replayQueuedNotification();
                 return;
 
-            case 14:
+            case 12:
                 replayQueuedFoggingEvent();
                 return;
         }
@@ -1934,6 +2010,12 @@ void FirebaseManager::readCommands()
         return;
     }
 
+    // A fresh, non-duplicate /commands/current request: every write to this
+    // path today originates from the app (REFILL/RESET_SAFETY/pH-EC trigger
+    // buttons), so reaching here - independent of whatever validation
+    // happens below - is genuine manual interaction.
+    lastManualCommandActivityAt = millis();
+
     //--------------------------------------------------
     // Lifecycle Ownership
     //--------------------------------------------------
@@ -2132,6 +2214,11 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
     String sources[ACTUATOR_COUNT];
     uint64_t timestamps[ACTUATOR_COUNT] = { 0 };
     uint8_t speeds[ACTUATOR_COUNT];
+    // Explicit one-shot override intent (see Types.h ActuatorCommand). Absent
+    // on any command that predates this field or wasn't a confirmed override -
+    // defaults to false, i.e. normal soft-rule enforcement, exactly like a
+    // missing "speed" already defaults to 100 below.
+    bool overrides[ACTUATOR_COUNT] = { false };
     FirebaseJsonData data;
 
     // Parse the complete snapshot first. deleteNode() reuses fbdo and would
@@ -2162,6 +2249,10 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
         {
             speeds[i] = static_cast<uint8_t>(constrain(data.intValue, 0, 100));
         }
+        if (snapshot.get(data, name + "/overrideRequested") && data.success)
+        {
+            overrides[i] = data.boolValue;
+        }
     }
 
     for (int i = 0; i < ACTUATOR_COUNT; i++)
@@ -2191,6 +2282,11 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
         {
             lastActuatorCommandTimestamps[i] = timestamps[i];
             saveActuatorCommandTimestamp(actuator, timestamps[i]);
+            // /commands/{actuator} is ADMIN-write-only (database.rules.json)
+            // and only ever written by the app, so any fresh write observed
+            // here - regardless of source string or dispatchCommands (the
+            // reconnect baseline pass) - is genuine manual interaction.
+            if (dispatchCommands) lastManualCommandActivityAt = millis();
         }
 
         if (!dispatchCommands)
@@ -2227,7 +2323,10 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
                 states[i],
                 sources[i],
                 static_cast<double>(timestamps[i]),
-                speeds[i]);
+                speeds[i],
+                "",
+                "",
+                overrides[i]);
         }
 
         // Commands are events, not desired-state storage. Removing the event
@@ -3117,7 +3216,8 @@ void FirebaseManager::writeActuators()
             current.startedAt != lastPublishedActuators[i].startedAt ||
             current.source != lastPublishedActuators[i].source ||
             current.strategy != lastPublishedActuators[i].strategy ||
-            current.reason != lastPublishedActuators[i].reason;
+            current.reason != lastPublishedActuators[i].reason ||
+            current.overrideActive != lastPublishedActuators[i].overrideActive;
 
         if (!fullUploadDue && !changed[i])
         {
@@ -3133,6 +3233,7 @@ void FirebaseManager::writeActuators()
         json.set(name + "/source", current.source);
         json.set(name + "/strategy", current.strategy);
         json.set(name + "/reason", current.reason);
+        json.set(name + "/overrideActive", current.overrideActive);
 
         // Single-producer compatibility marker (task-mandated): its presence
         // tells the legacy state-trigger Cloud Function (logFoggerActivity)

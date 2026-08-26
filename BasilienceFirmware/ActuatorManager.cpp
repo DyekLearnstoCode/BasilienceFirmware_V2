@@ -68,7 +68,8 @@ namespace
             left.startedAt != right.startedAt ||
             left.source != right.source ||
             left.strategy != right.strategy ||
-            left.reason != right.reason;
+            left.reason != right.reason ||
+            left.overrideActive != right.overrideActive;
     }
 
     bool isManualSource(const String& source)
@@ -97,6 +98,48 @@ namespace
             sensors.temperature >= -40.0f && sensors.temperature <= 100.0f &&
             isfinite(sensors.humidity) &&
             sensors.humidity >= 0.0f && sensors.humidity <= 100.0f;
+    }
+
+    // Actuators that already carry an explicit hard manual runtime cap in the
+    // RUNNING-state watchdog below (MANUAL_PUMP_RUNTIME/OPERATION_TIMEOUT_MS)
+    // get an independent esp_timer deadline for that same cap. Grow Light,
+    // Canopy Fan, Blower, and Circulation Pump have no such cap by design
+    // (latched-until-explicit-OFF) and deliberately get none here either -
+    // see the task report's per-actuator evaluation.
+    bool isDeadlineProtected(Actuator actuator)
+    {
+        switch (actuator)
+        {
+            case PH_UP_PUMP:
+            case PH_DOWN_PUMP:
+            case GROW_PUMP:
+            case BLOOM_PUMP:
+            case SOLENOID:
+            case PELTIER:
+            case FOGGER:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Mirrors the exact constant the loop-polled watchdog in update() already
+    // uses for the same actuator, so the independent deadline and the normal
+    // watchdog always agree on the cap - this is a second enforcement path
+    // for the same limit, never a second, different limit.
+    unsigned long manualDeadlineMs(Actuator actuator)
+    {
+        switch (actuator)
+        {
+            case PH_UP_PUMP:
+            case PH_DOWN_PUMP:
+            case GROW_PUMP:
+            case BLOOM_PUMP:
+                return MANUAL_PUMP_RUNTIME;
+            default:
+                // SOLENOID, PELTIER, FOGGER
+                return OPERATION_TIMEOUT_MS;
+        }
     }
 }
 
@@ -129,6 +172,28 @@ void ActuatorManager::begin()
         statuses[i].state = ActuatorCommandState::OFF;
         statuses[i].running = false;
         manuallyOverridden[i] = false;
+        deadlineExpired[i] = false;
+
+        if (isDeadlineProtected((Actuator)i) && deadlineTimers[i] == nullptr)
+        {
+            esp_timer_create_args_t timerArgs = {};
+            timerArgs.callback = &ActuatorManager::onDeadlineExpired;
+            timerArgs.arg = reinterpret_cast<void*>(static_cast<intptr_t>(i));
+            // Default (task) dispatch, not ESP_TIMER_ISR: onDeadlineExpired()
+            // runs in the esp_timer service task, a normal FreeRTOS task
+            // context, so plain Arduino calls (digitalWrite) are safe there -
+            // this deliberately avoids true-ISR constraints entirely.
+            timerArgs.dispatch_method = ESP_TIMER_TASK;
+            timerArgs.name = "actDeadline";
+            esp_err_t created = esp_timer_create(&timerArgs, &deadlineTimers[i]);
+            if (created != ESP_OK)
+            {
+                Serial.print("[SAFETY] Independent deadline timer create failed for ");
+                Serial.print(actuatorLogName((Actuator)i));
+                Serial.print(": esp_err=");
+                Serial.println((int)created);
+            }
+        }
     }
 }
 
@@ -182,7 +247,7 @@ void ActuatorManager::turnOffAll(const String& reason)
     }
 }
 
-void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed, const String& strategy, const String& reason)
+void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed, const String& strategy, const String& reason, bool overrideRequested)
 {
     // The circulation pump serves several subsystems at once, so a manual ON
     // is always meaningful and needs no threshold check. A manual OFF is the
@@ -270,6 +335,11 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
     commands[actuator].strategy = strategy;
     commands[actuator].reason = reason;
     commands[actuator].timestamp = timestamp;
+    // Only a manual ON command can carry a meaningful override - defensively
+    // stripped for every other case so an OFF or an automatic-source command
+    // (which never call this with the app's override flag anyway) can never
+    // leave a stale override active on the status this becomes.
+    commands[actuator].overrideRequested = overrideRequested && state && isManualSource(source);
 }
 
 ActuatorStatus ActuatorManager::getStatus(Actuator actuator) const
@@ -285,6 +355,42 @@ bool ActuatorManager::isStatusDirty() const
 void ActuatorManager::markStatusSynced()
 {
     statusDirty = false;
+}
+
+// esp_timer service-task callback - see the header comment on
+// deadlineExpired[] for exactly what is and is not safe to do here.
+// Deliberately minimal: force the physical pin OFF now (the actual safety
+// action - must not wait for loop() to come back from a blocked Firebase
+// call), then hand off to update() via one flag for everything else
+// (FSM/actuatorStatus/logging reconciliation). No Strings, no Firebase, no
+// other ActuatorManager array is touched from here.
+void ActuatorManager::onDeadlineExpired(void* arg)
+{
+    const int index = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    if (index < 0 || index >= ACTUATOR_COUNT) return;
+
+    digitalWrite(actuatorManager.getPin((Actuator)index), LOW);
+    actuatorManager.deadlineExpired[index] = true;
+}
+
+void ActuatorManager::armDeadline(Actuator actuator, unsigned long durationMs)
+{
+    if (deadlineTimers[actuator] == nullptr) return;
+
+    // esp_timer_start_once() on an already-running one-shot fails - stopping
+    // first is the documented safe re-arm sequence, and is a harmless no-op
+    // if the timer isn't currently running (already fired or never started).
+    esp_timer_stop(deadlineTimers[actuator]);
+    deadlineExpired[actuator] = false;
+    esp_timer_start_once(deadlineTimers[actuator], (uint64_t)durationMs * 1000ULL);
+}
+
+void ActuatorManager::disarmDeadline(Actuator actuator)
+{
+    if (deadlineTimers[actuator] == nullptr) return;
+    // Harmless no-op if not currently running (already fired, or this
+    // actuator was never armed for the run that's ending).
+    esp_timer_stop(deadlineTimers[actuator]);
 }
 
 bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, String& outReason, bool runningValidation)
@@ -377,24 +483,35 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                const float phUpLimit = runningValidation
-                    ? systemState.phTargetMin : systemState.minPH;
-                const float phDownLimit = runningValidation
-                    ? systemState.phTargetMax : systemState.maxPH;
-                if (actuator == PH_UP_PUMP && sensors.ph >= phUpLimit)
+                // SOFT rule ("pH already inside the configured target range") -
+                // the only check in this block an explicit manual override may
+                // bypass. Bypassing it also suppresses the runningValidation
+                // early-stop-on-target-reached signal for this command, so an
+                // overridden dose simply runs for its existing bounded
+                // MANUAL_PUMP_RUNTIME pulse instead of self-stopping the
+                // instant it re-enters the (tighter) completion band - the
+                // pulse duration is what makes this safe, not this check.
+                if (!statuses[actuator].overrideActive)
                 {
-                    outReason = runningValidation
-                        ? "pH Up complete: Minimum pH threshold reached."
-                        : "pH Up rejected: Current pH does not require an increase.";
-                    return false;
-                }
+                    const float phUpLimit = runningValidation
+                        ? systemState.phTargetMin : systemState.minPH;
+                    const float phDownLimit = runningValidation
+                        ? systemState.phTargetMax : systemState.maxPH;
+                    if (actuator == PH_UP_PUMP && sensors.ph >= phUpLimit)
+                    {
+                        outReason = runningValidation
+                            ? "pH Up complete: Minimum pH threshold reached."
+                            : "pH Up rejected: Current pH does not require an increase.";
+                        return false;
+                    }
 
-                if (actuator == PH_DOWN_PUMP && sensors.ph <= phDownLimit)
-                {
-                    outReason = runningValidation
-                        ? "pH Down complete: Maximum pH threshold reached."
-                        : "pH Down rejected: Current pH does not require a decrease.";
-                    return false;
+                    if (actuator == PH_DOWN_PUMP && sensors.ph <= phDownLimit)
+                    {
+                        outReason = runningValidation
+                            ? "pH Down complete: Maximum pH threshold reached."
+                            : "pH Down rejected: Current pH does not require a decrease.";
+                        return false;
+                    }
                 }
             }
 
@@ -406,14 +523,19 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                const float ecLimit = runningValidation
-                    ? systemState.ecTargetMin : systemState.minEC;
-                if (sensors.ec >= ecLimit)
+                // SOFT rule ("EC already inside the configured target range") -
+                // same override treatment as the pH block above.
+                if (!statuses[actuator].overrideActive)
                 {
-                    outReason = runningValidation
-                        ? "Nutrient dosing complete: Minimum EC threshold reached."
-                        : "Nutrient dosing rejected: Current EC does not require correction.";
-                    return false;
+                    const float ecLimit = runningValidation
+                        ? systemState.ecTargetMin : systemState.minEC;
+                    if (sensors.ec >= ecLimit)
+                    {
+                        outReason = runningValidation
+                            ? "Nutrient dosing complete: Minimum EC threshold reached."
+                            : "Nutrient dosing rejected: Current EC does not require correction.";
+                        return false;
+                    }
                 }
             }
             break;
@@ -453,15 +575,19 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                     return false;
                 }
 
-                const float threshold = runningValidation
-                    ? systemState.refillStopLevel
-                    : systemState.refillStartLevel;
-                if (sensors.waterLevel >= threshold)
+                // SOFT rule ("refill not currently required") - overridable.
+                if (!statuses[actuator].overrideActive)
                 {
-                    outReason = runningValidation
-                        ? "Refill complete: Stop level reached."
-                        : "Refill rejected: Water level is above the refill start threshold.";
-                    return false;
+                    const float threshold = runningValidation
+                        ? systemState.refillStopLevel
+                        : systemState.refillStartLevel;
+                    if (sensors.waterLevel >= threshold)
+                    {
+                        outReason = runningValidation
+                            ? "Refill complete: Stop level reached."
+                            : "Refill rejected: Water level is above the refill start threshold.";
+                        return false;
+                    }
                 }
             }
             break;
@@ -493,16 +619,25 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             }
             if (manual)
             {
-                const float threshold = runningValidation
-                    ? systemState.coolerOffTemp
-                    : systemState.highWaterTemp;
-                if (sensors.waterTemp <= threshold)
+                // SOFT rule ("water temperature already within target") -
+                // overridable. NOTE: unlike the dosing pumps, Peltier's
+                // manual runtime cap is the much longer OPERATION_TIMEOUT_MS
+                // (5 min, Config.h) - an override here can keep cooling
+                // running for up to that whole window rather than a short
+                // pulse. Flagged for a policy decision; not changed here.
+                if (!statuses[actuator].overrideActive)
                 {
-                    automationManager.setManualCoolingDemand(false);
-                    outReason = runningValidation
-                        ? "Cooling complete: Cooler-off temperature reached."
-                        : "Peltier rejected: Water temperature does not require cooling.";
-                    return false;
+                    const float threshold = runningValidation
+                        ? systemState.coolerOffTemp
+                        : systemState.highWaterTemp;
+                    if (sensors.waterTemp <= threshold)
+                    {
+                        automationManager.setManualCoolingDemand(false);
+                        outReason = runningValidation
+                            ? "Cooling complete: Cooler-off temperature reached."
+                            : "Peltier rejected: Water temperature does not require cooling.";
+                        return false;
+                    }
                 }
 
                 // Contribute to the existing PELTIER demand bit before waiting
@@ -598,6 +733,31 @@ void ActuatorManager::update()
         Actuator a = (Actuator)i;
         ActuatorCommand& cmd = commands[i];
         ActuatorStatus& status = statuses[i];
+
+        // Independent-deadline reconciliation. The esp_timer callback (a
+        // different task context - see onDeadlineExpired()) has already
+        // forced the physical GPIO OFF the instant the deadline elapsed,
+        // regardless of whether loop() was stalled. This only catches up
+        // ActuatorManager's own FSM/status bookkeeping to match that
+        // physical reality, so actuatorStatus and Android cannot keep
+        // showing RUNNING for an actuator that is already physically off.
+        // Runs before the normal cmd/FSM processing below so it always takes
+        // precedence for this tick.
+        if (deadlineExpired[i])
+        {
+            deadlineExpired[i] = false;
+            if (status.state == ActuatorCommandState::RUNNING ||
+                status.state == ActuatorCommandState::ACTIVATING)
+            {
+                turnOff(a);
+                status.running = false;
+                status.state = ActuatorCommandState::OFF;
+                status.reason = "Safety limit: independent deadline expired";
+                manuallyOverridden[i] = false;
+                statusDirty = true;
+            }
+        }
+
         const ActuatorStatus previousStatus = status;
 
         if (cmd.isPending)
@@ -607,7 +767,11 @@ void ActuatorManager::update()
             status.speed = cmd.speed;
             status.strategy = cmd.source == "automatic" ? cmd.strategy : "";
             status.reason = cmd.reason;
-            
+            // Mirrors onto status (not just the transient command) so the
+            // continuous RUNNING-state re-check below can see it for as long
+            // as this actuator keeps running under this command.
+            status.overrideActive = cmd.overrideRequested;
+
             if (cmd.targetState)
             {
                 if (status.state == ActuatorCommandState::OFF || status.state == ActuatorCommandState::REJECTED || status.state == ActuatorCommandState::STOPPING)
@@ -773,6 +937,14 @@ void ActuatorManager::update()
                         statuses[PELTIER].state = ActuatorCommandState::OFF;
                         statuses[PELTIER].reason = "Peltier stopped: Circulation unavailable.";
                         manuallyOverridden[PELTIER] = false;
+                        // Out-of-band stop (this is CIRCULATION_PUMP's own
+                        // iteration, not PELTIER's) - the generic
+                        // running-transition arm/disarm below only observes
+                        // transitions within an actuator's own iteration, so
+                        // PELTIER's independent deadline needs this explicit
+                        // disarm to avoid firing into whatever PELTIER runs
+                        // next.
+                        disarmDeadline(PELTIER);
                         automationManager.setManualCoolingDemand(false);
                         systemState.coolingSubsystemLocked = true;
                         statusDirty = true;
@@ -792,6 +964,26 @@ void ActuatorManager::update()
                     stateChanged = true;
                     break;
             }
+        }
+
+        // Single point of truth for arming/disarming this actuator's
+        // independent deadline, covering every path that can start or stop
+        // it this tick (explicit command, hard-safety stop, soft-rule stop,
+        // loop-polled timeout) without needing a call at each individual
+        // site. The one exception - PELTIER forced off from CIRCULATION_PUMP's
+        // own iteration above - is out-of-band and disarms itself explicitly
+        // where that happens, since it is not observable as a transition
+        // within PELTIER's own iteration.
+        if (!previousStatus.running && status.running)
+        {
+            if (isDeadlineProtected(a) && isManualSource(status.source))
+            {
+                armDeadline(a, manualDeadlineMs(a));
+            }
+        }
+        else if (previousStatus.running && !status.running)
+        {
+            disarmDeadline(a);
         }
 
         if (actuatorStatusDiffers(previousStatus, status))

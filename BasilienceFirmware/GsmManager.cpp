@@ -3,8 +3,7 @@
 
 void GsmManager::begin()
 {
-    serial.begin(GSM_BAUD_RATE, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
-    Serial.println("[GSM] Initializing A7680C");
+    Serial.println("[GSM] Initializing SIM800L");
 
     state = State::WAITING_FOR_MODULE;
     lastResult = SendResult::NONE;
@@ -12,11 +11,27 @@ void GsmManager::begin()
     rxBuffer = "";
     pendingNumber = "";
     pendingMessage = "";
+    baudCandidateIndex = 0;
 
     // First probe fires immediately; begin() only writes a few bytes to the
     // UART and returns, so this does not block setup().
+    beginSerialAtCurrentBaudCandidate();
     stageStartedAt = millis();
     sendCommand("AT");
+}
+
+// (Re)opens the GSM UART at BAUD_CANDIDATES[baudCandidateIndex]. HardwareSerial::
+// begin() on this core tears down and reconfigures the peripheral itself, so
+// calling it again with a different rate - which updateWaitingForModule() does
+// each time a candidate's window expires with no "OK" - is safe and does not
+// require an explicit end() first.
+void GsmManager::beginSerialAtCurrentBaudCandidate()
+{
+    const unsigned long baud = BAUD_CANDIDATES[baudCandidateIndex];
+    serial.begin(baud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    Serial.print("[GSM] Probing at ");
+    Serial.print(baud);
+    Serial.println(" baud");
 }
 
 void GsmManager::update()
@@ -142,7 +157,9 @@ void GsmManager::updateWaitingForModule(unsigned long now)
 {
     if (rxBuffer.indexOf("OK") >= 0)
     {
-        Serial.println("[GSM] Module responding");
+        Serial.print("[GSM] Module responding at ");
+        Serial.print(BAUD_CANDIDATES[baudCandidateIndex]);
+        Serial.println(" baud");
         rxBuffer = "";
         state = State::CHECKING_SIM;
         stageStartedAt = now;
@@ -153,6 +170,14 @@ void GsmManager::updateWaitingForModule(unsigned long now)
     if (now - stageStartedAt >= MODULE_PROBE_RETRY_INTERVAL_MS)
     {
         stageStartedAt = now;
+
+        // No "OK" within this candidate's window - move to the next baud
+        // and reopen the UART there before probing again. Wraps around
+        // indefinitely (same "never give up, just keep polling" policy this
+        // state already used for a single baud) so a module that's slow to
+        // power up is still found eventually, not just on this pass.
+        baudCandidateIndex = (baudCandidateIndex + 1) % BAUD_CANDIDATE_COUNT;
+        beginSerialAtCurrentBaudCandidate();
         sendCommand("AT");
     }
 }
@@ -165,7 +190,7 @@ void GsmManager::updateCheckingSim(unsigned long now)
         rxBuffer = "";
         state = State::CHECKING_REGISTRATION;
         stageStartedAt = now;
-        sendCommand("AT+CEREG?");
+        sendCommand("AT+CREG?");
         return;
     }
 
@@ -181,12 +206,15 @@ void GsmManager::updateCheckingSim(unsigned long now)
 
 void GsmManager::updateCheckingRegistration(unsigned long now)
 {
-    // A76XX is an LTE Cat1 module, so EPS registration (AT+CEREG?) is the
-    // appropriate query rather than legacy circuit-switched AT+CREG?.
-    // Response shape: "+CEREG: <n>,<stat>[,...]" - stat 1 = registered home,
-    // 5 = registered roaming. The status digit always immediately follows
-    // the first comma in both the 2-value and extended (5-value) forms.
-    int tagIdx = rxBuffer.indexOf("+CEREG:");
+    // SIM800L is 2G/GPRS-only and has no EPS stack, so registration is
+    // checked with legacy circuit-switched AT+CREG? rather than AT+CEREG?
+    // (the previous module was LTE Cat1 and needed EPS registration).
+    // Response shape: "+CREG: <n>,<stat>[,...]" - stat 1 = registered home,
+    // 5 = registered roaming. Same shape and status codes as CEREG, so only
+    // the command/tag string changes here - the status digit still always
+    // immediately follows the first comma in both the 2-value and extended
+    // (5-value) forms.
+    int tagIdx = rxBuffer.indexOf("+CREG:");
     if (tagIdx >= 0)
     {
         int commaIdx = rxBuffer.indexOf(',', tagIdx);
@@ -207,7 +235,7 @@ void GsmManager::updateCheckingRegistration(unsigned long now)
     if (now - stageStartedAt >= REGISTRATION_RETRY_INTERVAL_MS)
     {
         stageStartedAt = now;
-        sendCommand("AT+CEREG?");
+        sendCommand("AT+CREG?");
     }
 }
 
