@@ -2911,6 +2911,21 @@ void FirebaseManager::writeStatus()
         "currentMode",
         (int)systemState.currentMode);
 
+    // Correction direction, mirrored for Android's manual-command advisor -
+    // systemState.phDirection/ecDirection already drive DOSING_PH/DOSING_EC
+    // internally (AutomationManager) but had no RTDB representation before
+    // this. Lets the app tell "stabilizing after raising" from "...lowering"
+    // without guessing from alert flags that can clear before stabilization ends.
+    json.set(
+        "phDirection",
+        systemState.phDirection == PH_UP ? "up" :
+        systemState.phDirection == PH_DOWN ? "down" : "none");
+
+    json.set(
+        "ecDirection",
+        systemState.ecDirection == EC_RAISE ? "raise" :
+        systemState.ecDirection == EC_DILUTE ? "dilute" : "none");
+
     json.set(
         "manualMode",
         systemState.manualMode);
@@ -3092,14 +3107,19 @@ bool FirebaseManager::writeAlerts()
     } while (false)
 
     ADD_ALERT_FIELD(lowWater);
+    ADD_ALERT_FIELD(waterLevelLow);
+    ADD_ALERT_FIELD(waterLevelHigh);
     ADD_ALERT_FIELD(ecLow);
     ADD_ALERT_FIELD(ecHigh);
     ADD_ALERT_FIELD(phOutOfRange);
     ADD_ALERT_FIELD(phLow);
     ADD_ALERT_FIELD(phHigh);
     ADD_ALERT_FIELD(waterTempOutOfRange);
+    ADD_ALERT_FIELD(waterTempLow);
     ADD_ALERT_FIELD(lowAirTemperature);
     ADD_ALERT_FIELD(highTemperature);
+    ADD_ALERT_FIELD(humidityLow);
+    ADD_ALERT_FIELD(humidityHigh);
 
     if (sensorFaultPublishingEligible)
     {
@@ -3142,14 +3162,19 @@ bool FirebaseManager::writeAlerts()
     } while (false)
 
     LOG_ALERT_TRANSITION(lowWater);
+    LOG_ALERT_TRANSITION(waterLevelLow);
+    LOG_ALERT_TRANSITION(waterLevelHigh);
     LOG_ALERT_TRANSITION(ecLow);
     LOG_ALERT_TRANSITION(ecHigh);
     LOG_ALERT_TRANSITION(phOutOfRange);
     LOG_ALERT_TRANSITION(phLow);
     LOG_ALERT_TRANSITION(phHigh);
     LOG_ALERT_TRANSITION(waterTempOutOfRange);
+    LOG_ALERT_TRANSITION(waterTempLow);
     LOG_ALERT_TRANSITION(lowAirTemperature);
     LOG_ALERT_TRANSITION(highTemperature);
+    LOG_ALERT_TRANSITION(humidityLow);
+    LOG_ALERT_TRANSITION(humidityHigh);
 
     if (sensorFaultIncluded && sensorFaultChanged)
     {

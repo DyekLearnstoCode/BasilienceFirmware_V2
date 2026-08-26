@@ -788,7 +788,11 @@ void AutomationManager::handleStartup()
                STARTUP_ON_TIME)
             {
                 actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
-                actuatorManager.requestCommand(BLOWER, false, "automatic", millis(), 100, "startup");
+                // Blower is deliberately left commanded on here - the
+                // STARTUP_FOG_OFF case below takes over on the very next
+                // tick and keeps it on for BLOWER_PURGE_MS using the same
+                // stateStartTime reset just below, so it is never actually
+                // turned off and immediately back on.
 
                 startupPhase =
                     STARTUP_FOG_OFF;
@@ -803,10 +807,18 @@ void AutomationManager::handleStartup()
         case STARTUP_FOG_OFF:
         {
             actuatorManager.requestCommand(FOGGER, false, "automatic", millis(), 100, "startup");
-            actuatorManager.requestCommand(BLOWER, false, "automatic", millis(), 100, "startup");
 
-            if(millis() -
-               systemState.stateStartTime >=
+            unsigned long elapsedInOff =
+                millis() - systemState.stateStartTime;
+
+            // Blower purge: stays on for the first BLOWER_PURGE_MS of the
+            // startup rest phase to clear fog concentrated near the
+            // reservoir toward the root chamber, then off for the
+            // remainder of the unchanged STARTUP_OFF_TIME window.
+            actuatorManager.requestCommand(
+                BLOWER, elapsedInOff < BLOWER_PURGE_MS, "automatic", millis(), 100, "startup");
+
+            if(elapsedInOff >=
                STARTUP_OFF_TIME)
             {
                 fogCycleOn = true;
@@ -1463,8 +1475,14 @@ void AutomationManager::processFogCycle()
         actuatorManager.requestCommand(
             FOGGER, false, "automatic", millis(), 100, activeFogStrategy);
 
+        // Blower purge: stays on for the first BLOWER_PURGE_MS of the
+        // OFF/rest window to clear fog concentrated near the reservoir
+        // toward the root chamber, then off for the remainder of the
+        // unchanged fogOffTime window - elapsed is already measured from
+        // the same ON->OFF transition instant, so this never extends the
+        // total NORMAL/HOT/COLD cycle length.
         actuatorManager.requestCommand(
-            BLOWER, false, "automatic", millis(), 100, activeFogStrategy);
+            BLOWER, elapsed < BLOWER_PURGE_MS, "automatic", millis(), 100, activeFogStrategy);
 
         if(elapsed >= fogOffTime)
         {

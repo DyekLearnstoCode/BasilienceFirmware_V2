@@ -35,6 +35,25 @@ void SensorManager::begin()
 
     waterSensor.begin();
 
+    Serial.print("[DS18B20] GPIO: ");
+    Serial.println(WATER_TEMP_PIN);
+
+    waterSensorDeviceCount = waterSensor.getDeviceCount();
+    Serial.print("[DS18B20] Devices found: ");
+    Serial.println(waterSensorDeviceCount);
+
+    if (waterSensorDeviceCount > 0)
+    {
+        waterSensorAddressValid = waterSensor.getAddress(waterSensorAddress, 0);
+        if (!waterSensorAddressValid)
+        {
+            Serial.println("[DS18B20] Device present but address could not be retrieved - falling back to index-based read");
+        }
+    }
+    // A count of 0 here is not fatal - readWaterTemperature() re-enumerates
+    // on its own throttled cadence and recovers automatically if the probe
+    // wasn't settled yet at this point in boot (see its own comment).
+
     analogReadResolution(12);
 
     analogSetAttenuation(ADC_11db);
@@ -345,12 +364,67 @@ void SensorManager::readWaterTemperature()
     }
     lastWaterTempReadTime = millis();
 
-    waterSensor.requestTemperatures();
+    if (waterSensorDeviceCount == 0)
+    {
+        // Re-enumerate on the same throttled cadence as the read itself - no
+        // new timer, no delay(). Recovers automatically if the probe wasn't
+        // settled/responding yet at begin() (e.g. long cable run, power-up
+        // settling) and starts answering later.
+        waterSensor.begin();
+        waterSensorDeviceCount = waterSensor.getDeviceCount();
 
-    float temp =
-        waterSensor.getTempCByIndex(0);
+        if (waterSensorDeviceCount > 0)
+        {
+            Serial.print("[DS18B20] Device found on retry - count: ");
+            Serial.println(waterSensorDeviceCount);
+            waterSensorAddressValid = waterSensor.getAddress(waterSensorAddress, 0);
+        }
+    }
 
-    if (temp == DEVICE_DISCONNECTED_C || !isfinite(temp))
+    float temp = NAN;
+    if (waterSensorDeviceCount > 0)
+    {
+        waterSensor.requestTemperatures();
+        temp = waterSensorAddressValid
+            ? waterSensor.getTempC(waterSensorAddress)
+            : waterSensor.getTempCByIndex(0);
+    }
+
+    // DS18B20 commonly returns exactly 85.00C as a power-on/default
+    // conversion result rather than a real reading (its scratchpad reset
+    // value) - a small float tolerance avoids an unsafe exact comparison
+    // while still only catching that specific default, not a genuine
+    // ~85C reading (implausible for a hydroponic reservoir regardless).
+    const bool powerOnDefault = fabsf(temp - 85.0f) < 0.01f;
+
+    if (waterSensorDeviceCount == 0)
+    {
+        Serial.println("[DS18B20] Raw: no device enumerated");
+    }
+    else if (temp == DEVICE_DISCONNECTED_C)
+    {
+        Serial.println("[DS18B20] Raw: -127.00 C (DEVICE_DISCONNECTED_C)");
+    }
+    else if (powerOnDefault)
+    {
+        Serial.print("[DS18B20] Raw: "); Serial.print(temp, 2); Serial.println(" C (power-on/default)");
+    }
+    else if (!isfinite(temp))
+    {
+        Serial.println("[DS18B20] Raw: invalid (non-finite)");
+    }
+    else
+    {
+        Serial.print("[DS18B20] Raw: "); Serial.print(temp, 2); Serial.println(" C");
+    }
+
+    const bool invalid =
+        waterSensorDeviceCount == 0 ||
+        temp == DEVICE_DISCONNECTED_C ||
+        !isfinite(temp) ||
+        powerOnDefault;
+
+    if (invalid)
     {
         if (waterTempFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
         {
@@ -358,14 +432,14 @@ void SensorManager::readWaterTemperature()
 
             if (waterTempFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
             {
-                Serial.print("[SENSOR] Water temperature transient read failure ");
+                Serial.print("[DS18B20] transient failure ");
                 Serial.print(waterTempFailureStreak);
                 Serial.print("/");
                 Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
             }
             else
             {
-                Serial.println("[SENSOR] Water temperature confirmed unavailable");
+                Serial.println("[DS18B20] confirmed unavailable");
                 physicalSensors.waterTemp = NAN;
             }
         }
@@ -375,7 +449,9 @@ void SensorManager::readWaterTemperature()
 
     if (waterTempFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
     {
-        Serial.println("[SENSOR] Water temperature recovered");
+        Serial.print("[DS18B20] recovered: ");
+        Serial.print(temp, 2);
+        Serial.println(" C");
     }
 
     waterTempFailureStreak = 0;

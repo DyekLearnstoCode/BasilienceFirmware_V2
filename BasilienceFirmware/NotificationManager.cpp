@@ -46,29 +46,43 @@ void NotificationManager::observeAlertTransitions()
         return;
     }
 
+    // Cloud-replay ownership: while online, /alerts already reaches Firestore
+    // directly via onAlertUpdated (immediate FCM + history) the instant
+    // writeAlerts() publishes the same transition - queuing these same four
+    // types for cloud replay too produced a second, differently-worded
+    // Firestore history document under a different eventId scheme with
+    // nothing to deduplicate the two (see the task report's duplicate-history
+    // audit). Cloud replay is therefore only needed as the offline fallback,
+    // matching the ownership DEVICE_UNREACHABLE/HARVEST_DUE already use below
+    // (backend owns online history for both cases - its own independent
+    // presence detection there, the direct /alerts watch here). SMS
+    // eligibility is untouched: a farmer's phone connectivity is independent
+    // of the device's, so the redundant delivery channel stays unconditional.
+    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+
     if (alertState.lowWater && !lastObservedAlerts.lowWater)
     {
         enqueueEvent(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
                      "Low Reservoir", "Water level dropped below the refill threshold.",
-                     String(millis()), true, true);
+                     String(millis()), true, !cloudUp);
     }
     if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange)
     {
         enqueueEvent(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Water Temperature", "Water temperature exceeded the configured limit.",
-                     String(millis()), true, true);
+                     String(millis()), true, !cloudUp);
     }
     if (alertState.highTemperature && !lastObservedAlerts.highTemperature)
     {
         enqueueEvent(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Air Temperature", "Air temperature exceeded the configured limit.",
-                     String(millis()), true, true);
+                     String(millis()), true, !cloudUp);
     }
     if (alertState.sensorFault && !lastObservedAlerts.sensorFault)
     {
         enqueueEvent(NotificationEventType::SENSOR_FAULT, NotificationSeverity::SEV_CRITICAL,
                      "Sensor Fault", "One or more sensors are reporting invalid readings.",
-                     String(millis()), true, true);
+                     String(millis()), true, !cloudUp);
     }
 
     lastObservedAlerts = alertState;

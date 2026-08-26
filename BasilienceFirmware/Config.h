@@ -277,7 +277,7 @@ constexpr unsigned long EC_DOSE_COOLDOWN =
 constexpr unsigned long SENSOR_STABILIZATION_TIME = 10000UL;
 
 constexpr unsigned long STARTUP_ON_TIME =
-    60UL * 1000UL; // 1 minute
+    180UL * 1000UL; // 3 minutes
 
 constexpr unsigned long STARTUP_OFF_TIME =
     60UL * 1000UL; // 1 minute
@@ -299,6 +299,13 @@ constexpr unsigned long COLD_FOG_ON_TIME =
 
 constexpr unsigned long COLD_FOG_OFF_TIME =
     5UL * 60UL * 1000UL; // 5 minutes
+
+// Short Blower overrun after the Fogger turns off (automatic fogging and
+// startup fogging alike) to clear fog concentrated near the reservoir toward
+// the root chamber. Consumes the front of the existing OFF/rest window -
+// never extends NORMAL/HOT/COLD/STARTUP's total cycle length.
+constexpr unsigned long BLOWER_PURGE_MS =
+    30UL * 1000UL; // 30 seconds
 
 constexpr unsigned long PH_STABILIZATION_TIME = 10000UL;
 constexpr unsigned long EC_STABILIZATION_TIME = 10000UL;

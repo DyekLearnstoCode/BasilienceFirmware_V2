@@ -63,6 +63,17 @@ private:
     uint8_t waterTempFailureStreak = 0;
     float lastValidWaterTemp = NAN;
 
+    // DS18B20 enumeration state. 0 devices at boot is re-checked on the same
+    // throttled WATER_TEMP_READ_INTERVAL_MS cadence readWaterTemperature()
+    // already uses - no separate timer - so a probe that wasn't settled yet
+    // at begin() is picked up automatically once it starts responding.
+    // waterSensorAddress is cached once enumeration succeeds so normal reads
+    // use DallasTemperature::getTempC(address) instead of re-walking the
+    // OneWire bus search on every getTempCByIndex(0) call.
+    uint8_t waterSensorDeviceCount = 0;
+    DeviceAddress waterSensorAddress = {0};
+    bool waterSensorAddressValid = false;
+
     enum class EcCompensationSource { LIVE, LAST_VALID, FALLBACK_DEFAULT };
     EcCompensationSource lastEcCompensationSource = EcCompensationSource::LIVE;
 
