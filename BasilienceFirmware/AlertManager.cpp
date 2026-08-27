@@ -34,6 +34,24 @@ void AlertManager::setAlert(const char* name, bool& currentValue, bool nextValue
     Serial.println(millis());
 }
 
+void AlertManager::setAlertDebounced(const char* name, bool& currentValue,
+                                     bool nextValue, uint8_t& pendingCount)
+{
+    if (!nextValue)
+    {
+        pendingCount = 0;
+        setAlert(name, currentValue, false);
+        return;
+    }
+
+    if (pendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        pendingCount++;
+    }
+
+    setAlert(name, currentValue, pendingCount >= SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+}
+
 void AlertManager::update()
 {
     // Mirrors the same gate SensorManager applies to the effective sensor
@@ -74,15 +92,18 @@ void AlertManager::updateLowWaterAlert()
     // CONTROL signal - stays on refillStartLevel because automatic refill is
     // driven by it. Retargeting this at minWaterLevel would change when the
     // valve opens, which is a control change, not a reporting one.
-    setAlert("lowWater", alertState.lowWater,
-        valid && sensors.waterLevel < systemState.refillStartLevel);
+    setAlertDebounced("lowWater", alertState.lowWater,
+        valid && sensors.waterLevel < systemState.refillStartLevel,
+        lowWaterPendingCount);
 
     // TARGET-RANGE classification, reported alongside it.
-    setAlert("waterLevelLow", alertState.waterLevelLow,
-        valid && sensors.waterLevel < systemState.minWaterLevel);
+    setAlertDebounced("waterLevelLow", alertState.waterLevelLow,
+        valid && sensors.waterLevel < systemState.minWaterLevel,
+        waterLevelLowPendingCount);
 
-    setAlert("waterLevelHigh", alertState.waterLevelHigh,
-        valid && sensors.waterLevel > systemState.maxWaterLevel);
+    setAlertDebounced("waterLevelHigh", alertState.waterLevelHigh,
+        valid && sensors.waterLevel > systemState.maxWaterLevel,
+        waterLevelHighPendingCount);
 }
 
 void AlertManager::updateTemperatureAlert()
@@ -94,26 +115,30 @@ void AlertManager::updateTemperatureAlert()
     // was a fogging-strategy value rather than a user-facing bound. Canopy fan
     // control is unaffected: handleCanopyClimate() reads highAirTemp /
     // airTempRelease directly and never consults these flags.
-    setAlert(
+    setAlertDebounced(
         "lowAirTemperature",
         alertState.lowAirTemperature,
-        valid && sensors.temperature < systemState.minAirTemp);
+        valid && sensors.temperature < systemState.minAirTemp,
+        lowAirTemperaturePendingCount);
 
-    setAlert(
+    setAlertDebounced(
         "highTemperature",
         alertState.highTemperature,
-        valid && sensors.temperature > systemState.maxAirTemp);
+        valid && sensors.temperature > systemState.maxAirTemp,
+        highTemperaturePendingCount);
 }
 
 void AlertManager::updateHumidityAlert()
 {
     const bool valid = isfinite(sensors.humidity);
 
-    setAlert("humidityLow", alertState.humidityLow,
-        valid && sensors.humidity < systemState.minHumidity);
+    setAlertDebounced("humidityLow", alertState.humidityLow,
+        valid && sensors.humidity < systemState.minHumidity,
+        humidityLowPendingCount);
 
-    setAlert("humidityHigh", alertState.humidityHigh,
-        valid && sensors.humidity > systemState.maxHumidity);
+    setAlertDebounced("humidityHigh", alertState.humidityHigh,
+        valid && sensors.humidity > systemState.maxHumidity,
+        humidityHighPendingCount);
 }
 
 void AlertManager::updateWaterTemperatureAlert()
@@ -124,15 +149,17 @@ void AlertManager::updateWaterTemperatureAlert()
     // highWaterTemp / coolerOffTemp directly.
     const bool valid = isfinite(sensors.waterTemp);
 
-    setAlert(
+    setAlertDebounced(
         "waterTempOutOfRange",
         alertState.waterTempOutOfRange,
-        valid && sensors.waterTemp > systemState.maxWaterTemp);
+        valid && sensors.waterTemp > systemState.maxWaterTemp,
+        waterTempOutOfRangePendingCount);
 
-    setAlert(
+    setAlertDebounced(
         "waterTempLow",
         alertState.waterTempLow,
-        valid && sensors.waterTemp < systemState.minWaterTemp);
+        valid && sensors.waterTemp < systemState.minWaterTemp,
+        waterTempLowPendingCount);
 }
 
 
@@ -143,22 +170,27 @@ void AlertManager::updatePHAlert()
     const bool low = valid && sensors.ph < systemState.minPH;
     const bool high = valid && sensors.ph > systemState.maxPH;
 
-    setAlert("phLow", alertState.phLow, low);
-    setAlert("phHigh", alertState.phHigh, high);
-    setAlert("phOutOfRange", alertState.phOutOfRange, low || high);
+    setAlertDebounced("phLow", alertState.phLow, low, phLowPendingCount);
+    setAlertDebounced("phHigh", alertState.phHigh, high, phHighPendingCount);
+    // Derived from the two flags above, which are already debounced - no
+    // separate pending counter needed here.
+    setAlert("phOutOfRange", alertState.phOutOfRange,
+        alertState.phLow || alertState.phHigh);
 }
 
 void AlertManager::updateECAlert()
 {
-    setAlert(
+    setAlertDebounced(
         "ecLow",
         alertState.ecLow,
-        isfinite(sensors.ec) && sensors.ec < systemState.minEC);
+        isfinite(sensors.ec) && sensors.ec < systemState.minEC,
+        ecLowPendingCount);
 
-    setAlert(
+    setAlertDebounced(
         "ecHigh",
         alertState.ecHigh,
-        isfinite(sensors.ec) && sensors.ec > systemState.maxEC);
+        isfinite(sensors.ec) && sensors.ec > systemState.maxEC,
+        ecHighPendingCount);
 }
 
 void AlertManager::updateSensorFaultAlert()

@@ -24,6 +24,13 @@ constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 1000UL;
 // pulseIn() timeouts unrelated to the sensor or wiring actually failing.
 constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 300UL;
 
+// Minimum spacing between DHT22 samples. The DHT22 datasheet requires at
+// least ~2s between reads; without this, readDHT() re-samples on literally
+// every loop iteration - far faster than the sensor can actually answer -
+// which is why humidity/air temperature would intermittently blank out and
+// reappear even though the sensor itself never lost contact.
+constexpr unsigned long DHT_READ_INTERVAL_MS = 2000UL;
+
 // How long a unit that booted into a PERSISTED mock source waits for a fresh
 // mock payload before giving up and reverting to physical sensors.
 //

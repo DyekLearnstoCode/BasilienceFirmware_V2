@@ -85,6 +85,14 @@ private:
     unsigned long lastWaterLevelReadTime = 0;
     uint8_t waterLevelFailureStreak = 0;
 
+    // DHT22 read scheduling and transient-failure tolerance, mirroring the
+    // water-temperature/water-level pattern above. physicalSensors.humidity/
+    // temperature only become NaN once a scheduled read has failed
+    // DHT_READ_INTERVAL_MS-spaced attempts consecutively for
+    // SENSOR_TRANSIENT_FAILURE_THRESHOLD times.
+    unsigned long lastDhtReadTime = 0;
+    uint8_t dhtFailureStreak = 0;
+
     // =====================================================
     // Sensor Reading Functions
     // =====================================================

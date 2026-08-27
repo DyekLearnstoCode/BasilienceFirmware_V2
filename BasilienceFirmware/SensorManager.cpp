@@ -331,6 +331,18 @@ float SensorManager::measureDistanceCM()
 
 void SensorManager::readDHT()
 {
+    // The DHT22 needs real settling time between samples; re-reading on every
+    // loop iteration is far faster than the sensor can actually answer and is
+    // a common cause of spurious checksum/timeout failures unrelated to the
+    // sensor or wiring actually failing. Not due yet simply means the last
+    // values are kept - they must never be invalidated merely because a new
+    // read isn't scheduled.
+    if (millis() - lastDhtReadTime < DHT_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastDhtReadTime = millis();
+
     float humidity =
         dht.readHumidity();
 
@@ -339,10 +351,33 @@ void SensorManager::readDHT()
 
     if (isnan(humidity) || isnan(temperature))
     {
-        physicalSensors.humidity = NAN;
-        physicalSensors.temperature = NAN;
+        if (dhtFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            dhtFailureStreak++;
+
+            if (dhtFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                Serial.print("[DHT22] transient failure ");
+                Serial.print(dhtFailureStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+            else
+            {
+                Serial.println("[DHT22] confirmed unavailable");
+                physicalSensors.humidity = NAN;
+                physicalSensors.temperature = NAN;
+            }
+        }
+        // Already confirmed unavailable - stays NaN, no repeated logging.
         return;
     }
+
+    if (dhtFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        Serial.println("[DHT22] recovered");
+    }
+    dhtFailureStreak = 0;
 
     physicalSensors.humidity =
         humidity;
