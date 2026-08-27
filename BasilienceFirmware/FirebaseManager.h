@@ -117,6 +117,10 @@ private:
     bool refillRejectionLogged = false;
     float lastRejectedRefillStart = NAN;
     float lastRejectedRefillStop = NAN;
+    bool waterLevelCalibrationInitialized = false;
+    bool waterLevelCalibrationRejectionLogged = false;
+    float lastRejectedWaterLevelEmptyCm = NAN;
+    float lastRejectedWaterLevelFullCm = NAN;
     bool highAirTempSettingsInitialized = false;
     bool highAirTempRejectionLogged = false;
     float lastRejectedHighAirTemp = NAN;
@@ -198,6 +202,14 @@ private:
     void readMockSensors();
     void readSensorTestCommand();
     void setSensorTestEnabled(bool enabled, bool publishAcknowledgement = true);
+
+    // Developer testing override that bypasses ONLY the automatic
+    // water-level/refill gate (AutomationManager's handleNormal(),
+    // processReadyLocalRegulation(), handleRefilling()). Mirrors
+    // readSensorTestCommand()/setSensorTestEnabled()'s shape exactly - see
+    // those for the established command/status RTDB pattern this follows.
+    void readWaterLevelOverrideCommand();
+    void setIgnoreWaterLevelAutomation(bool enabled, bool publishAcknowledgement = true);
 
     void provisionDevice();
 

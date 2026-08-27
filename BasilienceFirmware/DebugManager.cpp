@@ -144,6 +144,12 @@ void DebugManager::printSensors()
         "%",
         1);
 
+    printFloat(
+        "Water Level Distance",
+        sensors.waterLevelDistanceCm,
+        "cm",
+        2);
+
     printInteger(
         "EC ADC",
         sensors.ecRaw,
@@ -224,6 +230,20 @@ void DebugManager::printActuators()
     printBool(
         "Peltier",
         actuatorManager.isOn(PELTIER));
+
+    // Speed (PWM duty, 0-100) only actually varies for the two PWM-capable
+    // actuators - see ActuatorManager::isPwmActuator(). Printed here rather
+    // than folded into the ON/OFF lines above so a commanded-but-unapplied
+    // speed change is visible on its own.
+    printInteger(
+        "Canopy Fan Speed",
+        actuatorManager.getStatus(CANOPY_FAN).speed,
+        "%");
+
+    printInteger(
+        "Blower Speed",
+        actuatorManager.getStatus(BLOWER).speed,
+        "%");
 
     printSeparator();
 }

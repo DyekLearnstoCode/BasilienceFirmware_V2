@@ -124,6 +124,8 @@ void SensorManager::resolveLocalSensorSource()
     }
     else
     {
+        physicalPhEcSettledAt = millis();
+
         Serial.println("[AUTOMATION] Sensor source=PHYSICAL (local)");
     }
 }
@@ -171,6 +173,7 @@ void SensorManager::updateMockBootWait()
     mockBootWaitingForPayload = false;
 
     systemState.mockSensorsEnabled = false;
+    physicalPhEcSettledAt = millis();
     persistSensorSource(false);
 
     // Drop the empty mock dataset so nothing stale can be read back if mock
@@ -283,7 +286,28 @@ void SensorManager::applyEffectiveSensors()
     }
     else
     {
+        // The cloud/local switch away from mock happens between one tick's
+        // applyEffectiveSensors() call and the next - lastReportedMockSource
+        // still holds last tick's value here, so this fires exactly once on
+        // the transition, before it's overwritten below.
+        if (lastReportedMockSource)
+        {
+            physicalPhEcSettledAt = millis();
+        }
+
         sensors = physicalSensors;
+
+        // pH/EC probes need time to electrically settle after physical
+        // sensors (re)become the active source - see PH_EC_ANALOG_SETTLE_TIME.
+        // Held NaN rather than published: a real-looking but still-drifting
+        // reading here would otherwise trip alerts and trigger dosing against
+        // a value the probe hasn't finished producing yet.
+        if (millis() - physicalPhEcSettledAt < PH_EC_ANALOG_SETTLE_TIME)
+        {
+            sensors.ph = NAN;
+            sensors.ec = NAN;
+            sensors.tds = NAN;
+        }
 
         if (systemState.mockApplyPending)
         {
@@ -349,8 +373,16 @@ void SensorManager::readDHT()
     float temperature =
         dht.readTemperature();
 
-    if (isnan(humidity) || isnan(temperature))
+    const bool readOk = !isnan(humidity) && !isnan(temperature);
+    const bool confirmedUnavailable = dhtFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD;
+
+    if (!readOk)
     {
+        // Any failed read cancels a recovery attempt in progress - a
+        // marginal sensor must complete a clean run of good reads to be
+        // trusted again, not just outnumber its bad ones.
+        dhtRecoveryStreak = 0;
+
         if (dhtFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
         {
             dhtFailureStreak++;
@@ -373,11 +405,38 @@ void SensorManager::readDHT()
         return;
     }
 
-    if (dhtFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    if (!confirmedUnavailable)
     {
-        Serial.println("[DHT22] recovered");
+        // Not yet confirmed unavailable (0 to THRESHOLD-1 consecutive
+        // failures) - a good read simply resumes normal operation right
+        // away, same as before the recovery debounce below existed.
+        dhtFailureStreak = 0;
+        physicalSensors.humidity = humidity;
+        physicalSensors.temperature = temperature;
+        return;
     }
+
+    // Confirmed unavailable: require a sustained run of good reads, not
+    // just one, before trusting the sensor again and clearing sensorFault.
+    // A marginal/flickering DHT22 was recovering on a single isolated good
+    // read and immediately failing again, flipping alertState.sensorFault
+    // false/true on every cycle and re-firing the Sensor Fault push
+    // notification each time - this makes recovery symmetric with the
+    // existing failure debounce above instead of instant.
+    dhtRecoveryStreak++;
+
+    if (dhtRecoveryStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        Serial.print("[DHT22] recovery ");
+        Serial.print(dhtRecoveryStreak);
+        Serial.print("/");
+        Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+        return;
+    }
+
+    Serial.println("[DHT22] recovered");
     dhtFailureStreak = 0;
+    dhtRecoveryStreak = 0;
 
     physicalSensors.humidity =
         humidity;
@@ -528,6 +587,7 @@ void SensorManager::readWaterLevel()
                 Serial.println("[SENSOR] Water level confirmed unavailable");
                 physicalSensors.waterLevel = NAN;
                 physicalSensors.waterLevelDistanceCm = NAN;
+                waterLevelHistoryCount = 0;
             }
         }
         // Already confirmed unavailable - stays NaN, no repeated logging.
@@ -540,20 +600,39 @@ void SensorManager::readWaterLevel()
     }
     waterLevelFailureStreak = 0;
 
-    physicalSensors.waterLevelDistanceCm = distance;
+    waterLevelDistanceHistory[waterLevelHistoryIndex] = distance;
+    waterLevelHistoryIndex = (waterLevelHistoryIndex + 1) % 3;
+    if (waterLevelHistoryCount < 3)
+    {
+        waterLevelHistoryCount++;
+    }
 
-    constexpr float EMPTY_DISTANCE = 30.0f;
+    float filteredDistance = distance;
+    if (waterLevelHistoryCount == 3)
+    {
+        const float a = waterLevelDistanceHistory[0];
+        const float b = waterLevelDistanceHistory[1];
+        const float c = waterLevelDistanceHistory[2];
+        filteredDistance = a + b + c - min(a, min(b, c)) - max(a, max(b, c));
+    }
 
-    constexpr float FULL_DISTANCE = 5.0f;
+    physicalSensors.waterLevelDistanceCm = filteredDistance;
+
+    // Configurable per-installation (see Types.h) rather than fixed
+    // constants - the sensor's mounting height and the reservoir's depth
+    // vary per device, so a single hardcoded pair could not match every
+    // physical setup.
+    const float emptyDistance = systemState.waterLevelEmptyDistanceCm;
+    const float fullDistance = systemState.waterLevelFullDistanceCm;
 
     physicalSensors.waterLevel =
         constrain(
 
-            (EMPTY_DISTANCE - distance)
+            (emptyDistance - filteredDistance)
 
                 /
 
-                (EMPTY_DISTANCE - FULL_DISTANCE)
+                (emptyDistance - fullDistance)
 
                 * 100.0f,
 

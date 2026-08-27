@@ -478,7 +478,9 @@
                 "phTargetMax": 6.3,
                 "phTargetMin": 5.8,
                 "refillStartLevel": 20,
-                "refillStopLevel": 75
+                "refillStopLevel": 75,
+                "waterLevelEmptyDistanceCm": 30,
+                "waterLevelFullDistanceCm": 5
             },
             "status": {
                 "coolingSubsystemLocked": false,

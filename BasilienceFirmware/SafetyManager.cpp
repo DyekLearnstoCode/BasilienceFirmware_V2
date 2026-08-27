@@ -314,9 +314,23 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
     bool cleared = false;
     reason = "";
 
+    // Requiring the reading to already be back in range here made the lock a
+    // deadlock: the subsystem trips after MAX_PH_ATTEMPTS/MAX_EC_ATTEMPTS
+    // failed automatic corrections specifically because automation could not
+    // get the reading into range, so a reset that demanded that same
+    // condition could never actually succeed while the real problem
+    // persisted - only a human manually dosing the reservoir by hand could
+    // clear it. Reset Safety is the admin's explicit request for a fresh
+    // attempt, not a claim that the problem is already fixed; it still
+    // requires the sensor itself to be reporting a real, physically valid
+    // number (validPH()/validEC()) so a reset is never granted against a
+    // broken/disconnected probe, but no longer requires the chemistry to
+    // already be corrected. processResetSafetyOperation() zeroes
+    // phAttempts/ecAttempts right after this succeeds, so automation gets a
+    // genuine fresh MAX_*_ATTEMPTS run rather than restarting mid-count.
     if(systemState.phSubsystemLocked)
     {
-        if(validPH() && sensors.ph >= systemState.minPH && sensors.ph <= systemState.maxPH)
+        if(validPH())
         {
             systemState.phSubsystemLocked = false;
             cleared = true;
@@ -326,7 +340,7 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
 
     if(systemState.ecSubsystemLocked)
     {
-        if(validEC() && sensors.ec >= systemState.minEC && sensors.ec <= systemState.maxEC)
+        if(validEC())
         {
             systemState.ecSubsystemLocked = false;
             cleared = true;

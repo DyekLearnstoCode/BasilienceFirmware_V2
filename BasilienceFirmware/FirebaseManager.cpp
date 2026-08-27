@@ -241,6 +241,8 @@ void FirebaseManager::loadPersistedSettings()
         systemState.ecTargetMax = preferences.getFloat("ecTargetMax", systemState.ecTargetMax);
         systemState.refillStartLevel = preferences.getFloat("refillStart", systemState.refillStartLevel);
         systemState.refillStopLevel = preferences.getFloat("refillStop", systemState.refillStopLevel);
+        systemState.waterLevelEmptyDistanceCm = preferences.getFloat("wlEmptyCm", systemState.waterLevelEmptyDistanceCm);
+        systemState.waterLevelFullDistanceCm = preferences.getFloat("wlFullCm", systemState.waterLevelFullDistanceCm);
         systemState.highAirTemp = preferences.getFloat("highAir", systemState.highAirTemp);
         systemState.airTempRelease = preferences.getFloat("airRelease", systemState.airTempRelease);
         systemState.highHumidity = preferences.getFloat("highHumidity", systemState.highHumidity);
@@ -269,6 +271,8 @@ void FirebaseManager::persistSettings()
     preferences.putFloat("ecTargetMax", systemState.ecTargetMax);
     preferences.putFloat("refillStart", systemState.refillStartLevel);
     preferences.putFloat("refillStop", systemState.refillStopLevel);
+    preferences.putFloat("wlEmptyCm", systemState.waterLevelEmptyDistanceCm);
+    preferences.putFloat("wlFullCm", systemState.waterLevelFullDistanceCm);
     preferences.putFloat("highAir", systemState.highAirTemp);
     preferences.putFloat("airRelease", systemState.airTempRelease);
     preferences.putFloat("highHumidity", systemState.highHumidity);
@@ -465,6 +469,12 @@ void FirebaseManager::initializeDatabase()
 
         json.set("refillStopLevel",
             systemState.refillStopLevel);
+
+        json.set("waterLevelEmptyDistanceCm",
+            systemState.waterLevelEmptyDistanceCm);
+
+        json.set("waterLevelFullDistanceCm",
+            systemState.waterLevelFullDistanceCm);
 
         json.set("highWaterTemp",
             systemState.highWaterTemp);
@@ -854,7 +864,7 @@ void FirebaseManager::runOneOptionalFirebaseJob(
     // their own always-checked fast path directly in update(), immediately
     // behind heartbeat - see the comment there. Every remaining job below
     // shifted down by 2 accordingly; this list is otherwise unchanged.
-    constexpr uint8_t OPTIONAL_JOB_COUNT = 13;
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 14;
 
     for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
     {
@@ -970,6 +980,10 @@ void FirebaseManager::runOneOptionalFirebaseJob(
 
             case 12:
                 replayQueuedFoggingEvent();
+                return;
+
+            case 13:
+                readWaterLevelOverrideCommand();
                 return;
         }
     }
@@ -1330,6 +1344,80 @@ void FirebaseManager::readSettings()
             refillRejectionLogged = true;
             lastRejectedRefillStart = incomingRefillStart;
             lastRejectedRefillStop = incomingRefillStop;
+        }
+    }
+
+    //--------------------------------------------------
+    // Water level sensor calibration (empty/full distance, cm)
+    //--------------------------------------------------
+
+    float incomingWaterLevelEmptyCm = systemState.waterLevelEmptyDistanceCm;
+    float incomingWaterLevelFullCm = systemState.waterLevelFullDistanceCm;
+
+    bool hasWaterLevelEmptyCm = fbdo.jsonObject().get(data, "waterLevelEmptyDistanceCm");
+    if (hasWaterLevelEmptyCm)
+        incomingWaterLevelEmptyCm = data.floatValue;
+
+    bool hasWaterLevelFullCm = fbdo.jsonObject().get(data, "waterLevelFullDistanceCm");
+    if (hasWaterLevelFullCm)
+        incomingWaterLevelFullCm = data.floatValue;
+
+    if (hasWaterLevelEmptyCm || hasWaterLevelFullCm)
+    {
+        // Both must be positive (physical distances), and full-tank distance
+        // must be strictly less than empty-tank distance - the sensor sits
+        // above the water, so a fuller tank is always a shorter distance.
+        const bool validEmpty = incomingWaterLevelEmptyCm > 0.0f;
+        const bool validFull = incomingWaterLevelFullCm > 0.0f;
+        const bool validOrder = incomingWaterLevelFullCm < incomingWaterLevelEmptyCm;
+
+        if (validEmpty && validFull && validOrder)
+        {
+            const bool changed =
+                floatValuesDiffer(systemState.waterLevelEmptyDistanceCm, incomingWaterLevelEmptyCm) ||
+                floatValuesDiffer(systemState.waterLevelFullDistanceCm, incomingWaterLevelFullCm);
+
+            systemState.waterLevelEmptyDistanceCm = incomingWaterLevelEmptyCm;
+            systemState.waterLevelFullDistanceCm = incomingWaterLevelFullCm;
+
+            if (!waterLevelCalibrationInitialized || changed)
+            {
+                Serial.println("[SETTINGS] Water level calibration updated");
+                Serial.print("[SETTINGS] waterLevelEmptyDistanceCm=");
+                Serial.println(systemState.waterLevelEmptyDistanceCm, 2);
+                Serial.print("[SETTINGS] waterLevelFullDistanceCm=");
+                Serial.println(systemState.waterLevelFullDistanceCm, 2);
+            }
+
+            waterLevelCalibrationInitialized = true;
+            waterLevelCalibrationRejectionLogged = false;
+        }
+        else
+        {
+            const bool newRejection =
+                !waterLevelCalibrationRejectionLogged ||
+                floatValuesDiffer(lastRejectedWaterLevelEmptyCm, incomingWaterLevelEmptyCm) ||
+                floatValuesDiffer(lastRejectedWaterLevelFullCm, incomingWaterLevelFullCm);
+
+            if (newRejection)
+            {
+                Serial.println("[SETTINGS] Water level calibration update rejected");
+                Serial.print("[SETTINGS] reason=");
+                if (!validEmpty)
+                    Serial.println("waterLevelEmptyDistanceCm must be greater than 0");
+                else if (!validFull)
+                    Serial.println("waterLevelFullDistanceCm must be greater than 0");
+                else
+                    Serial.println("waterLevelFullDistanceCm must be less than waterLevelEmptyDistanceCm");
+                Serial.print("[SETTINGS] keeping empty=");
+                Serial.println(systemState.waterLevelEmptyDistanceCm, 2);
+                Serial.print("[SETTINGS] keeping full=");
+                Serial.println(systemState.waterLevelFullDistanceCm, 2);
+            }
+
+            waterLevelCalibrationRejectionLogged = true;
+            lastRejectedWaterLevelEmptyCm = incomingWaterLevelEmptyCm;
+            lastRejectedWaterLevelFullCm = incomingWaterLevelFullCm;
         }
     }
 
@@ -3995,6 +4083,75 @@ void FirebaseManager::setSensorTestEnabled(bool enabled, bool publishAcknowledge
         WiFi.status() == WL_CONNECTED && Firebase.ready())
     {
         Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/status/sensorTest", enabled);
+    }
+}
+
+void FirebaseManager::readWaterLevelOverrideCommand()
+{
+    static unsigned long lastRead = 0;
+    static unsigned long lastReadFailure = 0;
+    static bool readBackoffActive = false;
+
+    if (readBackoffActive &&
+        millis() - lastReadFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
+    if (millis() - lastRead < 2000) return; // 2 seconds interval
+    lastRead = millis();
+
+    FirebaseJsonData data;
+    const bool readSucceeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/ignoreWaterLevelAutomation");
+    recordFirebaseResult(readSucceeded);
+    if (!readSucceeded)
+    {
+        readBackoffActive = true;
+        lastReadFailure = millis();
+        return;
+    }
+
+    readBackoffActive = false;
+    {
+        FirebaseJson& json = fbdo.jsonObject();
+        if (json.get(data, "enabled") && data.success)
+        {
+            setIgnoreWaterLevelAutomation(data.boolValue);
+        }
+    }
+}
+
+// Applying the flag is deliberately just the systemState write + logging +
+// acknowledgement here - the actual bypass behavior lives entirely in
+// AutomationManager (handleNormal()/processReadyLocalRegulation() refuse to
+// start a new automatic refill while this is set; handleRefilling() exits an
+// already-running automatic one on the very next tick). Driving both off the
+// same persistent flag, re-checked every tick, is simpler and more robust
+// than a one-shot side effect here trying to reach into AutomationManager's
+// state machine - it self-corrects regardless of exactly when this read
+// lands relative to the automation loop, and needs no special-casing for
+// which state happens to be active when the flag flips.
+void FirebaseManager::setIgnoreWaterLevelAutomation(bool enabled, bool publishAcknowledgement)
+{
+    if (enabled == systemState.ignoreWaterLevelAutomation) return;
+
+    systemState.ignoreWaterLevelAutomation = enabled;
+
+    Serial.print("[DEV WATER] ignoreWaterLevelAutomation=");
+    Serial.println(enabled ? "true" : "false");
+
+    if (enabled)
+    {
+        Serial.println("[DEV WATER] automatic refill bypass active");
+    }
+    else
+    {
+        Serial.println("[DEV WATER] normal refill automation restored");
+    }
+
+    if (publishAcknowledgement &&
+        WiFi.status() == WL_CONNECTED && Firebase.ready())
+    {
+        Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/status/ignoreWaterLevelAutomation", enabled);
     }
 }
 

@@ -283,6 +283,16 @@ constexpr unsigned long EC_DOSE_COOLDOWN =
 
 constexpr unsigned long SENSOR_STABILIZATION_TIME = 10000UL;
 
+// How long after physical pH/EC probes become the active source their
+// readings are held invalid (NaN) rather than published/acted on. The
+// analog front end (glass-electrode buffer, coupling caps) needs time to
+// charge after power/reconnection; until then the ADC returns a real,
+// smoothly-drifting-but-wrong value that would otherwise trip alerts and
+// trigger dosing mid-ramp. 20s covers the settling ramp observed on field
+// serial logs (~17s from cold power-on to a stable reading) with margin -
+// re-tune against your own probe/hardware if it settles slower/faster.
+constexpr unsigned long PH_EC_ANALOG_SETTLE_TIME = 20000UL;
+
 constexpr unsigned long STARTUP_ON_TIME =
     180UL * 1000UL; // 3 minutes
 
@@ -331,8 +341,8 @@ constexpr int OUT_OF_RANGE_REQUIRED = 3;
 // Debug
 // ======================================================
 
-constexpr bool DEBUG_ENABLED = false;
-constexpr unsigned long DEBUG_INTERVAL = 1000UL;
+constexpr bool DEBUG_ENABLED = true;
+constexpr unsigned long DEBUG_INTERVAL = 2000UL;
 
 // ======================================================
 // Water Refill
@@ -343,4 +353,18 @@ constexpr float REFILL_START_LEVEL = 20.0f;
 constexpr float REFILL_STOP_LEVEL = 75.0f;
 
 constexpr unsigned long MANUAL_PUMP_RUNTIME = 5000UL;
+
+// ======================================================
+// Water Level Sensor Calibration
+// ======================================================
+// Ultrasonic (HC-SR04) distance, in cm, from the sensor to the water surface
+// at each end of the reservoir - not a universal constant, it depends on
+// where the sensor is physically mounted and the reservoir's depth. These
+// are only the firmware defaults; systemState.waterLevelEmptyDistanceCm/
+// waterLevelFullDistanceCm (settable via /settings, see FirebaseManager) are
+// what SensorManager::readWaterLevel() actually uses, so a mismatched
+// installation can be corrected without a reflash.
+constexpr float WATER_LEVEL_EMPTY_DISTANCE_CM = 30.0f;
+
+constexpr float WATER_LEVEL_FULL_DISTANCE_CM = 5.0f;
 #endif

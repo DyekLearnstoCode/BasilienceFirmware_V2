@@ -51,6 +51,14 @@ private:
     bool mockBootWaitingForPayload = false;
     unsigned long mockBootWaitStartedAt = 0;
 
+    // Timestamp of the most recent moment physical sensors became the active
+    // source (cold boot direct to physical, mock boot-wait timeout, or the
+    // cloud turning mock off). applyEffectiveSensors() holds sensors.ph/ec
+    // NaN for PH_EC_ANALOG_SETTLE_TIME after this, since the analog probes
+    // haven't electrically settled yet even though physicalSensors already
+    // has a finite (but still drifting) reading.
+    unsigned long physicalPhEcSettledAt = 0;
+
     void resolveLocalSensorSource();
     void updateMockBootWait();
 
@@ -85,6 +93,17 @@ private:
     unsigned long lastWaterLevelReadTime = 0;
     uint8_t waterLevelFailureStreak = 0;
 
+    // Median-of-3 filter over the raw distance samples. The refill solenoid's
+    // flow ripples the reservoir surface enough to shift a single HC-SR04
+    // echo by several cm, which - fed straight to the alert layer - flapped
+    // waterLevelLow on and off within one debounce window. A median rejects
+    // that one-sample spike instead of smoothing it away (which would lag a
+    // real level change); cleared on confirmed-unavailable so a recovery
+    // doesn't median against stale pre-outage readings.
+    float waterLevelDistanceHistory[3] = {NAN, NAN, NAN};
+    uint8_t waterLevelHistoryIndex = 0;
+    uint8_t waterLevelHistoryCount = 0;
+
     // DHT22 read scheduling and transient-failure tolerance, mirroring the
     // water-temperature/water-level pattern above. physicalSensors.humidity/
     // temperature only become NaN once a scheduled read has failed
@@ -92,6 +111,9 @@ private:
     // SENSOR_TRANSIENT_FAILURE_THRESHOLD times.
     unsigned long lastDhtReadTime = 0;
     uint8_t dhtFailureStreak = 0;
+    // Consecutive good reads accumulated while confirmed-unavailable, before
+    // recovery is trusted - see readDHT()'s symmetric recovery debounce.
+    uint8_t dhtRecoveryStreak = 0;
 
     // =====================================================
     // Sensor Reading Functions

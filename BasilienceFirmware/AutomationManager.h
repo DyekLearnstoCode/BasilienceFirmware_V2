@@ -10,6 +10,14 @@ public:
     void update();
     void setManualCoolingDemand(bool active);
 
+    // Admin's explicit judgment that the current water level is acceptable -
+    // called by ActuatorManager::requestCommand() when a manual OFF for
+    // SOLENOID arrives while an automatic refill is in progress. Ends the
+    // refill early, the same way handleRefilling() itself would once
+    // sensors.waterLevel reaches refillStopLevel; a no-op if REFILLING isn't
+    // actually the current mode.
+    void stopRefillManually();
+
     // Read-only view of the circulation demand mask maintained by
     // updateCooling(). ActuatorManager consults these before allowing a manual
     // OFF so a user cannot stop circulation that an automatic operation is
@@ -65,6 +73,23 @@ private:
     float lastRefillWaterLevel = NAN;
     float lastRefillStartLevel = NAN;
     float lastRefillStopLevel = NAN;
+
+    // NaN = no manual acceptance in effect - the ordinary refillStartLevel
+    // threshold governs. Set by stopRefillManually() to the water level at
+    // the moment the admin accepted it; the low-water auto-refill trigger
+    // then only fires again once the level drops below THIS, not merely for
+    // remaining under refillStartLevel, so an admin's explicit "current
+    // level is enough" isn't undone within the same tick by the very
+    // condition it was meant to override. Cleared back to NaN the instant a
+    // real refill is in progress (handleRefilling() itself, whichever path
+    // started it), since any active refill supersedes a prior acceptance.
+    float manualRefillAcceptedLevel = NAN;
+
+    // One-shot guard so handleRefilling()'s developer-override exit logs
+    // "[DEV WATER] exiting automatic REFILLING..." once per bypass, not
+    // every tick the override stays enabled with water still low.
+    bool devWaterOverrideExitLogged = false;
+    bool shouldAutoRefill() const;
     int8_t lastWaterTemperatureBand = -2;
     bool coolingDemandActive = false;
     bool manualCoolingDemandActive = false;

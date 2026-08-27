@@ -77,6 +77,16 @@ namespace
         return source == "manual";
     }
 
+    // CANOPY_FAN and BLOWER are both MOSFET-driven DC fans, so both can take
+    // a PWM duty cycle for variable speed the same way. SOLENOID shares the
+    // same "MOSFET Outputs" pin group in Config.h but is a valve, not a fan -
+    // PWM-ing it would just chatter the valve, so it deliberately stays a
+    // plain digitalWrite actuator.
+    bool isPwmActuator(Actuator actuator)
+    {
+        return actuator == CANOPY_FAN || actuator == BLOWER;
+    }
+
     bool validPH(float value)
     {
         return isfinite(value) && value >= 0.0f && value <= 14.0f;
@@ -154,7 +164,7 @@ void ActuatorManager::begin()
 
     for (int i = 0; i < ACTUATOR_COUNT; i++)
     {
-        if (i == CANOPY_FAN)
+        if (isPwmActuator((Actuator)i))
         {
             // ESP32 Core 3.x API
             ledcAttach(getPin((Actuator)i), 5000, 8); // pin, freq, resolution
@@ -172,6 +182,7 @@ void ActuatorManager::begin()
         statuses[i].state = ActuatorCommandState::OFF;
         statuses[i].running = false;
         manuallyOverridden[i] = false;
+        automaticSkipLogged[i] = false;
         deadlineExpired[i] = false;
 
         if (isDeadlineProtected((Actuator)i) && deadlineTimers[i] == nullptr)
@@ -199,18 +210,18 @@ void ActuatorManager::begin()
 
 void ActuatorManager::turnOn(Actuator actuator)
 {
-    if (actuator != CANOPY_FAN)
+    if (!isPwmActuator(actuator))
     {
         digitalWrite(getPin(actuator), HIGH);
     }
-    // For CANOPY_FAN, speed is applied dynamically in update()
+    // For PWM actuators (CANOPY_FAN, BLOWER), speed is applied dynamically in update()
 
     actuatorStates[actuator] = true;
 }
 
 void ActuatorManager::turnOff(Actuator actuator)
 {
-    if (actuator == CANOPY_FAN)
+    if (isPwmActuator(actuator))
     {
         ledcWrite(getPin(actuator), 0);
     }
@@ -247,7 +258,7 @@ void ActuatorManager::turnOffAll(const String& reason)
     }
 }
 
-void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed, const String& strategy, const String& reason, bool overrideRequested)
+void ActuatorManager::requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed, const String& strategy, const String& reason, bool overrideRequested, bool bypassAutoFoggerGate)
 {
     // The circulation pump serves several subsystems at once, so a manual ON
     // is always meaningful and needs no threshold check. A manual OFF is the
@@ -274,11 +285,26 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
         }
     }
 
-    // Ignore automatic schedule commands when this actuator is manually overridden in manual mode
-    if (systemState.manualMode && source == "automatic" && manuallyOverridden[actuator])
+    // Ignore automatic schedule commands when this actuator is manually
+    // overridden in manual mode - manual holds outrank routine automation
+    // (priority model: HARD SAFETY BLOCK > MANUAL > AUTOMATIC). A genuine
+    // global safety lock is the one thing that outranks even a manual hold,
+    // so turnOffAll()'s emergency-stop OFF commands must still get through -
+    // see AutomationManager::failCurrentSubsystem()/handleSafetyLock(), which
+    // both set systemState.safetyLock before calling turnOffAll().
+    if (systemState.manualMode && source == "automatic" && manuallyOverridden[actuator] &&
+        !systemState.safetyLock)
     {
+        if (!automaticSkipLogged[actuator])
+        {
+            Serial.print("[AUTO] ");
+            Serial.print(actuatorLogName(actuator));
+            Serial.println(" skipped: manual ownership active");
+            automaticSkipLogged[actuator] = true;
+        }
         return;
     }
+    automaticSkipLogged[actuator] = false;
 
     if (isManualSource(source))
     {
@@ -288,14 +314,34 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
         Serial.print(state ? "ON" : "OFF");
         Serial.println(" received");
 
-        // Manual control cannot take ownership of, or stop, an actuator that
-        // is currently being controlled by an automatic path.
+        // A manual OFF against an in-progress automatic refill is the
+        // admin's explicit judgment that the current water level is good
+        // enough - handled as an intentional early stop (mirrors exactly
+        // what AutomationManager::handleRefilling() itself does once
+        // sensors.waterLevel reaches refillStopLevel) rather than being
+        // silently dropped by the generic guard just below. A no-op inside
+        // stopRefillManually() if the solenoid's automatic run turns out not
+        // to actually be a refill (e.g. EC dilution).
+        if (actuator == SOLENOID && !state &&
+            statuses[actuator].running && statuses[actuator].source == "automatic")
+        {
+            automationManager.stopRefillManually();
+            return;
+        }
+
+        // Manual control outranks an automatic owner (priority model: MANUAL
+        // > AUTOMATIC) - it takes ownership rather than being rejected.
+        // Genuine hard-safety conditions remain enforced downstream by
+        // validateCommand() and the actuator-specific checks in this
+        // function (e.g. the circulation-required guard just above), so this
+        // is an ownership transfer, not a bypass of any real safety check.
         if (statuses[actuator].running && statuses[actuator].source != "manual")
         {
-            Serial.print("[MANUAL] ignored: actuator is running under ");
+            Serial.print("[MANUAL] ");
+            Serial.print(actuatorLogName(actuator));
+            Serial.print(" automatic ownership overridden by manual request (was ");
             Serial.print(statuses[actuator].source);
-            Serial.println(" control");
-            return;
+            Serial.println(")");
         }
 
         if (actuator == PELTIER && !state)
@@ -311,14 +357,35 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
             return;
         }
 
-        if (actuator == CIRCULATION_PUMP && manuallyOverridden[actuator] != state)
+        if (actuator == CIRCULATION_PUMP)
         {
-            Serial.println(state
-                ? "[CIRCULATION] Manual demand added"
-                : "[CIRCULATION] Manual demand removed");
+            // Circulation is the one documented exception to a manual hold
+            // locking automation out: automatic cooling and pH/EC
+            // stabilization physically depend on it, so a future automatic
+            // demand must always be able to reclaim it (see the manual-OFF
+            // guard above and AutomationManager::isCirculationRequired()).
+            // Its override flag keeps mirroring the live manual target
+            // (true only while a manual ON demand is standing) rather than
+            // becoming a sticky hold.
+            if (manuallyOverridden[actuator] != state)
+            {
+                Serial.println(state
+                    ? "[CIRCULATION] Manual demand added"
+                    : "[CIRCULATION] Manual demand removed");
+            }
+            manuallyOverridden[actuator] = state;
         }
-
-        manuallyOverridden[actuator] = state;
+        else
+        {
+            // Every other actuator: any accepted manual command (ON or OFF)
+            // takes and HOLDS ownership so automatic control cannot reclaim
+            // it on the next tick - see the guard near the top of this
+            // function and the STOPPING handling in update(). Released by:
+            // manual mode being turned off, the manual-runtime deadline
+            // expiring, a soft rule reporting the target already reached, a
+            // rejected command, or another manual command.
+            manuallyOverridden[actuator] = true;
+        }
     }
 
     // Repeated automatic OFF reconciliation must not erase the reason retained
@@ -340,6 +407,7 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
     // (which never call this with the app's override flag anyway) can never
     // leave a stale override active on the status this becomes.
     commands[actuator].overrideRequested = overrideRequested && state && isManualSource(source);
+    commands[actuator].bypassAutoFoggerGate = bypassAutoFoggerGate;
 }
 
 ActuatorStatus ActuatorManager::getStatus(Actuator actuator) const
@@ -698,7 +766,17 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             // request. Because FOGGER precedes BLOWER in the actuator update,
             // this accepts only after the paired fogger has actually started.
             // Manual blower control retains its existing independent behavior.
-            if (statuses[actuator].source == "automatic")
+            //
+            // Exception: AutomationManager deliberately keeps the blower
+            // commanded on for BLOWER_PURGE_MS after the fogger has already
+            // been told to stop, to clear residual fog toward the root
+            // chamber. Without bypassAutoFoggerGate, that purge command would
+            // fail this same check the instant the fogger's status catches up
+            // to OFF (same tick, since FOGGER precedes BLOWER in the update
+            // loop) - which is exactly what was turning the purge into a
+            // REJECTED blower instead of the intended few extra seconds of
+            // runtime.
+            if (statuses[actuator].source == "automatic" && !statuses[actuator].bypassAutoFoggerGate)
             {
                 const ActuatorStatus& fogger = statuses[FOGGER];
                 if (!isOn(FOGGER) || !fogger.running ||
@@ -753,12 +831,25 @@ void ActuatorManager::update()
                 status.running = false;
                 status.state = ActuatorCommandState::OFF;
                 status.reason = "Safety limit: independent deadline expired";
-                manuallyOverridden[i] = false;
+                if (manuallyOverridden[i])
+                {
+                    manuallyOverridden[i] = false;
+                    Serial.print("[MANUAL] ");
+                    Serial.print(actuatorLogName(a));
+                    Serial.println(" manual hold expired; automation ownership restored");
+                }
                 statusDirty = true;
             }
         }
 
         const ActuatorStatus previousStatus = status;
+
+        // Set only when this tick's STOPPING transition came from an
+        // explicit manual OFF command (just below), never from the
+        // loop-polled runtime watchdog or a soft-rule "target already
+        // reached" stop further down - see the STOPPING case's use of this
+        // flag for why the two must stay distinguishable.
+        bool explicitManualStop = false;
 
         if (cmd.isPending)
         {
@@ -771,6 +862,7 @@ void ActuatorManager::update()
             // continuous RUNNING-state re-check below can see it for as long
             // as this actuator keeps running under this command.
             status.overrideActive = cmd.overrideRequested;
+            status.bypassAutoFoggerGate = cmd.bypassAutoFoggerGate;
 
             if (cmd.targetState)
             {
@@ -784,9 +876,13 @@ void ActuatorManager::update()
                 if (status.state == ActuatorCommandState::RUNNING || status.state == ActuatorCommandState::ACTIVATING)
                 {
                     status.state = ActuatorCommandState::STOPPING;
-                    if (status.source == "manual" && status.reason.isEmpty())
+                    if (status.source == "manual")
                     {
-                        status.reason = "Manual stop";
+                        explicitManualStop = true;
+                        if (status.reason.isEmpty())
+                        {
+                            status.reason = "Manual stop";
+                        }
                     }
                 }
                 else
@@ -920,7 +1016,7 @@ void ActuatorManager::update()
                     }
                     else
                     {
-                        if (a == CANOPY_FAN)
+                        if (isPwmActuator(a))
                         {
                             uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
                             ledcWrite(getPin(a), pwmValue);
@@ -954,11 +1050,31 @@ void ActuatorManager::update()
                     status.running = false;
                     if (isManualSource(status.source))
                     {
-                        manuallyOverridden[i] = false;
+                        // An explicit manual OFF (any actuator other than
+                        // CIRCULATION_PUMP - see its dedicated demand-mirror
+                        // handling in requestCommand()) HOLDS ownership so
+                        // automatic control cannot reclaim the actuator on
+                        // the very next tick; only a natural stop - the
+                        // runtime watchdog above, or validateCommand's
+                        // soft-rule "target already reached" - releases it
+                        // here. See explicitManualStop's declaration above.
+                        if (a == CIRCULATION_PUMP || !explicitManualStop)
+                        {
+                            if (manuallyOverridden[i])
+                            {
+                                manuallyOverridden[i] = false;
+                                Serial.print("[MANUAL] ");
+                                Serial.print(actuatorLogName(a));
+                                Serial.println(" manual hold expired; automation ownership restored");
+                            }
+                        }
                         if (a == PELTIER)
                         {
                             automationManager.setManualCoolingDemand(false);
                         }
+                        Serial.print("[MANUAL] ");
+                        Serial.print(actuatorLogName(a));
+                        Serial.println(" owner=manual state=OFF");
                     }
                     status.state = ActuatorCommandState::OFF;
                     stateChanged = true;
@@ -997,7 +1113,19 @@ void ActuatorManager::update()
                 Serial.print("[ACTUATOR] ");
                 Serial.print(actuatorLogName(a));
                 Serial.print(" ");
-                Serial.println(actuatorStateLogName(status.state));
+                Serial.print(actuatorStateLogName(status.state));
+                // Only fires on an actual transition (guarded above), so this
+                // is a one-shot diagnostic per rejection/stop, not per tick -
+                // status.reason is already the exact validateCommand()/safety
+                // string (e.g. "Fogger stopped. Water reservoir level is too
+                // low."), so this is printed as-is rather than mapped to a
+                // separate reason-code enum that doesn't otherwise exist.
+                if (status.reason.length() > 0)
+                {
+                    Serial.print(" reason=");
+                    Serial.print(status.reason);
+                }
+                Serial.println();
             }
 
             // History-correctness hook: FOGGER's `running` flip is the

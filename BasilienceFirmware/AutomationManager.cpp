@@ -517,7 +517,7 @@ void AutomationManager::validateSystem()
 {
     alertManager.update();
 
-    if(alertState.lowWater)
+    if(alertState.lowWater && shouldAutoRefill())
     {
         SafetyResult result =
             safetyManager.canRefill();
@@ -814,9 +814,15 @@ void AutomationManager::handleStartup()
             // Blower purge: stays on for the first BLOWER_PURGE_MS of the
             // startup rest phase to clear fog concentrated near the
             // reservoir toward the root chamber, then off for the
-            // remainder of the unchanged STARTUP_OFF_TIME window.
-            actuatorManager.requestCommand(
-                BLOWER, elapsedInOff < BLOWER_PURGE_MS, "automatic", millis(), 100, "startup");
+            // remainder of the unchanged STARTUP_OFF_TIME window. The fogger
+            // is already off for the whole purge window by design, so the
+            // blower's automatic fogger-running gate is waived here (see
+            // ActuatorManager::validateCommand's BLOWER case).
+            {
+                bool purging = elapsedInOff < BLOWER_PURGE_MS;
+                actuatorManager.requestCommand(
+                    BLOWER, purging, "automatic", millis(), 100, "startup", "", false, purging);
+            }
 
             if(elapsedInOff >=
                STARTUP_OFF_TIME)
@@ -844,8 +850,11 @@ void AutomationManager::handleNormal()
 
     handleCanopyClimate();
 
-    // Check for automatic refill before processing manual requests
-    if (alertState.lowWater)
+    // Check for automatic refill before processing manual requests. The
+    // developer water-level override (systemState.ignoreWaterLevelAutomation)
+    // only ever suppresses this AUTOMATIC trigger - processRefillRequest()
+    // below still services an explicit manual "Trigger Refill" unconditionally.
+    if (alertState.lowWater && shouldAutoRefill() && !systemState.ignoreWaterLevelAutomation)
     {
         SafetyResult result = safetyManager.canRefill();
         if (result == SafetyResult::SAFE)
@@ -881,7 +890,9 @@ bool AutomationManager::processReadyLocalRegulation()
 {
     alertManager.update();
 
-    if(alertState.lowWater)
+    // See handleNormal()'s matching check for why ignoreWaterLevelAutomation
+    // only gates this AUTOMATIC trigger, never processRefillRequest() below.
+    if(alertState.lowWater && shouldAutoRefill() && !systemState.ignoreWaterLevelAutomation)
     {
         SafetyResult result = safetyManager.canRefill();
         if(result == SafetyResult::SAFE)
@@ -1235,10 +1246,22 @@ bool AutomationManager::processPHCorrection()
 
     if(result != SafetyResult::SAFE)
     {
+        // A safety-blocked attempt did not take over this tick - returning
+        // true here (as this used to) told every caller "I'm handling this,
+        // stop" identically to an actual dose starting. With phOutOfRange
+        // persistently true (e.g. LOW_WATER blocking a dose the whole time
+        // water stays low), that starved everything after this check forever:
+        // processECCorrection() in the same caller never even got evaluated,
+        // and handleStartup()/SENSOR_STABILIZATION's processReadyLocalRegulation()
+        // callers never fell through to their own state-timer/fog-cycle logic
+        // - a real stuck-in-STARTUP condition, not a false "still within its
+        // normal timing" read. failCurrentOperation() itself is a no-op here
+        // (operationRequest.state is never RUNNING at this call site - see its
+        // own guard), kept only as a defensive marker if that ever changes.
         failCurrentOperation(
             safetyManager.getSafetyReason(result));
 
-        return true;
+        return false;
     }
 
     createOperationRequest(
@@ -1318,7 +1341,12 @@ bool AutomationManager::processECCorrection()
         failCurrentOperation(
             safetyManager.getSafetyReason(result));
 
-        return true;
+        // See processPHCorrection()'s matching comment: a safety-blocked
+        // attempt must report false, not true, or it starves everything
+        // after it in the same caller (handleNormal()'s processFogCycle(),
+        // processReadyLocalRegulation()'s STARTUP/SENSOR_STABILIZATION
+        // fallthrough) for as long as ecLow/ecHigh stays true.
+        return false;
     }
 
     createOperationRequest(
@@ -1480,9 +1508,15 @@ void AutomationManager::processFogCycle()
         // toward the root chamber, then off for the remainder of the
         // unchanged fogOffTime window - elapsed is already measured from
         // the same ON->OFF transition instant, so this never extends the
-        // total NORMAL/HOT/COLD cycle length.
-        actuatorManager.requestCommand(
-            BLOWER, elapsed < BLOWER_PURGE_MS, "automatic", millis(), 100, activeFogStrategy);
+        // total NORMAL/HOT/COLD cycle length. The fogger is already off for
+        // the whole purge window by design, so the blower's automatic
+        // fogger-running gate is waived here (see
+        // ActuatorManager::validateCommand's BLOWER case).
+        {
+            bool purging = elapsed < BLOWER_PURGE_MS;
+            actuatorManager.requestCommand(
+                BLOWER, purging, "automatic", millis(), 100, activeFogStrategy, "", false, purging);
+        }
 
         if(elapsed >= fogOffTime)
         {
@@ -1569,6 +1603,44 @@ bool AutomationManager::isWithinSchedule(
 //Refilling Handling
 void AutomationManager::handleRefilling()
 {
+    // Developer testing override: an AUTOMATIC refill (low-water triggered)
+    // is exited cleanly the instant the override is on, without touching a
+    // manual "Trigger Refill" request (RequestSource::MANUAL is left
+    // completely alone here) and without routing through
+    // abortCurrentOperation()/failCurrentSubsystem(), which would latch
+    // refillSubsystemLocked - a real safety-fault flag this benign bypass
+    // must never set. Re-checked every tick (not just on the flag's rising
+    // edge), so it equally covers a refill that was already running when the
+    // override turned on.
+    if(systemState.ignoreWaterLevelAutomation &&
+       systemState.operationRequest.source == RequestSource::AUTOMATIC)
+    {
+        if(!devWaterOverrideExitLogged)
+        {
+            Serial.println("[DEV WATER] exiting automatic REFILLING due to developer override");
+            devWaterOverrideExitLogged = true;
+        }
+
+        actuatorManager.requestCommand(
+            SOLENOID, false, "automatic", millis(), 100, "refill",
+            "Developer override: automatic water-level refill bypassed");
+
+        systemState.reservoirLocked = false;
+
+        failCurrentOperation(
+            "Developer override: automatic water-level refill bypassed");
+
+        changeState(STARTUP);
+
+        return;
+    }
+    devWaterOverrideExitLogged = false;
+
+    // Any refill actually in progress supersedes a prior manual acceptance,
+    // regardless of which path started it (low-water auto-trigger, the
+    // admin's "Start Reservoir Refill" button, or forceRefill).
+    manualRefillAcceptedLevel = NAN;
+
     alertManager.update();
 
     SafetyResult result =
@@ -1632,6 +1704,45 @@ void AutomationManager::handleRefilling()
 
     actuatorManager.requestCommand(
         SOLENOID, true, "automatic", millis());
+}
+
+void AutomationManager::stopRefillManually()
+{
+    if(systemState.currentMode != REFILLING)
+    {
+        return;
+    }
+
+    Serial.print("[REFILL] Manually stopped - admin accepted current water level=");
+    Serial.println(sensors.waterLevel, 2);
+
+    // See the member's own comment: without this, the low-water trigger
+    // below (still true, since refillStartLevel hasn't itself changed) would
+    // just re-open the solenoid again on the very next check.
+    manualRefillAcceptedLevel = sensors.waterLevel;
+
+    actuatorManager.requestCommand(
+        SOLENOID, false, "automatic", millis(), 100, "refill",
+        "Manually stopped - admin accepted current water level");
+
+    systemState.reservoirLocked = false;
+
+    completeCurrentOperation();
+
+    changeState(STARTUP);
+}
+
+// See manualRefillAcceptedLevel's own comment for the scenario this exists
+// for. isnan() means no acceptance is in effect - ordinary threshold rules
+// apply unmodified.
+bool AutomationManager::shouldAutoRefill() const
+{
+    if(isnan(manualRefillAcceptedLevel))
+    {
+        return true;
+    }
+
+    return sensors.waterLevel < manualRefillAcceptedLevel;
 }
 
 //handle ph dosing
@@ -2046,8 +2157,13 @@ void AutomationManager::failCurrentSubsystem(const String& reason)
     {
         // The global mechanism remains available for a genuinely system-wide
         // critical condition, but ordinary subsystem failures never reach it.
-        actuatorManager.turnOffAll(reason);
+        // safetyLock must be set BEFORE turnOffAll(): its automatic OFF
+        // commands must bypass any standing manual hold (priority model:
+        // HARD SAFETY BLOCK outranks MANUAL) - see
+        // ActuatorManager::requestCommand()'s manual-hold guard, which only
+        // lets a genuine safety lock through.
         systemState.safetyLock = true;
+        actuatorManager.turnOffAll(reason);
         changeState(SAFETY_LOCK);
         failCurrentOperation(reason);
         return;

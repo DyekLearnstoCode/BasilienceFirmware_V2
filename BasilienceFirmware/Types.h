@@ -155,6 +155,11 @@ struct ActuatorCommand
     // arrived on - a later command with this unset/false returns to normal
     // soft-rule enforcement.
     bool overrideRequested = false;
+    // Waives BLOWER's automatic "fogger must be RUNNING" gate for this
+    // command - set by AutomationManager's deliberate post-fogger purge
+    // window (BLOWER_PURGE_MS), where the fogger has already stopped on
+    // purpose. See ActuatorManager::validateCommand's BLOWER case.
+    bool bypassAutoFoggerGate = false;
 };
 
 struct ActuatorStatus
@@ -172,6 +177,10 @@ struct ActuatorStatus
     // same override for the actuator's whole run, and so actuatorStatus can
     // publish it for the app to display.
     bool overrideActive = false;
+    // Mirrors bypassAutoFoggerGate the same way overrideActive mirrors
+    // overrideRequested, so the continuous RUNNING-state re-check sees it
+    // for as long as this command's purge window lasts.
+    bool bypassAutoFoggerGate = false;
 };
 
 //==================================================
@@ -318,6 +327,18 @@ struct SystemState
     bool sensorTestEnabled = false;
     unsigned long sensorTestStartTime = 0;
 
+    // Developer testing override: bypasses ONLY the automatic
+    // water-level/refill gate (AutomationManager's handleNormal(),
+    // processReadyLocalRegulation(), handleRefilling()) so pH/EC/fogging/
+    // cooling automation can be exercised on hardware sitting below
+    // refillStartLevel. The water-level sensor itself, its alerts, and
+    // manual refill are all untouched - see FirebaseManager::
+    // setIgnoreWaterLevelAutomation()/readWaterLevelOverrideCommand().
+    // Deliberately not restored from NVS: resets to false on every reboot,
+    // same as sensorTestEnabled above, so a developer testing session never
+    // silently survives a power cycle.
+    bool ignoreWaterLevelAutomation = false;
+
     // Remote Mocking
     bool mockSensorsEnabled = false;
     SensorData mockSensors;
@@ -420,6 +441,15 @@ struct SystemState
 
     float refillStopLevel =
         REFILL_STOP_LEVEL;
+
+    // Ultrasonic sensor-to-water-surface distance (cm) at empty/full - see
+    // Config.h's WATER_LEVEL_EMPTY_DISTANCE_CM/WATER_LEVEL_FULL_DISTANCE_CM
+    // for why these need to be configurable rather than fixed constants.
+    float waterLevelEmptyDistanceCm =
+        WATER_LEVEL_EMPTY_DISTANCE_CM;
+
+    float waterLevelFullDistanceCm =
+        WATER_LEVEL_FULL_DISTANCE_CM;
 
     //==================================================
     // Target (acceptable) ranges

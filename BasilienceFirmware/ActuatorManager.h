@@ -9,7 +9,7 @@ class ActuatorManager
 public:
     void begin();
     void update();
-    void requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed = 100, const String& strategy = "", const String& reason = "", bool overrideRequested = false);
+    void requestCommand(Actuator actuator, bool state, const String& source, double timestamp, uint8_t speed = 100, const String& strategy = "", const String& reason = "", bool overrideRequested = false, bool bypassAutoFoggerGate = false);
 
     void turnOn(Actuator actuator);
 
@@ -33,7 +33,16 @@ private:
     bool actuatorStates[ACTUATOR_COUNT];
     ActuatorCommand commands[ACTUATOR_COUNT];
     ActuatorStatus statuses[ACTUATOR_COUNT];
+    // True while manual ownership is holding an actuator (ON or OFF) against
+    // routine automatic requests - see requestCommand()'s manual-source
+    // handling and its "Ignore automatic schedule commands" guard. Cleared on
+    // release (manual mode off, hold expiry, explicit re-command, rejection)
+    // - see update()'s STOPPING handling and the independent-deadline path.
     bool manuallyOverridden[ACTUATOR_COUNT];
+    // Edge-detection only, so the "[AUTO] ... skipped: manual ownership
+    // active" log fires once per hold rather than every automation tick -
+    // see requestCommand()'s manual-hold guard.
+    bool automaticSkipLogged[ACTUATOR_COUNT];
 
     // Independent physical-safety deadline for a manual run of an actuator
     // that already carries a hard manual runtime cap (dosing pumps, solenoid,
