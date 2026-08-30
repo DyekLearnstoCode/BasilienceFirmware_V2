@@ -473,7 +473,12 @@ struct SystemState
 
     // Remote Mocking
     bool mockSensorsEnabled = false;
+    bool mockSensorsDynamic = false;
+    // The RTDB command values are authoritative bases. mockSensors is the
+    // current effective dataset and equals these bases in static mode.
+    SensorData mockSensorBases;
     SensorData mockSensors;
+    unsigned long mockDynamicUpdatedAt = 0;
     bool mockApplyPending = false;
 
     // True once the effective sensor source (mock vs. physical) has been

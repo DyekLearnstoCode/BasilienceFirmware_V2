@@ -205,6 +205,41 @@ void AutomationManager::reconcileAutomationTestMode()
             Serial.println("[EC-LOCK] test-session rearm");
         }
     }
+
+    // Starting a new isolated test is an explicit request for a fresh bounded
+    // attempt budget. Clear only the selected subsystem's stale prior-test
+    // latch; the global hard safety lock and every live sensor/water safety
+    // check remain authoritative on the next tick. Like the EC rearm above,
+    // this runs once per genuine mode transition, so it cannot defeat the
+    // per-session MAX_PH_ATTEMPTS/MAX_REFILL_ATTEMPTS limits.
+    if(selected == AutomationTestSubsystem::PH && systemState.phSubsystemLocked)
+    {
+        if(systemState.safetyLock)
+        {
+            Serial.println("[PH-LOCK] rearm skipped reason=hard_safety_lock_active");
+        }
+        else
+        {
+            systemState.phSubsystemLocked = false;
+            systemState.phAttempts = 0;
+            systemState.phDirection = PH_NONE;
+            Serial.println("[PH-LOCK] cleared reason=test_session_rearm");
+        }
+    }
+
+    if(selected == AutomationTestSubsystem::REFILL && systemState.refillSubsystemLocked)
+    {
+        if(systemState.safetyLock)
+        {
+            Serial.println("[REFILL-LOCK] rearm skipped reason=hard_safety_lock_active");
+        }
+        else
+        {
+            systemState.refillSubsystemLocked = false;
+            resetAutomaticRefillAttempts();
+            Serial.println("[REFILL-LOCK] cleared reason=test_session_rearm");
+        }
+    }
 }
 
 void AutomationManager::cancelPausedAutomaticOperation()
@@ -2077,12 +2112,19 @@ bool AutomationManager::processECCorrection()
 // have just reconfirmed the reading, not merely be retaining an old one.
 bool AutomationManager::canStartNewPHCorrection() const
 {
-    return sensorManager.isPhCurrentlyStable();
+    // Mock values are supplied directly by the developer and bypass the
+    // physical stability window in SensorManager::applyEffectiveSensors().
+    // Requiring that physical window here made mock pH tests depend on stale
+    // hardware state. Validity and all dosing safety checks still run at the
+    // call sites before an operation starts and throughout dosing.
+    return systemState.mockSensorsEnabled || sensorManager.isPhCurrentlyStable();
 }
 
 bool AutomationManager::canStartNewECCorrection() const
 {
-    return sensorManager.isEcCurrentlyStable();
+    // Same controlled-source rule as pH above. A finite, validated mock EC
+    // payload is current by definition; physical EC retains the full window.
+    return systemState.mockSensorsEnabled || sensorManager.isEcCurrentlyStable();
 }
 
 // See the header's own comment. Deliberately re-derives its answer from the

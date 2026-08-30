@@ -75,6 +75,24 @@ constexpr float WATER_TEMP_SMOOTHING_ALPHA = 0.3f;
 // subject to it.
 constexpr unsigned long MOCK_BOOT_PAYLOAD_TIMEOUT = 120000UL; // 2 minutes
 
+// Developer Dynamic Mock Readings. Firmware owns this cadence so automation,
+// alerts, Firebase publication, and Android Monitoring all consume the same
+// effective values. Each update is a small bounded random-walk step around
+// the developer-supplied base, never a fresh full-envelope resample.
+constexpr unsigned long MOCK_DYNAMIC_UPDATE_INTERVAL_MS = 10000UL;
+constexpr float MOCK_DYNAMIC_PH_ENVELOPE = 0.05f;
+constexpr float MOCK_DYNAMIC_PH_STEP = 0.015f;
+constexpr float MOCK_DYNAMIC_EC_ENVELOPE = 0.05f;
+constexpr float MOCK_DYNAMIC_EC_STEP = 0.015f;
+constexpr float MOCK_DYNAMIC_AIR_TEMP_ENVELOPE = 0.5f;
+constexpr float MOCK_DYNAMIC_AIR_TEMP_STEP = 0.15f;
+constexpr float MOCK_DYNAMIC_HUMIDITY_ENVELOPE = 1.5f;
+constexpr float MOCK_DYNAMIC_HUMIDITY_STEP = 0.4f;
+constexpr float MOCK_DYNAMIC_WATER_TEMP_ENVELOPE = 0.3f;
+constexpr float MOCK_DYNAMIC_WATER_TEMP_STEP = 0.1f;
+constexpr float MOCK_DYNAMIC_WATER_LEVEL_ENVELOPE = 0.75f;
+constexpr float MOCK_DYNAMIC_WATER_LEVEL_STEP = 0.25f;
+
 // Shared short debounce threshold used to tell a transient one-tick sensor
 // hiccup (OneWire/ADC noise, a blocking call landing at the wrong moment)
 // apart from a genuinely failed/disconnected sensor. Applied consistently to

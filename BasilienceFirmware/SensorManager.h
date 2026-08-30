@@ -291,6 +291,8 @@ private:
     void readPH();
 
     void applyEffectiveSensors();
+    void updateDynamicMockSensors();
+    float boundedMockWalk(float current, float base, float envelope, float maxStep) const;
 
 public:
     // Called by FirebaseManager when the authoritative remote setting is read,
