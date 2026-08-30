@@ -57,13 +57,6 @@ namespace
         return debouncedValid(rawValid, invalidStreak);
     }
 
-    bool validEnvironment()
-    {
-        return isfinite(sensors.temperature) &&
-            sensors.temperature >= -40.0f && sensors.temperature <= 100.0f &&
-            isfinite(sensors.humidity) &&
-            sensors.humidity >= 0.0f && sensors.humidity <= 100.0f;
-    }
 }
 
 void SafetyManager::begin()
@@ -142,7 +135,22 @@ SafetyResult SafetyManager::canDosePH() const
         return SafetyResult::SENSOR_FAULT;
     }
 
-    if(sensors.waterLevel < systemState.refillStartLevel)
+    // Developer water-level override (Types.h's ignoreWaterLevelAutomation):
+    // waives ONLY this reservoir-too-low reason for physical testing with a
+    // reservoir intentionally kept below refillStartLevelCm. Every other
+    // check in this function - locks, sensor validity - stays enforced
+    // exactly as before. See ActuatorManager::lowWaterBlocks() for the
+    // matching actuator-level gate and its bypass log.
+    //
+    // refillStartLevelCm (2.0cm), NOT criticalLowWaterCm (1.0cm) - see the
+    // static automation integration audit. criticalLowWaterCm is a stricter,
+    // separate escalation threshold ON TOP of this operational bar, not a
+    // replacement for it; the operational "block dependent controllers"
+    // boundary has always been the same 2.0cm level that makes refill
+    // eligible, matching the pre-water-depth-model design where a single
+    // shared threshold played both roles.
+    if(!systemState.ignoreWaterLevelAutomation &&
+       sensors.waterLevelCm <= systemState.refillStartLevelCm)
     {
         return SafetyResult::LOW_WATER;
     }
@@ -176,7 +184,10 @@ SafetyResult SafetyManager::canDoseEC() const
         return SafetyResult::SENSOR_FAULT;
     }
 
-    if(sensors.waterLevel < systemState.refillStartLevel)
+    // refillStartLevelCm, not criticalLowWaterCm - see canDosePH()'s matching
+    // comment.
+    if(!systemState.ignoreWaterLevelAutomation &&
+       sensors.waterLevelCm <= systemState.refillStartLevelCm)
     {
         return SafetyResult::LOW_WATER;
     }
@@ -189,7 +200,7 @@ SafetyResult SafetyManager::canDiluteEC() const
     SafetyResult result = canDoseEC();
     if(result != SafetyResult::SAFE) return result;
     if(systemState.refillSubsystemLocked) return SafetyResult::SUBSYSTEM_LOCKED;
-    if(sensors.waterLevel >= systemState.refillStopLevel &&
+    if(sensors.waterLevelCm >= systemState.refillStopLevelCm &&
        sensors.ec > systemState.ecTargetMax) return SafetyResult::RESERVOIR_FULL;
     return SafetyResult::SAFE;
 }
@@ -221,7 +232,12 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SAFETY_LOCKED;
     }
 
-    if(!validWaterLevel() || !validEnvironment())
+    // DHT/environment validity is deliberately NOT checked here - see the
+    // automation resilience pass report. Root fogging's hard requirements
+    // are water/pH/EC/ownership only; DHT selects the fog cadence
+    // (AutomationManager::processFogCycle()) but never gates permission to
+    // fog. This is an intentional behavior change from the prior design.
+    if(!validWaterLevel())
     {
         return SafetyResult::SENSOR_FAULT;
     }
@@ -231,6 +247,9 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SENSOR_FAULT;
     }
 
+    // sensors.ph is the stable-value filter's authoritative output (see
+    // SensorManager::applyEffectiveSensors()), so this plain comparison
+    // no longer needs its own decision-layer hysteresis.
     if(sensors.ph < systemState.minPH || sensors.ph > systemState.maxPH)
     {
         return SafetyResult::INVALID_PH;
@@ -256,7 +275,10 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::INVALID_EC;
     }
 
-    if(sensors.waterLevel < systemState.refillStartLevel)
+    // refillStartLevelCm, not criticalLowWaterCm - see canDosePH()'s matching
+    // comment.
+    if(!systemState.ignoreWaterLevelAutomation &&
+       sensors.waterLevelCm <= systemState.refillStartLevelCm)
     {
         return SafetyResult::LOW_WATER;
     }
@@ -281,7 +303,10 @@ SafetyResult SafetyManager::canCool() const
         return SafetyResult::SENSOR_FAULT;
     }
 
-    if(sensors.waterLevel < systemState.refillStartLevel)
+    // refillStartLevelCm, not criticalLowWaterCm - see canDosePH()'s matching
+    // comment.
+    if(!systemState.ignoreWaterLevelAutomation &&
+       sensors.waterLevelCm <= systemState.refillStartLevelCm)
     {
         return SafetyResult::LOW_WATER;
     }
@@ -344,6 +369,7 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
         {
             systemState.ecSubsystemLocked = false;
             cleared = true;
+            Serial.println("[EC-LOCK] cleared reason=reset_safety");
         }
         else reason += "EC subsystem remains unsafe. ";
     }
@@ -354,14 +380,30 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
         {
             systemState.refillSubsystemLocked = false;
             cleared = true;
+
+            // Temporary diagnostic: prove exactly which admin Reset Safety
+            // request cleared the lock, and when - see the root-cause
+            // finding above the requestId gate in
+            // AutomationManager::createOperationRequest().
+            Serial.print("[REFILL-LOCK] CLEAR-WRITER source=reset_safety requestId=");
+            Serial.print(systemState.operationRequest.requestId);
+            Serial.print(" t=");
+            Serial.print(millis());
+            Serial.print(" water=");
+            Serial.println(sensors.waterLevel, 2);
         }
         else reason += "Refill subsystem water-level input remains unsafe. ";
     }
 
     if(systemState.coolingSubsystemLocked)
     {
+        // Mirrors canCool()'s own gate (refillStartLevelCm, not
+        // criticalLowWaterCm) - this must clear exactly when canCool() would
+        // newly report SAFE, or the lock could be released while canCool()
+        // still blocks, or stay stuck after canCool() would already permit
+        // cooling again.
         if(validWaterLevel() && validWaterTemperature() &&
-           sensors.waterLevel >= systemState.refillStartLevel)
+           sensors.waterLevelCm > systemState.refillStartLevelCm)
         {
             systemState.coolingSubsystemLocked = false;
             cleared = true;

@@ -87,6 +87,19 @@ namespace
         return actuator == CANOPY_FAN || actuator == BLOWER;
     }
 
+    // SINGLE authoritative percentage-to-PWM-duty conversion (real-hardware
+    // Canopy/Blower PWM verification follow-up) - every PWM write for both
+    // CANOPY_FAN and BLOWER goes through this one function rather than a
+    // duplicated inline calculation. Matches CANOPY_BLOWER_PWM_RESOLUTION_BITS
+    // (8-bit, 0-255) from the same ledcAttach() call this duty value is
+    // written with.
+    uint8_t percentToDuty(uint8_t percent)
+    {
+        if (percent > 100) percent = 100;
+        constexpr uint16_t maxDuty = (1u << CANOPY_BLOWER_PWM_RESOLUTION_BITS) - 1;
+        return (uint8_t)((percent / 100.0f) * maxDuty);
+    }
+
     bool validPH(float value)
     {
         return isfinite(value) && value >= 0.0f && value <= 14.0f;
@@ -102,12 +115,37 @@ namespace
         return isfinite(value) && value >= 0.0f && value <= 100.0f;
     }
 
-    bool validEnvironment()
+    // Single source of truth for every per-actuator LOW WATER hard block in
+    // validateCommand() below. With the developer override
+    // (systemState.ignoreWaterLevelAutomation) off, behaves exactly as
+    // before: true (blocked) whenever the reservoir depth is at or below
+    // refillStartLevelCm - see Config.h's "Water Reservoir Geometry" section
+    // and the static automation integration audit. This is the OPERATIONAL
+    // low-water boundary (the same level that makes refill eligible, not the
+    // stricter criticalLowWaterCm escalation threshold on top of it - see
+    // SafetyManager::canDosePH()'s matching comment for the full hierarchy).
+    // With the override on, this specific reason - and only this reason - is
+    // waived for physical testing with a reservoir intentionally kept low;
+    // every other hard check in validateCommand() (locks, sensor validity,
+    // mutual exclusion, circulation dependency, etc.) is untouched. Logs
+    // once per command intake (runningValidation false) so a multi-second
+    // dose under the override doesn't spam Serial on every RUNNING-state
+    // re-check tick.
+    bool lowWaterBlocks(Actuator actuator, bool runningValidation)
     {
-        return isfinite(sensors.temperature) &&
-            sensors.temperature >= -40.0f && sensors.temperature <= 100.0f &&
-            isfinite(sensors.humidity) &&
-            sensors.humidity >= 0.0f && sensors.humidity <= 100.0f;
+        if (sensors.waterLevelCm > systemState.refillStartLevelCm) return false;
+
+        if (systemState.ignoreWaterLevelAutomation)
+        {
+            if (!runningValidation)
+            {
+                Serial.print("[DEV WATER] LOW_WATER bypassed for ");
+                Serial.println(actuatorLogName(actuator));
+            }
+            return false;
+        }
+
+        return true;
     }
 
     // Actuators that already carry an explicit hard manual runtime cap in the
@@ -167,7 +205,7 @@ void ActuatorManager::begin()
         if (isPwmActuator((Actuator)i))
         {
             // ESP32 Core 3.x API
-            ledcAttach(getPin((Actuator)i), 5000, 8); // pin, freq, resolution
+            ledcAttach(getPin((Actuator)i), CANOPY_BLOWER_PWM_FREQUENCY_HZ, CANOPY_BLOWER_PWM_RESOLUTION_BITS); // pin, freq, resolution
             ledcWrite(getPin((Actuator)i), 0); // pin, duty
         }
         else
@@ -183,6 +221,7 @@ void ActuatorManager::begin()
         statuses[i].running = false;
         manuallyOverridden[i] = false;
         automaticSkipLogged[i] = false;
+        lastLoggedPwmPercent[i] = -1;
         deadlineExpired[i] = false;
 
         if (isDeadlineProtected((Actuator)i) && deadlineTimers[i] == nullptr)
@@ -224,6 +263,31 @@ void ActuatorManager::turnOff(Actuator actuator)
     if (isPwmActuator(actuator))
     {
         ledcWrite(getPin(actuator), 0);
+
+        // Same change-detection as the RUNNING-state PWM diagnostic - an
+        // OFF is a commanded-percentage change to 0% too, and this is the
+        // only place that transition is ever applied to hardware.
+        if (lastLoggedPwmPercent[actuator] != 0)
+        {
+            lastLoggedPwmPercent[actuator] = 0;
+            constexpr uint16_t maxDuty = (1u << CANOPY_BLOWER_PWM_RESOLUTION_BITS) - 1;
+            if (actuator == CANOPY_FAN && debugManager.shouldPrintActuator(actuator))
+            {
+                Serial.print("[CANOPY-PWM] requested=0% duty=0/");
+                Serial.println(maxDuty);
+            }
+            else if (actuator == BLOWER && debugManager.shouldPrintActuator(actuator))
+            {
+                // configured= still reflects the standing automatic setting
+                // (systemState.blowerSpeedPercent) - only the commanded/
+                // applied speed drops to 0% when the blower turns off, the
+                // configuration itself is untouched.
+                Serial.print("[BLOWER-PWM] configured=");
+                Serial.print(systemState.blowerSpeedPercent);
+                Serial.print("% commanded=0% duty=0/");
+                Serial.println(maxDuty);
+            }
+        }
     }
     else
     {
@@ -314,19 +378,18 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
         Serial.print(state ? "ON" : "OFF");
         Serial.println(" received");
 
-        // A manual OFF against an in-progress automatic refill is the
-        // admin's explicit judgment that the current water level is good
-        // enough - handled as an intentional early stop (mirrors exactly
-        // what AutomationManager::handleRefilling() itself does once
-        // sensors.waterLevel reaches refillStopLevel) rather than being
-        // silently dropped by the generic guard just below. A no-op inside
-        // stopRefillManually() if the solenoid's automatic run turns out not
-        // to actually be a refill (e.g. EC dilution).
+        // A manual OFF against an in-progress automatic refill first closes
+        // the refill OperationRequest cleanly, then CONTINUES through this
+        // function so the accepted OFF becomes a real manual command and
+        // takes sticky manual ownership. Returning here used to stop the
+        // operation but leave the actuator automatic-owned, allowing a later
+        // automation tick to reclaim it. stopRefillManually() is a no-op for
+        // non-refill solenoid use (for example EC dilution), where the manual
+        // OFF still must proceed and outrank that automatic owner.
         if (actuator == SOLENOID && !state &&
             statuses[actuator].running && statuses[actuator].source == "automatic")
         {
             automationManager.stopRefillManually();
-            return;
         }
 
         // Manual control outranks an automatic owner (priority model: MANUAL
@@ -515,7 +578,7 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 outReason = "Cannot dose: Water-level reading is invalid.";
                 return false;
             }
-            if (sensors.waterLevel < systemState.refillStartLevel)
+            if (lowWaterBlocks(actuator, runningValidation))
             {
                 outReason = "Cannot dose: Water reservoir level is too low.";
                 return false;
@@ -644,12 +707,18 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 }
 
                 // SOFT rule ("refill not currently required") - overridable.
+                // Depth-based (see Config.h's "Water Reservoir Geometry"):
+                // a fresh manual request is rejected once above
+                // refillStartLevelCm (mirrors the automatic trigger's own
+                // <= eligibility bound), an already-running one auto-stops
+                // at refillStopLevelCm - the same deliberate hysteresis the
+                // automatic refill uses.
                 if (!statuses[actuator].overrideActive)
                 {
-                    const float threshold = runningValidation
-                        ? systemState.refillStopLevel
-                        : systemState.refillStartLevel;
-                    if (sensors.waterLevel >= threshold)
+                    const bool alreadySatisfied = runningValidation
+                        ? sensors.waterLevelCm >= systemState.refillStopLevelCm
+                        : sensors.waterLevelCm > systemState.refillStartLevelCm;
+                    if (alreadySatisfied)
                     {
                         outReason = runningValidation
                             ? "Refill complete: Stop level reached."
@@ -673,7 +742,7 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 outReason = "Peltier stopped. Water-level reading is invalid.";
                 return false;
             }
-            if (sensors.waterLevel < systemState.refillStartLevel)
+            if (lowWaterBlocks(actuator, runningValidation))
             {
                 if (manual) automationManager.setManualCoolingDemand(false);
                 outReason = "Peltier stopped. Water reservoir level is too low.";
@@ -687,29 +756,24 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             }
             if (manual)
             {
-                // SOFT rule ("water temperature already within target") -
-                // overridable. NOTE: unlike the dosing pumps, Peltier's
-                // manual runtime cap is the much longer OPERATION_TIMEOUT_MS
-                // (5 min, Config.h) - an override here can keep cooling
-                // running for up to that whole window rather than a short
-                // pulse. Flagged for a policy decision; not changed here.
-                if (!statuses[actuator].overrideActive)
-                {
-                    const float threshold = runningValidation
-                        ? systemState.coolerOffTemp
-                        : systemState.highWaterTemp;
-                    if (sensors.waterTemp <= threshold)
-                    {
-                        automationManager.setManualCoolingDemand(false);
-                        outReason = runningValidation
-                            ? "Cooling complete: Cooler-off temperature reached."
-                            : "Peltier rejected: Water temperature does not require cooling.";
-                        return false;
-                    }
-                }
-
-                // Contribute to the existing PELTIER demand bit before waiting
-                // for the automation-owned circulation actuator to acknowledge.
+                // Manual ownership must win over the automatic temperature
+                // demand (control priority: hard safety > manual > automatic
+                // - see the real-hardware pre-integration task). This used
+                // to enforce a SOFT "water temperature already within
+                // target" rule here: reject a fresh manual ON, or
+                // auto-stop (runningValidation) an already-running manual
+                // Peltier, the instant waterTemp <= highWaterTemp/
+                // coolerOffTemp. On a bench where ambient water is cooler
+                // than maxWaterTemp - the normal case - that silently
+                // rejected every manual ON and immediately auto-stopped any
+                // manual command that did get through, making manual
+                // Peltier control unusable. Removed for manual entirely;
+                // every genuine HARD safety check above (subsystem lock,
+                // invalid/low water) and the circulation-pump interlock
+                // below remain fully enforced - this only stops a SOFT
+                // automatic target from overriding an explicit manual
+                // command, exactly like every other actuator's manual
+                // ownership already works.
                 automationManager.setManualCoolingDemand(true);
             }
             {
@@ -729,7 +793,7 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 outReason = "Circulation pump stopped. Water-level reading is invalid.";
                 return false;
             }
-            if (sensors.waterLevel < systemState.refillStartLevel)
+            if (lowWaterBlocks(actuator, runningValidation))
             {
                 outReason = "Circulation pump stopped. Water reservoir level is too low.";
                 return false;
@@ -750,16 +814,16 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 outReason = "Fogger stopped. Water-level reading is invalid.";
                 return false;
             }
-            if (sensors.waterLevel < systemState.refillStartLevel)
+            if (lowWaterBlocks(actuator, runningValidation))
             {
                 outReason = "Fogger stopped. Water reservoir level is too low.";
                 return false;
             }
-            if (!validEnvironment())
-            {
-                outReason = "Fogger stopped. Environmental sensor reading is invalid.";
-                return false;
-            }
+            // DHT/environment validity deliberately NOT checked here - see
+            // the automation resilience pass report and
+            // SafetyManager::canFog()'s matching comment. This used to be an
+            // unconditional block (even for manual commands); root fogging's
+            // hard requirements are water/pH/EC/ownership only.
             break;
         case BLOWER:
             // Automatic blower demand is the delivery half of an automatic fog
@@ -1018,8 +1082,40 @@ void ActuatorManager::update()
                     {
                         if (isPwmActuator(a))
                         {
-                            uint8_t pwmValue = (uint8_t)((status.speed / 100.0f) * 255.0f);
+                            const uint8_t pwmValue = percentToDuty(status.speed);
                             ledcWrite(getPin(a), pwmValue);
+
+                            // [CANOPY-PWM]/[BLOWER-PWM]: the commanded PWM
+                            // OUTPUT only - never claimed as measured/actual
+                            // RPM (this hardware has no tachometer feedback;
+                            // see this task's own note). Logged only on a
+                            // change to the applied percentage, not every
+                            // tick this state re-runs.
+                            if ((int16_t)status.speed != lastLoggedPwmPercent[a])
+                            {
+                                lastLoggedPwmPercent[a] = status.speed;
+                                constexpr uint16_t maxDuty = (1u << CANOPY_BLOWER_PWM_RESOLUTION_BITS) - 1;
+                                if (a == CANOPY_FAN && debugManager.shouldPrintActuator(a))
+                                {
+                                    Serial.print("[CANOPY-PWM] requested=");
+                                    Serial.print(status.speed);
+                                    Serial.print("% duty=");
+                                    Serial.print(pwmValue);
+                                    Serial.print("/");
+                                    Serial.println(maxDuty);
+                                }
+                                else if (a == BLOWER && debugManager.shouldPrintActuator(a))
+                                {
+                                    Serial.print("[BLOWER-PWM] configured=");
+                                    Serial.print(systemState.blowerSpeedPercent);
+                                    Serial.print("% commanded=");
+                                    Serial.print(status.speed);
+                                    Serial.print("% duty=");
+                                    Serial.print(pwmValue);
+                                    Serial.print("/");
+                                    Serial.println(maxDuty);
+                                }
+                            }
                         }
                     }
                     break;
@@ -1044,7 +1140,10 @@ void ActuatorManager::update()
                         automationManager.setManualCoolingDemand(false);
                         systemState.coolingSubsystemLocked = true;
                         statusDirty = true;
-                        Serial.println("[SAFETY] PELTIER stopped: circulation unavailable");
+                        if (debugManager.shouldPrintActuator(PELTIER))
+                        {
+                            Serial.println("[SAFETY] PELTIER stopped: circulation unavailable");
+                        }
                     }
                     turnOff(a);
                     status.running = false;
@@ -1106,9 +1205,10 @@ void ActuatorManager::update()
         {
             statusDirty = true;
 
-            if (previousStatus.state != status.state ||
+            if ((previousStatus.state != status.state ||
                 previousStatus.running != status.running ||
-                previousStatus.source != status.source)
+                previousStatus.source != status.source) &&
+                debugManager.shouldPrintActuator(a))
             {
                 Serial.print("[ACTUATOR] ");
                 Serial.print(actuatorLogName(a));

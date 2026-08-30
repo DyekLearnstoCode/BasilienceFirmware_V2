@@ -117,13 +117,23 @@ private:
     bool refillRejectionLogged = false;
     float lastRejectedRefillStart = NAN;
     float lastRejectedRefillStop = NAN;
+    bool refillLevelCmSettingsInitialized = false;
+    bool refillLevelCmRejectionLogged = false;
+    float lastRejectedRefillStartCm = NAN;
+    float lastRejectedRefillStopCm = NAN;
     bool waterLevelCalibrationInitialized = false;
     bool waterLevelCalibrationRejectionLogged = false;
     float lastRejectedWaterLevelEmptyCm = NAN;
     float lastRejectedWaterLevelFullCm = NAN;
+    // sensorToBottomCm - the authoritative calibration field (see Types.h's
+    // matching comment and the automation resilience pass report), tracked
+    // independently of the legacy waterLevelCalibrationInitialized above.
+    bool sensorToBottomCalibrationInitialized = false;
     bool highAirTempSettingsInitialized = false;
     bool highAirTempRejectionLogged = false;
     float lastRejectedHighAirTemp = NAN;
+    bool blowerSpeedRejectionLogged = false;
+    float lastRejectedBlowerSpeed = NAN;
 
     unsigned long lastAlertFullUpload = 0;
     unsigned long lastActuatorFullUpload = 0;
@@ -196,6 +206,9 @@ private:
     void readCommands();
     void readActuatorCommands();
     void primeActuatorCommands();
+    bool applyAutomationTestModeCommand(FirebaseJson& snapshot);
+    void setAutomationTestMode(AutomationTestSubsystem subsystem,
+                               bool publishAcknowledgement = true);
     void consumeActuatorCommandSnapshot(FirebaseJson& snapshot, bool dispatchCommands);
     void loadActuatorCommandTimestamps();
     void saveActuatorCommandTimestamp(Actuator actuator, uint64_t timestamp);
@@ -205,7 +218,7 @@ private:
 
     // Developer testing override that bypasses ONLY the automatic
     // water-level/refill gate (AutomationManager's handleNormal(),
-    // processReadyLocalRegulation(), handleRefilling()). Mirrors
+    // handleRefilling()). Mirrors
     // readSensorTestCommand()/setSensorTestEnabled()'s shape exactly - see
     // those for the established command/status RTDB pattern this follows.
     void readWaterLevelOverrideCommand();

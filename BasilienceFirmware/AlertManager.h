@@ -34,6 +34,7 @@ private:
     // condition - without delaying recovery, or delaying an automation
     // trigger that reads the same flag (e.g. lowWater/ecLow/ecHigh).
     uint8_t lowWaterPendingCount = 0;
+    uint8_t criticalLowWaterPendingCount = 0;
     uint8_t waterLevelLowPendingCount = 0;
     uint8_t waterLevelHighPendingCount = 0;
     uint8_t lowAirTemperaturePendingCount = 0;

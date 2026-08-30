@@ -70,6 +70,8 @@ private:
     AlertState lastObservedAlerts;
     bool alertBaselineCaptured = false;
 
+    bool alertNotificationAllowed(NotificationEventType type) const;
+
     bool deviceUnreachableEpisodeActive = false;
     bool cloudWasDown = false;
     unsigned long cloudDownSinceMillis = 0;

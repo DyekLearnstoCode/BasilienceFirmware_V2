@@ -60,19 +60,22 @@ void NotificationManager::observeAlertTransitions()
     // of the device's, so the redundant delivery channel stays unconditional.
     const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
 
-    if (alertState.lowWater && !lastObservedAlerts.lowWater)
+    if (alertState.lowWater && !lastObservedAlerts.lowWater &&
+        alertNotificationAllowed(NotificationEventType::LOW_WATER))
     {
         enqueueEvent(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
                      "Low Reservoir", "Water level dropped below the refill threshold.",
                      String(millis()), true, !cloudUp);
     }
-    if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange)
+    if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange &&
+        alertNotificationAllowed(NotificationEventType::HIGH_WATER_TEMP))
     {
         enqueueEvent(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Water Temperature", "Water temperature exceeded the configured limit.",
                      String(millis()), true, !cloudUp);
     }
-    if (alertState.highTemperature && !lastObservedAlerts.highTemperature)
+    if (alertState.highTemperature && !lastObservedAlerts.highTemperature &&
+        alertNotificationAllowed(NotificationEventType::HIGH_AIR_TEMP))
     {
         enqueueEvent(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Air Temperature", "Air temperature exceeded the configured limit.",
@@ -86,6 +89,41 @@ void NotificationManager::observeAlertTransitions()
     }
 
     lastObservedAlerts = alertState;
+}
+
+bool NotificationManager::alertNotificationAllowed(NotificationEventType type) const
+{
+    // Critical/global faults are never isolated away.
+    if(type == NotificationEventType::SENSOR_FAULT ||
+       type == NotificationEventType::DEVICE_UNREACHABLE)
+    {
+        return true;
+    }
+
+    const AutomationTestSubsystem selected = systemState.automationTestSubsystem;
+    if(type == NotificationEventType::LOW_WATER &&
+       systemState.ignoreWaterLevelAutomation)
+    {
+        return false;
+    }
+    if(selected == AutomationTestSubsystem::NONE) return true;
+
+    switch(type)
+    {
+        case NotificationEventType::LOW_WATER:
+            // The deliberate water bypass must neither notify nor enqueue a
+            // repeated LOW_WATER fallback episode while the flag is active.
+            return selected == AutomationTestSubsystem::REFILL ||
+                selected == AutomationTestSubsystem::STARTUP ||
+                selected == AutomationTestSubsystem::FOGGING;
+        case NotificationEventType::HIGH_WATER_TEMP:
+            return selected == AutomationTestSubsystem::COOLING;
+        case NotificationEventType::HIGH_AIR_TEMP:
+            return selected == AutomationTestSubsystem::CANOPY ||
+                selected == AutomationTestSubsystem::FOGGING;
+        default:
+            return false;
+    }
 }
 
 void NotificationManager::observeConnectivity()
@@ -517,16 +555,22 @@ void NotificationManager::markCloudReplaySubmitted(const char* eventId)
     queue[slot].cloudStatus = CloudReplayStatus::IN_PROGRESS;
     cloudReplaySubmittedAtMillis = millis();
     persistQueue();
-    Serial.print("[QUEUE] Replaying ");
-    Serial.println(eventId);
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[QUEUE] Replaying ");
+        Serial.println(eventId);
+    }
 }
 
 void NotificationManager::markCloudReplayAcked(const char* eventId)
 {
     int slot = findQueueSlot(eventId);
     if (slot < 0) return;
-    Serial.print("[QUEUE] Cloud ack ");
-    Serial.println(eventId);
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[QUEUE] Cloud ack ");
+        Serial.println(eventId);
+    }
     queue[slot] = NotificationEvent(); // clears inUse too
     cloudReplayInFlightEventId[0] = '\0';
     persistQueue();

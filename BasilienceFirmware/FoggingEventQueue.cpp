@@ -222,16 +222,22 @@ void FoggingEventQueue::markReplaySubmitted(const String& eventId)
 {
     if (strcmp(replayInFlightEventId, eventId.c_str()) != 0) return;
     replaySubmittedAtMillis = millis();
-    Serial.print("[FOGQ] Replaying ");
-    Serial.println(eventId);
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[FOGQ] Replaying ");
+        Serial.println(eventId);
+    }
 }
 
 void FoggingEventQueue::markReplayAcked(const String& eventId)
 {
     int slot = findSlotByEventId(eventId.c_str());
     if (slot < 0) return;
-    Serial.print("[FOGQ] Cloud ack ");
-    Serial.println(eventId);
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[FOGQ] Cloud ack ");
+        Serial.println(eventId);
+    }
     queue[slot] = FoggingQueueEvent(); // clears inUse too
     replayInFlightEventId[0] = '\0';
     persistQueue();

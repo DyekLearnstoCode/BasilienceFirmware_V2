@@ -17,6 +17,17 @@ void DebugManager::update()
     if (!DEBUG_ENABLED)
         return;
 
+    // Serial Monitor Focus Mode: the periodic round-robin dashboards below
+    // are exactly the kind of high-volume generic output an isolated
+    // controller test does not want competing with its own focused event
+    // logs (see shouldPrintDebug()'s own comment - SYSTEM is never true
+    // while a controller is isolated). Suppressed entirely rather than
+    // replaced with a mode-specific summary - the focused event logs added
+    // at each controller's own log sites already serve that role. NONE
+    // (normal/full-system operation) is completely unaffected.
+    if (!shouldPrintDebug(DebugCategory::SYSTEM))
+        return;
+
     if (millis() - lastPrintTime < DEBUG_INTERVAL)
         return;
 
@@ -143,6 +154,18 @@ void DebugManager::printSensors()
         sensors.waterLevel,
         "%",
         1);
+
+    printFloat(
+        "Water Level Depth",
+        sensors.waterLevelCm,
+        "cm",
+        2);
+
+    printFloat(
+        "Water Volume",
+        sensors.waterVolumeLiters,
+        "L",
+        2);
 
     printFloat(
         "Water Level Distance",
@@ -458,5 +481,140 @@ void DebugManager::printRTC()
     Serial.println(systemState.lightOffMinute);
 
     printSeparator();
+}
+
+// ======================================================
+// Serial Monitor Focus Mode
+// ======================================================
+// See DebugManager.h's own comments. All three methods read
+// systemState.automationTestSubsystem fresh on every call - no cached/
+// compile-time state - so they track a live mode change immediately.
+
+bool DebugManager::shouldPrintDebug(DebugCategory category) const
+{
+    if (systemState.automationTestSubsystem == AutomationTestSubsystem::NONE)
+        return true;
+
+    switch (systemState.automationTestSubsystem)
+    {
+        case AutomationTestSubsystem::STARTUP:
+            // Startup's own phase/timer diagnostics, plus water depth - the
+            // pre-startup refill decision and accepted waterLevelCm are
+            // explicitly in scope even though REFILL is not the isolated
+            // controller. DHT deliberately excluded: startup fogging does
+            // not consume it (SafetyManager::canFog()).
+            return category == DebugCategory::STARTUP ||
+                   category == DebugCategory::WATER;
+
+        case AutomationTestSubsystem::REFILL:
+            return category == DebugCategory::WATER;
+
+        case AutomationTestSubsystem::PH:
+            return category == DebugCategory::PH;
+
+        case AutomationTestSubsystem::EC:
+            return category == DebugCategory::EC;
+
+        case AutomationTestSubsystem::COOLING:
+            return category == DebugCategory::COOLING;
+
+        case AutomationTestSubsystem::FOGGING:
+            // DHT is optional for fogging (cadence selection only) but its
+            // availability/stale status is explicitly requested - the raw
+            // read diagnostics are already throttled to one line per 5s
+            // (DHT_RAW_DIAGNOSTIC_INTERVAL_MS) so this is not the per-pH/EC-
+            // sample spam the task explicitly asks to avoid re-testing here.
+            return category == DebugCategory::FOGGING ||
+                   category == DebugCategory::DHT;
+
+        case AutomationTestSubsystem::CANOPY:
+            return category == DebugCategory::CANOPY ||
+                   category == DebugCategory::DHT;
+
+        case AutomationTestSubsystem::GROW_LIGHT:
+            return category == DebugCategory::LIGHT;
+
+        default:
+            return false;
+    }
+}
+
+bool DebugManager::shouldPrintActuator(Actuator actuator) const
+{
+    if (systemState.automationTestSubsystem == AutomationTestSubsystem::NONE)
+        return true;
+
+    switch (systemState.automationTestSubsystem)
+    {
+        case AutomationTestSubsystem::STARTUP:
+            return actuator == FOGGER || actuator == BLOWER || actuator == SOLENOID;
+
+        case AutomationTestSubsystem::REFILL:
+            return actuator == SOLENOID;
+
+        case AutomationTestSubsystem::PH:
+            return actuator == PH_UP_PUMP || actuator == PH_DOWN_PUMP ||
+                   actuator == CIRCULATION_PUMP;
+
+        case AutomationTestSubsystem::EC:
+            // SOLENOID included - EC dilution actuates it (see
+            // AutomationManager::handleDosingEC()'s EC_DILUTE branch).
+            return actuator == GROW_PUMP || actuator == BLOOM_PUMP ||
+                   actuator == CIRCULATION_PUMP || actuator == SOLENOID;
+
+        case AutomationTestSubsystem::COOLING:
+            return actuator == PELTIER || actuator == CIRCULATION_PUMP;
+
+        case AutomationTestSubsystem::FOGGING:
+            return actuator == FOGGER || actuator == BLOWER;
+
+        case AutomationTestSubsystem::CANOPY:
+            return actuator == CANOPY_FAN;
+
+        case AutomationTestSubsystem::GROW_LIGHT:
+            return actuator == GROW_LIGHT;
+
+        default:
+            return false;
+    }
+}
+
+bool DebugManager::shouldPrintStateTransition(SystemMode fromMode, SystemMode toMode) const
+{
+    if (systemState.automationTestSubsystem == AutomationTestSubsystem::NONE)
+        return true;
+
+    // Always-critical / always-common, regardless of which controller (if
+    // any) is isolated: a safety lock is a system-wide event by definition,
+    // and NORMAL/SENSOR_STABILIZATION are the shared resting/boot states
+    // every controller transitions through.
+    if (fromMode == SAFETY_LOCK || toMode == SAFETY_LOCK ||
+        fromMode == SENSOR_STABILIZATION || toMode == SENSOR_STABILIZATION ||
+        toMode == NORMAL)
+        return true;
+
+    switch (systemState.automationTestSubsystem)
+    {
+        case AutomationTestSubsystem::STARTUP:
+            return fromMode == STARTUP || toMode == STARTUP;
+
+        case AutomationTestSubsystem::REFILL:
+            return fromMode == REFILLING || toMode == REFILLING;
+
+        case AutomationTestSubsystem::PH:
+            return fromMode == DOSING_PH || toMode == DOSING_PH ||
+                   fromMode == STABILIZING_PH || toMode == STABILIZING_PH;
+
+        case AutomationTestSubsystem::EC:
+            return fromMode == DOSING_EC || toMode == DOSING_EC ||
+                   fromMode == STABILIZING_EC || toMode == STABILIZING_EC;
+
+        default:
+            // COOLING/FOGGING/CANOPY/GROW_LIGHT have no dedicated SystemMode
+            // of their own - they run continuously inside NORMAL (already
+            // covered by the toMode == NORMAL rule above), so there is no
+            // additional state transition to show for them.
+            return false;
+    }
 }
 

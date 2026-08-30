@@ -13,6 +13,16 @@ constexpr unsigned long COMMAND_FAILURE_BACKOFF_INTERVAL = 5000;
 constexpr unsigned long MOCK_READ_INTERVAL     = 2000;
 constexpr unsigned long SETTINGS_READ_INTERVAL = 60000;
 constexpr unsigned long UPLOAD_INTERVAL        = 10000;
+// Dedicated sensor-telemetry cadence (quick-response refinement task) -
+// deliberately separate from UPLOAD_INTERVAL above, which is still used
+// unchanged by writeStatus()/writeTelemetry() (status/telemetry are not
+// latency-sensitive the way live pH/EC/water/temperature display is).
+// Audited: UPLOAD_INTERVAL's only OTHER use tied to the sensor heartbeat
+// itself (the isSensorUploadDue() gate and the debug/physicalSensors
+// diagnostic's own "is the main heartbeat current" check) now uses this
+// constant instead, so both track the same real cadence; every other
+// UPLOAD_INTERVAL use is untouched.
+constexpr unsigned long SENSOR_UPLOAD_INTERVAL_MS = 1000;
 constexpr unsigned long DEVICE_INFO_INTERVAL   = 15000;
 constexpr unsigned long REALTIME_FALLBACK_INTERVAL = 60000;
 constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
@@ -241,14 +251,25 @@ void FirebaseManager::loadPersistedSettings()
         systemState.ecTargetMax = preferences.getFloat("ecTargetMax", systemState.ecTargetMax);
         systemState.refillStartLevel = preferences.getFloat("refillStart", systemState.refillStartLevel);
         systemState.refillStopLevel = preferences.getFloat("refillStop", systemState.refillStopLevel);
+        systemState.refillStartLevelCm = preferences.getFloat("refillStartCm", systemState.refillStartLevelCm);
+        systemState.refillStopLevelCm = preferences.getFloat("refillStopCm", systemState.refillStopLevelCm);
+        systemState.criticalLowWaterCm = preferences.getFloat("critLowCm", systemState.criticalLowWaterCm);
         systemState.waterLevelEmptyDistanceCm = preferences.getFloat("wlEmptyCm", systemState.waterLevelEmptyDistanceCm);
         systemState.waterLevelFullDistanceCm = preferences.getFloat("wlFullCm", systemState.waterLevelFullDistanceCm);
+        // Own NVS key, deliberately not derived from "wlEmptyCm" above - see
+        // Types.h's sensorToBottomCm comment.
+        systemState.sensorToBottomCm = preferences.getFloat("sensorBottomCm", systemState.sensorToBottomCm);
         systemState.highAirTemp = preferences.getFloat("highAir", systemState.highAirTemp);
         systemState.airTempRelease = preferences.getFloat("airRelease", systemState.airTempRelease);
         systemState.highHumidity = preferences.getFloat("highHumidity", systemState.highHumidity);
         systemState.humidityRelease = preferences.getFloat("humidityRel", systemState.humidityRelease);
         systemState.highWaterTemp = preferences.getFloat("highWater", systemState.highWaterTemp);
         systemState.coolerOffTemp = preferences.getFloat("coolerOff", systemState.coolerOffTemp);
+        // Loaded BEFORE Firebase becomes available on this boot, per this
+        // task's own requirement - falls back to the compiled default
+        // (BLOWER_SPEED_DEFAULT_PERCENT) only if this key was never
+        // persisted (first boot, or before this feature existed).
+        systemState.blowerSpeedPercent = preferences.getUChar("blowerSpeed", systemState.blowerSpeedPercent);
         Serial.println("[SETTINGS] Restored persisted automation settings");
     }
     preferences.end();
@@ -271,14 +292,22 @@ void FirebaseManager::persistSettings()
     preferences.putFloat("ecTargetMax", systemState.ecTargetMax);
     preferences.putFloat("refillStart", systemState.refillStartLevel);
     preferences.putFloat("refillStop", systemState.refillStopLevel);
+    preferences.putFloat("refillStartCm", systemState.refillStartLevelCm);
+    preferences.putFloat("refillStopCm", systemState.refillStopLevelCm);
+    preferences.putFloat("critLowCm", systemState.criticalLowWaterCm);
     preferences.putFloat("wlEmptyCm", systemState.waterLevelEmptyDistanceCm);
     preferences.putFloat("wlFullCm", systemState.waterLevelFullDistanceCm);
+    preferences.putFloat("sensorBottomCm", systemState.sensorToBottomCm);
     preferences.putFloat("highAir", systemState.highAirTemp);
     preferences.putFloat("airRelease", systemState.airTempRelease);
     preferences.putFloat("highHumidity", systemState.highHumidity);
     preferences.putFloat("humidityRel", systemState.humidityRelease);
     preferences.putFloat("highWater", systemState.highWaterTemp);
     preferences.putFloat("coolerOff", systemState.coolerOffTemp);
+    // Only ever reached via readSettings() after a value already passed
+    // validation there, or via the compiled default already in
+    // systemState - never writes an unvalidated Firebase value.
+    preferences.putUChar("blowerSpeed", systemState.blowerSpeedPercent);
     preferences.putBool("valid", true);
     preferences.end();
 }
@@ -470,17 +499,38 @@ void FirebaseManager::initializeDatabase()
         json.set("refillStopLevel",
             systemState.refillStopLevel);
 
+        // Water-depth model (AUTHORITATIVE for control) - see Config.h's
+        // "Water Reservoir Geometry" section.
+        json.set("refillStartLevelCm",
+            systemState.refillStartLevelCm);
+
+        json.set("refillStopLevelCm",
+            systemState.refillStopLevelCm);
+
+        json.set("criticalLowWaterCm",
+            systemState.criticalLowWaterCm);
+
         json.set("waterLevelEmptyDistanceCm",
             systemState.waterLevelEmptyDistanceCm);
 
         json.set("waterLevelFullDistanceCm",
             systemState.waterLevelFullDistanceCm);
 
+        json.set("sensorToBottomCm",
+            systemState.sensorToBottomCm);
+
         json.set("highWaterTemp",
             systemState.highWaterTemp);
 
         json.set("coolerOffTemp",
             systemState.coolerOffTemp);
+
+        // Only reached when /settings does not exist at all yet (a brand
+        // new/never-provisioned device) - never re-seeded on every boot of
+        // an already-provisioned one. See BLOWER_SPEED_DEFAULT_PERCENT's
+        // own comment for why 50% is a fallback-only value.
+        json.set("blowerSpeedPercent",
+            systemState.blowerSpeedPercent);
 
         json.set("highAirTemp",
             systemState.highAirTemp);
@@ -825,7 +875,7 @@ void FirebaseManager::update()
 
 bool FirebaseManager::isSensorUploadDue() const
 {
-    return millis() - lastSensorUploadAttempt >= UPLOAD_INTERVAL;
+    return millis() - lastSensorUploadAttempt >= SENSOR_UPLOAD_INTERVAL_MS;
 }
 
 bool FirebaseManager::shouldDeferOptionalJobsForControlResponse()
@@ -1038,15 +1088,18 @@ void FirebaseManager::syncOperationState()
                 automaticTerminalSensorUploaded = true;
                 automaticTerminalSensorUploadFailureLogged = false;
                 automaticTerminalSnapshotUploadedAt = millis();
-                Serial.println("[OP-SYNC] Sensor snapshot uploaded");
+                if (debugManager.shouldPrintDebug(DebugCategory::NETWORK))
+                {
+                    Serial.println("[OP-SYNC] Sensor snapshot uploaded");
 
-                Serial.print("[LATENCY] sensorSnapshotUploaded t=");
-                Serial.print(automaticTerminalSnapshotUploadedAt);
-                Serial.print(" requestId=");
-                Serial.println(request.requestId);
-                Serial.print("[LATENCY] localComplete -> sensorSnapshotUploaded = ");
-                Serial.print(automaticTerminalSnapshotUploadedAt - request.completedTimestamp);
-                Serial.println(" ms");
+                    Serial.print("[LATENCY] sensorSnapshotUploaded t=");
+                    Serial.print(automaticTerminalSnapshotUploadedAt);
+                    Serial.print(" requestId=");
+                    Serial.println(request.requestId);
+                    Serial.print("[LATENCY] localComplete -> sensorSnapshotUploaded = ");
+                    Serial.print(automaticTerminalSnapshotUploadedAt - request.completedTimestamp);
+                    Serial.println(" ms");
+                }
             }
         }
 
@@ -1085,33 +1138,48 @@ void FirebaseManager::syncOperationState()
 
         if (terminal)
         {
-            Serial.print("[OP-SYNC] ");
-            Serial.print(requestStateToString(state));
-            Serial.print(" published requestId=");
-            Serial.print(request.requestId);
-            Serial.print(" operation=");
-            Serial.println(operationToString(request.operation));
+            const bool dbgNetwork = debugManager.shouldPrintDebug(DebugCategory::NETWORK);
+            if (dbgNetwork)
+            {
+                Serial.print("[OP-SYNC] ");
+                Serial.print(requestStateToString(state));
+                Serial.print(" published requestId=");
+                Serial.print(request.requestId);
+                Serial.print(" operation=");
+                Serial.println(operationToString(request.operation));
+            }
 
             if (orderedAutomaticCompletion)
             {
-                const unsigned long publishedAt = millis();
-                Serial.print("[LATENCY] completedPublished t=");
-                Serial.print(publishedAt);
-                Serial.print(" requestId=");
-                Serial.println(request.requestId);
-                Serial.print("[LATENCY] sensorSnapshotUploaded -> completedPublished = ");
-                Serial.print(publishedAt - automaticTerminalSnapshotUploadedAt);
-                Serial.println(" ms");
-                Serial.print("[LATENCY] localComplete -> completedPublished = ");
-                Serial.print(publishedAt - request.completedTimestamp);
-                Serial.println(" ms");
+                if (dbgNetwork)
+                {
+                    const unsigned long publishedAt = millis();
+                    Serial.print("[LATENCY] completedPublished t=");
+                    Serial.print(publishedAt);
+                    Serial.print(" requestId=");
+                    Serial.println(request.requestId);
+                    Serial.print("[LATENCY] sensorSnapshotUploaded -> completedPublished = ");
+                    Serial.print(publishedAt - automaticTerminalSnapshotUploadedAt);
+                    Serial.println(" ms");
+                    Serial.print("[LATENCY] localComplete -> completedPublished = ");
+                    Serial.print(publishedAt - request.completedTimestamp);
+                    Serial.println(" ms");
+                }
 
                 if (request.operation == OperationType::PH_UP ||
                     request.operation == OperationType::PH_DOWN ||
                     request.operation == OperationType::EC_CORRECTION)
                 {
                     systemState.chemistryFoggingHoldActive = false;
-                    Serial.println("[CHEMISTRY] Lifecycle published - fogging eligible");
+                    // Relevant to PH/EC (unblocks fogging eligibility after a
+                    // chemistry correction) and to FOGGING (its own optional
+                    // dependency) - not folded into dbgNetwork above.
+                    if (debugManager.shouldPrintDebug(DebugCategory::PH) ||
+                        debugManager.shouldPrintDebug(DebugCategory::EC) ||
+                        debugManager.shouldPrintDebug(DebugCategory::FOGGING))
+                    {
+                        Serial.println("[CHEMISTRY] Lifecycle published - fogging eligible");
+                    }
                 }
             }
         }
@@ -1348,6 +1416,97 @@ void FirebaseManager::readSettings()
     }
 
     //--------------------------------------------------
+    // Reservoir - water-depth model (AUTHORITATIVE for control; see
+    // Config.h's "Water Reservoir Geometry" section). Legacy percentage
+    // pair above is no longer read by any control path.
+    //--------------------------------------------------
+
+    float incomingRefillStartCm = systemState.refillStartLevelCm;
+    float incomingRefillStopCm = systemState.refillStopLevelCm;
+
+    bool hasRefillStartCm = fbdo.jsonObject().get(data, "refillStartLevelCm");
+    if (hasRefillStartCm)
+        incomingRefillStartCm = data.floatValue;
+
+    bool hasRefillStopCm = fbdo.jsonObject().get(data, "refillStopLevelCm");
+    if (hasRefillStopCm)
+        incomingRefillStopCm = data.floatValue;
+
+    if (hasRefillStartCm || hasRefillStopCm)
+    {
+        const bool validStartCm = incomingRefillStartCm >= 0.0f && incomingRefillStartCm <= MAX_WORKING_WATER_CM;
+        const bool validStopCm = incomingRefillStopCm >= 0.0f && incomingRefillStopCm <= MAX_WORKING_WATER_CM;
+        const bool validOrderCm = incomingRefillStartCm < incomingRefillStopCm;
+
+        if (validStartCm && validStopCm && validOrderCm)
+        {
+            const bool changedCm =
+                floatValuesDiffer(systemState.refillStartLevelCm, incomingRefillStartCm) ||
+                floatValuesDiffer(systemState.refillStopLevelCm, incomingRefillStopCm);
+
+            systemState.refillStartLevelCm = incomingRefillStartCm;
+            systemState.refillStopLevelCm = incomingRefillStopCm;
+
+            if (!refillLevelCmSettingsInitialized || changedCm)
+            {
+                Serial.println("[SETTINGS] Refill depth thresholds updated");
+                Serial.print("[SETTINGS] refillStartLevelCm=");
+                Serial.println(systemState.refillStartLevelCm, 2);
+                Serial.print("[SETTINGS] refillStopLevelCm=");
+                Serial.println(systemState.refillStopLevelCm, 2);
+            }
+
+            refillLevelCmSettingsInitialized = true;
+            refillLevelCmRejectionLogged = false;
+        }
+        else
+        {
+            const bool newRejectionCm =
+                !refillLevelCmRejectionLogged ||
+                floatValuesDiffer(lastRejectedRefillStartCm, incomingRefillStartCm) ||
+                floatValuesDiffer(lastRejectedRefillStopCm, incomingRefillStopCm);
+
+            if (newRejectionCm)
+            {
+                Serial.println("[SETTINGS] Refill depth threshold update rejected");
+                Serial.print("[SETTINGS] reason=");
+                if (!validStartCm)
+                    Serial.println("refillStartLevelCm must be between 0 and MAX_WORKING_WATER_CM");
+                else if (!validStopCm)
+                    Serial.println("refillStopLevelCm must be at most MAX_WORKING_WATER_CM");
+                else
+                    Serial.println("refillStartLevelCm must be less than refillStopLevelCm");
+                Serial.print("[SETTINGS] keeping startCm=");
+                Serial.println(systemState.refillStartLevelCm, 2);
+                Serial.print("[SETTINGS] keeping stopCm=");
+                Serial.println(systemState.refillStopLevelCm, 2);
+            }
+
+            refillLevelCmRejectionLogged = true;
+            lastRejectedRefillStartCm = incomingRefillStartCm;
+            lastRejectedRefillStopCm = incomingRefillStopCm;
+        }
+    }
+
+    if (fbdo.jsonObject().get(data, "criticalLowWaterCm"))
+    {
+        const float incomingCriticalLowCm = data.floatValue;
+        if (incomingCriticalLowCm >= 0.0f && incomingCriticalLowCm <= MAX_WORKING_WATER_CM)
+        {
+            if (floatValuesDiffer(systemState.criticalLowWaterCm, incomingCriticalLowCm))
+            {
+                systemState.criticalLowWaterCm = incomingCriticalLowCm;
+                Serial.print("[SETTINGS] criticalLowWaterCm=");
+                Serial.println(systemState.criticalLowWaterCm, 2);
+            }
+        }
+        else
+        {
+            Serial.println("[SETTINGS] criticalLowWaterCm update rejected: must be between 0 and MAX_WORKING_WATER_CM");
+        }
+    }
+
+    //--------------------------------------------------
     // Water level sensor calibration (empty/full distance, cm)
     //--------------------------------------------------
 
@@ -1418,6 +1577,39 @@ void FirebaseManager::readSettings()
             waterLevelCalibrationRejectionLogged = true;
             lastRejectedWaterLevelEmptyCm = incomingWaterLevelEmptyCm;
             lastRejectedWaterLevelFullCm = incomingWaterLevelFullCm;
+        }
+    }
+
+    //--------------------------------------------------
+    // Sensor-to-bottom calibration (authoritative - see the automation
+    // resilience pass report and Types.h's sensorToBottomCm comment).
+    // Deliberately a SEPARATE field/key from waterLevelEmptyDistanceCm above,
+    // never falling back to it, so a stale legacy value cannot silently
+    // resurface here.
+    //--------------------------------------------------
+
+    bool hasSensorToBottomCm = fbdo.jsonObject().get(data, "sensorToBottomCm");
+    if (hasSensorToBottomCm)
+    {
+        const float incomingSensorToBottomCm = data.floatValue;
+
+        if (incomingSensorToBottomCm > 0.0f)
+        {
+            const bool changed = floatValuesDiffer(systemState.sensorToBottomCm, incomingSensorToBottomCm);
+
+            systemState.sensorToBottomCm = incomingSensorToBottomCm;
+
+            if (!sensorToBottomCalibrationInitialized || changed)
+            {
+                Serial.print("[SETTINGS] sensorToBottomCm=");
+                Serial.println(systemState.sensorToBottomCm, 2);
+            }
+
+            sensorToBottomCalibrationInitialized = true;
+        }
+        else
+        {
+            Serial.println("[SETTINGS] sensorToBottomCm update rejected: must be greater than 0");
         }
     }
 
@@ -1507,6 +1699,43 @@ void FirebaseManager::readSettings()
     {
         systemState.highWaterTemp = incomingHighWater;
         systemState.coolerOffTemp = incomingCoolerOff;
+    }
+
+    //--------------------------------------------------
+    // Automatic fogging blower speed
+    //--------------------------------------------------
+
+    float incomingBlowerSpeed = systemState.blowerSpeedPercent;
+    if (fbdo.jsonObject().get(data, "blowerSpeedPercent"))
+        incomingBlowerSpeed = data.floatValue;
+
+    if (incomingBlowerSpeed >= BLOWER_SPEED_MIN_PERCENT &&
+        incomingBlowerSpeed <= BLOWER_SPEED_MAX_PERCENT)
+    {
+        systemState.blowerSpeedPercent = (uint8_t)incomingBlowerSpeed;
+        blowerSpeedRejectionLogged = false;
+    }
+    else
+    {
+        const bool newRejection =
+            !blowerSpeedRejectionLogged ||
+            floatValuesDiffer(lastRejectedBlowerSpeed, incomingBlowerSpeed);
+
+        if (newRejection)
+        {
+            Serial.print("[SETTINGS] blowerSpeedPercent rejected: ");
+            Serial.print(incomingBlowerSpeed, 1);
+            Serial.print(" (valid range is ");
+            Serial.print(BLOWER_SPEED_MIN_PERCENT);
+            Serial.print(" to ");
+            Serial.print(BLOWER_SPEED_MAX_PERCENT);
+            Serial.println(")");
+            Serial.print("[SETTINGS] keeping blowerSpeedPercent=");
+            Serial.println(systemState.blowerSpeedPercent);
+        }
+
+        blowerSpeedRejectionLogged = true;
+        lastRejectedBlowerSpeed = incomingBlowerSpeed;
     }
 
     // Only validated/accepted runtime values are persisted.
@@ -2245,6 +2474,7 @@ void FirebaseManager::readActuatorCommands()
     }
     const bool startProvisioningRequested =
         snapshot.get(jsonData, "startProvisioning") && jsonData.success && jsonData.boolValue;
+    const bool automationTestModeChanged = applyAutomationTestModeCommand(snapshot);
 
     const bool dispatchCommands = actuatorCommandsPrimed;
     consumeActuatorCommandSnapshot(snapshot, dispatchCommands);
@@ -2252,6 +2482,11 @@ void FirebaseManager::readActuatorCommands()
     {
         actuatorCommandsPrimed = true;
         Serial.println("[MANUAL] Existing actuator commands consumed as reconnect baseline");
+    }
+
+    if(automationTestModeChanged)
+    {
+        setAutomationTestMode(systemState.automationTestSubsystem, true);
     }
 
     // Developer-only manual provisioning trigger.
@@ -2290,9 +2525,113 @@ void FirebaseManager::primeActuatorCommands()
     }
 
     FirebaseJson& snapshot = fbdo.jsonObject();
+    const bool automationTestModeChanged = applyAutomationTestModeCommand(snapshot);
     consumeActuatorCommandSnapshot(snapshot, false);
+    if(automationTestModeChanged)
+    {
+        setAutomationTestMode(systemState.automationTestSubsystem, true);
+    }
     actuatorCommandsPrimed = true;
     Serial.println("[MANUAL] Existing actuator commands consumed as boot baseline");
+}
+
+bool FirebaseManager::applyAutomationTestModeCommand(FirebaseJson& snapshot)
+{
+    FirebaseJsonData data;
+
+    // Developer-only Grow Light mock time - read unconditionally, ahead of
+    // the enabled/subsystem branches below, so a value stays captured in
+    // systemState even while a different (or no) Automation Test Mode is
+    // currently selected. Safe either way: AutomationManager::
+    // growLightMockTimeActive() re-checks automationTestSubsystem ==
+    // GROW_LIGHT live on every use, so a stored value never takes effect on
+    // its own - the app is not required to delete it when switching test
+    // modes away from Grow Light. Minutes are clamped, not rejected, since
+    // this is a developer convenience field, not a production safety
+    // setting.
+    if(snapshot.get(data, "automationTestMode/mockGrowLightTimeEnabled") && data.success)
+    {
+        systemState.mockGrowLightTimeEnabled = data.boolValue;
+    }
+    if(snapshot.get(data, "automationTestMode/mockGrowLightMinutes") && data.success)
+    {
+        int minutes = data.intValue;
+        if(minutes < 0) minutes = 0;
+        if(minutes > 1439) minutes = 1439;
+        systemState.mockGrowLightMinutes = (uint16_t)minutes;
+    }
+
+    if(!snapshot.get(data, "automationTestMode/enabled") || !data.success)
+    {
+        return false;
+    }
+
+    const AutomationTestSubsystem previous = systemState.automationTestSubsystem;
+    const bool enabled = data.boolValue;
+    if(!enabled)
+    {
+        setAutomationTestMode(AutomationTestSubsystem::NONE, false);
+        return previous != systemState.automationTestSubsystem;
+    }
+
+    if(!snapshot.get(data, "automationTestMode/subsystem") || !data.success)
+    {
+        Serial.println("[AUTO-TEST] rejected command: enabled mode has no subsystem");
+        return false;
+    }
+
+    String value = data.stringValue;
+    value.trim();
+    value.toUpperCase();
+
+    AutomationTestSubsystem subsystem = AutomationTestSubsystem::NONE;
+    bool valid = true;
+    if(value == "STARTUP") subsystem = AutomationTestSubsystem::STARTUP;
+    else if(value == "REFILL") subsystem = AutomationTestSubsystem::REFILL;
+    else if(value == "PH") subsystem = AutomationTestSubsystem::PH;
+    else if(value == "EC") subsystem = AutomationTestSubsystem::EC;
+    else if(value == "COOLING") subsystem = AutomationTestSubsystem::COOLING;
+    else if(value == "FOGGING") subsystem = AutomationTestSubsystem::FOGGING;
+    else if(value == "CANOPY") subsystem = AutomationTestSubsystem::CANOPY;
+    else if(value == "GROW_LIGHT") subsystem = AutomationTestSubsystem::GROW_LIGHT;
+    else valid = false;
+
+    if(!valid)
+    {
+        Serial.print("[AUTO-TEST] rejected unknown subsystem: ");
+        Serial.println(value);
+        return false;
+    }
+
+    setAutomationTestMode(subsystem, false);
+    return previous != systemState.automationTestSubsystem;
+}
+
+void FirebaseManager::setAutomationTestMode(
+    AutomationTestSubsystem subsystem,
+    bool publishAcknowledgement)
+{
+    if(subsystem != systemState.automationTestSubsystem)
+    {
+        // Always printed regardless of the previous/new focus filter (see
+        // DebugManager's Serial Monitor Focus Mode) - this IS the entry/exit
+        // announcement the focus filter itself keys off of, so it can never
+        // be suppressed by it.
+        Serial.print("[AUTO-TEST] ");
+        Serial.print(automationTestSubsystemName(systemState.automationTestSubsystem));
+        Serial.print(" -> ");
+        Serial.println(automationTestSubsystemName(subsystem));
+
+        systemState.automationTestSubsystem = subsystem;
+    }
+
+    if(publishAcknowledgement && WiFi.status() == WL_CONNECTED && Firebase.ready())
+    {
+        FirebaseJson acknowledgement;
+        acknowledgement.set("enabled", subsystem != AutomationTestSubsystem::NONE);
+        acknowledgement.set("subsystem", automationTestSubsystemName(subsystem));
+        updateJson(deviceRoot() + "/status/automationTestMode", acknowledgement);
+    }
 }
 
 void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, bool dispatchCommands)
@@ -2523,7 +2862,7 @@ bool FirebaseManager::validateOperationRequest(
             reason = safetyManager.getSafetyReason(safety);
             return false;
         }
-        if (sensors.waterLevel >= systemState.refillStartLevel)
+        if (sensors.waterLevelCm > systemState.refillStartLevelCm)
         {
             reason = "Refill rejected: Water level is above the refill start threshold.";
             return false;
@@ -2872,7 +3211,8 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
         return true;
     }
     // A failed write is still one heartbeat attempt. Keep retries on the normal
-    // 10-second cadence instead of hammering RTDB on every loop iteration.
+    // SENSOR_UPLOAD_INTERVAL_MS (1s) cadence instead of hammering RTDB on
+    // every loop iteration.
     if (!force) lastSensorUploadAttempt = millis();
 
     FirebaseJson json;
@@ -2884,13 +3224,28 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
 
     if (!isnan(publishedSensors.temperature)) json.set("airTemperature", publishedSensors.temperature);
     if (!isnan(publishedSensors.humidity)) json.set("humidity", publishedSensors.humidity);
+    // Health/staleness pair for the two fields above - see the automation
+    // resilience pass report. airTemperature/humidity may now be a held
+    // last-good value rather than a fresh sample; dhtStale is what lets the
+    // app show "LAST KNOWN / STALE" instead of misrepresenting it as a
+    // current measurement. Always published (booleans have no NaN state).
+    json.set("dhtAvailable", publishedSensors.dhtAvailable);
+    json.set("dhtStale", publishedSensors.dhtStale);
 
     //--------------------------------------------------
     // Reservoir
     //--------------------------------------------------
 
     if (!isnan(publishedSensors.waterTemp)) json.set("waterTemperature", publishedSensors.waterTemp);
+    // waterLevel: derived 0-100 working percentage (water-depth model - see
+    // Config.h's "Water Reservoir Geometry"). waterLevelCm/waterVolumeLiters
+    // are the new authoritative depth/volume fields; waterLevelDistanceCm is
+    // the raw HC-SR04 distance, published here (not diagnostics-only
+    // anymore) so Android can show it without the Sensor Test flow.
     if (isfinite(publishedSensors.waterLevel)) json.set("waterLevel", publishedSensors.waterLevel);
+    if (isfinite(publishedSensors.waterLevelCm)) json.set("waterLevelCm", publishedSensors.waterLevelCm);
+    if (isfinite(publishedSensors.waterVolumeLiters)) json.set("waterVolumeLiters", publishedSensors.waterVolumeLiters);
+    if (isfinite(publishedSensors.waterLevelDistanceCm)) json.set("waterLevelDistanceCm", publishedSensors.waterLevelDistanceCm);
 
     //--------------------------------------------------
     // Nutrient
@@ -2899,10 +3254,76 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     if (!isnan(publishedSensors.ec)) json.set("ec", publishedSensors.ec);
     if (!isnan(publishedSensors.tds)) json.set("tds", publishedSensors.tds);
     if (!isnan(publishedSensors.ph)) json.set("ph", publishedSensors.ph);
+    // Quick-response refinement task: ph above is now the FAST TELEMETRY
+    // value (the pH temporal step filter's own trusted candidate), not the
+    // slower 10-sample automation-trust window's output - see
+    // SensorManager::applyEffectiveSensors()'s own comment. phConfirming
+    // lets Android distinguish "this is the last trusted reading, a new one
+    // is being confirmed" from a plain stale/unavailable state. Always
+    // published (boolean, no NaN state) - false whenever ph is NaN too
+    // (nothing has ever been confirmed at all yet, see Types.h's comment).
+    json.set("phConfirming", publishedSensors.phConfirming);
 
     //--------------------------------------------------
     // Metadata
     //--------------------------------------------------
+
+    // Coherent initial sensor snapshot (see the quick-response refinement
+    // task report and Types.h's sensorSnapshotBaselineAt comment). Written
+    // as nested fields of this SAME json object, in the SAME single
+    // writeJson() call as every sensor value above - Firebase RTDB applies
+    // one REST write atomically regardless of how many nested keys it
+    // carries, so Android can never observe sensorState.ready=true paired
+    // with a partially-written sensor set, or vice versa.
+    //
+    // Deliberately NOT SENSOR_STABILIZATION_TIME (10s) - that is
+    // AutomationManager's own boot-wait duration for a different purpose
+    // (holding automatic refill/pH/EC/fog regulation off) and is far
+    // longer than Monitoring UI readiness needs.
+    //
+    // sensorState.ready refinement (quick-response follow-up): readiness
+    // requires every Monitoring-displayed sensor's state for THIS
+    // acquisition session to be KNOWN - either a real value, or confirmed
+    // unavailable (not just water level + pH telemetry, the original
+    // narrower "fast sensor" set - EC/water temperature/DHT air
+    // temperature+humidity are now included too, so the dashboard can no
+    // longer reveal before they have had a chance to report anything at
+    // all, which previously let them flash "--" individually right after
+    // reveal). A sensor is never required to be VALID, only for its state
+    // to no longer be "haven't checked yet" - see each isXStateKnown()/
+    // isPhEcAnalogSettling() accessor's own comment in SensorManager.h.
+    // pH/EC's deliberate ~20s analog settle window (PH_EC_ANALOG_SETTLE_TIME)
+    // itself counts as a known "not yet available" state, not an unknown
+    // one, so it does not have to fully elapse before readiness can fire -
+    // without that carve-out pH/EC would force every physical fresh boot
+    // to the SENSOR_READY_MAX_MS hard fallback below, which is exactly the
+    // "normally 1-2s" target this refinement is meant to hit. Bounded by
+    // SENSOR_READY_MIN_MS (so "ready" is never reported before even one
+    // real read cycle could possibly have run) and SENSOR_READY_MAX_MS
+    // (so a genuinely stuck/failed sensor still bounds readiness at ~3s
+    // rather than blocking the dashboard indefinitely - it simply reveals
+    // as "--"/stale on its own card, exactly as one that fails later
+    // would; "usable snapshot" never means "every sensor is currently
+    // valid forever" - see Part D/F of the task report).
+    const unsigned long sensorSnapshotElapsed =
+        millis() - systemState.sensorSnapshotBaselineAt;
+    const bool allSensorsObserved =
+        sensorManager.isWaterLevelStateKnown() &&
+        (sensorManager.hasPhTelemetry() || sensorManager.isPhEcAnalogSettling()) &&
+        sensorManager.isEcStateKnown() &&
+        sensorManager.isWaterTempStateKnown() &&
+        sensorManager.isDhtStateKnown();
+    const bool sensorSnapshotReady =
+        sensorSnapshotElapsed >= SENSOR_READY_MAX_MS ||
+        (sensorSnapshotElapsed >= SENSOR_READY_MIN_MS && allSensorsObserved);
+    json.set("sensorState/stabilizing", !sensorSnapshotReady);
+    json.set("sensorState/ready", sensorSnapshotReady);
+    // Device-uptime ms, matching the existing "timestamp" field's own
+    // convention immediately below - not a second, differently-scaled time
+    // source for Android to reconcile (see Part G of the task report -
+    // Android does not, and must not, compare this against its own wall
+    // clock; it exists for firmware-local/diagnostic reference only).
+    json.set("sensorState/updatedAt", millis());
 
     json.set(
         "timestamp",
@@ -2934,15 +3355,16 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
             Serial.println("[PRESENCE] Heartbeat resumed after connectivity loss");
             heartbeatResumePending = false;
         }
-        else if (!hasPublishedHeartbeat ||
-                 millis() - lastHeartbeatSuccessLog >= HEARTBEAT_SUCCESS_LOG_INTERVAL_MS)
+        else if ((!hasPublishedHeartbeat ||
+                 millis() - lastHeartbeatSuccessLog >= HEARTBEAT_SUCCESS_LOG_INTERVAL_MS) &&
+                 debugManager.shouldPrintDebug(DebugCategory::NETWORK))
         {
             Serial.println("[PRESENCE] Heartbeat uploaded");
             lastHeartbeatSuccessLog = millis();
         }
         hasPublishedHeartbeat = true;
 
-        if (force)
+        if (force && debugManager.shouldPrintDebug(DebugCategory::NETWORK))
         {
             Serial.print("[SENSOR-SYNC] waterLevel=");
             Serial.print(publishedSensors.waterLevel, 2);
@@ -2954,8 +3376,11 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
             Serial.println(millis());
         }
 
-        Serial.println(
-            "Sensors Uploaded");
+        if (debugManager.shouldPrintDebug(DebugCategory::NETWORK))
+        {
+            Serial.println(
+                "Sensors Uploaded");
+        }
     }
     else
     {
@@ -3023,6 +3448,14 @@ void FirebaseManager::writeStatus()
         systemState.mockSensorsEnabled);
 
     json.set("sensorTest", systemState.sensorTestEnabled);
+
+    json.set("ignoreWaterLevelAutomation",
+        systemState.ignoreWaterLevelAutomation);
+
+    json.set("automationTestMode/enabled",
+        systemState.automationTestSubsystem != AutomationTestSubsystem::NONE);
+    json.set("automationTestMode/subsystem",
+        automationTestSubsystemName(systemState.automationTestSubsystem));
 
     //--------------------------------------------------
     // Safety
@@ -3102,7 +3535,7 @@ void FirebaseManager::writeStatus()
     const unsigned long uploadStartedAt = millis();
     const bool uploadSucceeded = updateJson(deviceRoot() + "/status", json);
     logFirebaseDuration("Status upload", millis() - uploadStartedAt);
-    if(uploadSucceeded)
+    if(uploadSucceeded && debugManager.shouldPrintDebug(DebugCategory::NETWORK))
     {
         Serial.println(
             "Status Uploaded");
@@ -3149,7 +3582,7 @@ void FirebaseManager::writeTelemetry()
     const unsigned long uploadStartedAt = millis();
     const bool uploadSucceeded = writeJson(deviceRoot() + "/telemetry", json);
     logFirebaseDuration("Telemetry upload", millis() - uploadStartedAt);
-    if(uploadSucceeded)
+    if(uploadSucceeded && debugManager.shouldPrintDebug(DebugCategory::NETWORK))
     {
         Serial.println(
             "Telemetry Uploaded");
@@ -3195,6 +3628,7 @@ bool FirebaseManager::writeAlerts()
     } while (false)
 
     ADD_ALERT_FIELD(lowWater);
+    ADD_ALERT_FIELD(criticalLowWater);
     ADD_ALERT_FIELD(waterLevelLow);
     ADD_ALERT_FIELD(waterLevelHigh);
     ADD_ALERT_FIELD(ecLow);
@@ -3240,8 +3674,9 @@ bool FirebaseManager::writeAlerts()
 
 #define LOG_ALERT_TRANSITION(fieldName) \
     do { \
-        if (!alertCacheInitialized || \
-            alertState.fieldName != lastPublishedAlerts.fieldName) { \
+        if ((!alertCacheInitialized || \
+            alertState.fieldName != lastPublishedAlerts.fieldName) && \
+            debugManager.shouldPrintDebug(DebugCategory::NETWORK)) { \
             Serial.print("[ALERT-SYNC] " #fieldName "="); \
             Serial.print(alertState.fieldName ? "true" : "false"); \
             Serial.print(" t="); \
@@ -3250,6 +3685,7 @@ bool FirebaseManager::writeAlerts()
     } while (false)
 
     LOG_ALERT_TRANSITION(lowWater);
+    LOG_ALERT_TRANSITION(criticalLowWater);
     LOG_ALERT_TRANSITION(waterLevelLow);
     LOG_ALERT_TRANSITION(waterLevelHigh);
     LOG_ALERT_TRANSITION(ecLow);
@@ -3264,7 +3700,7 @@ bool FirebaseManager::writeAlerts()
     LOG_ALERT_TRANSITION(humidityLow);
     LOG_ALERT_TRANSITION(humidityHigh);
 
-    if (sensorFaultIncluded && sensorFaultChanged)
+    if (sensorFaultIncluded && sensorFaultChanged && debugManager.shouldPrintDebug(DebugCategory::NETWORK))
     {
         Serial.print("[ALERT-SYNC] sensorFault=");
         Serial.print(alertState.sensorFault ? "true" : "false");
@@ -3375,7 +3811,7 @@ void FirebaseManager::writeActuators()
 
         for (int i = 0; i < ACTUATOR_COUNT; i++)
         {
-            if (changed[i])
+            if (changed[i] && debugManager.shouldPrintActuator((Actuator)i))
             {
                 Serial.print("[ACTUATOR-SYNC] ");
                 Serial.print(getActuatorName((Actuator)i));
@@ -3441,7 +3877,7 @@ void FirebaseManager::writeDeviceInfo()
 
     if(writeJson(
         deviceRoot() + "/deviceInfo",
-        json))
+        json) && debugManager.shouldPrintDebug(DebugCategory::NETWORK))
     {
         Serial.println(
             "Device Info Uploaded");
@@ -3894,8 +4330,35 @@ void FirebaseManager::readMockSensors()
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
         nextMock.waterLevel = data.to<float>();
-    else 
+    else
         nextMock.waterLevel = NAN;
+
+    // Water Level Depth (cm) - AUTHORITATIVE for refill/low-water control
+    // (see Config.h's "Water Reservoir Geometry"). A tester injecting
+    // waterLevelCm directly takes precedence; otherwise it is derived from
+    // the percentage above so existing percentage-only mock payloads keep
+    // driving refill/low-water control exactly as before, just recalibrated
+    // to the new working-depth scale.
+    json.get(data, "waterLevelCm");
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
+    {
+        nextMock.waterLevelCm = data.to<float>();
+    }
+    else if (isfinite(nextMock.waterLevel))
+    {
+        nextMock.waterLevelCm = (nextMock.waterLevel / 100.0f) * MAX_WORKING_WATER_CM;
+    }
+    else
+    {
+        nextMock.waterLevelCm = NAN;
+    }
+
+    nextMock.waterVolumeLiters = isfinite(nextMock.waterLevelCm)
+        ? nextMock.waterLevelCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f
+        : NAN;
 
     // pH
     const bool phExtracted = json.get(data, "ph") && data.success;
@@ -4122,8 +4585,8 @@ void FirebaseManager::readWaterLevelOverrideCommand()
 
 // Applying the flag is deliberately just the systemState write + logging +
 // acknowledgement here - the actual bypass behavior lives entirely in
-// AutomationManager (handleNormal()/processReadyLocalRegulation() refuse to
-// start a new automatic refill while this is set; handleRefilling() exits an
+// AutomationManager (handleNormal() refuses to start a new automatic refill
+// while this is set; handleRefilling() exits an
 // already-running automatic one on the very next tick). Driving both off the
 // same persistent flag, re-checked every tick, is simpler and more robust
 // than a one-shot side effect here trying to reach into AutomationManager's
@@ -4200,6 +4663,16 @@ void FirebaseManager::writeDiagnosticSensors()
         Serial.println("[DEV TEST] EC=INVALID");
     }
 
+    // Raw ADC/voltage behind the EC reading above - diagnostic only, useful
+    // for a developer inspecting the probe's actual analog signal from the
+    // app without a serial cable. EC calibration itself is not adjustable
+    // here - the accepted calibration (Calibration.h) is unchanged.
+    if (isfinite(physicalSensors.ecVoltage))
+    {
+        json.set("ecVoltage", physicalSensors.ecVoltage);
+    }
+    json.set("ecRaw", physicalSensors.ecRaw);
+
     // Air Temperature
     if (!isnan(physicalSensors.temperature) && isfinite(physicalSensors.temperature) && physicalSensors.temperature >= -40.0f && physicalSensors.temperature <= 100.0f)
     {
@@ -4255,6 +4728,22 @@ void FirebaseManager::writeDiagnosticSensors()
         Serial.println("[DEV TEST] WaterLevelDistanceCm=INVALID");
     }
 
+    // Water Depth / Volume (water-depth model)
+    if (isfinite(physicalSensors.waterLevelCm))
+    {
+        json.set("waterLevelCm", physicalSensors.waterLevelCm);
+        Serial.print("[DEV TEST] WaterLevelCm="); Serial.println(physicalSensors.waterLevelCm, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] WaterLevelCm=INVALID");
+    }
+    if (isfinite(physicalSensors.waterVolumeLiters))
+    {
+        json.set("waterVolumeLiters", physicalSensors.waterVolumeLiters);
+        Serial.print("[DEV TEST] WaterVolumeLiters="); Serial.println(physicalSensors.waterVolumeLiters, 2);
+    }
+
     if (now - lastDiagnosticUploadAttempt < DIAGNOSTIC_UPLOAD_INTERVAL_MS)
     {
         return;
@@ -4270,7 +4759,7 @@ void FirebaseManager::writeDiagnosticSensors()
     // called before this low-priority diagnostic path, and diagnostics are
     // skipped whenever that heartbeat has not succeeded or is due/overdue.
     if (!hasPublishedHeartbeat ||
-        now - lastSuccessfulSensorUpload >= UPLOAD_INTERVAL)
+        now - lastSuccessfulSensorUpload >= SENSOR_UPLOAD_INTERVAL_MS)
     {
         return;
     }

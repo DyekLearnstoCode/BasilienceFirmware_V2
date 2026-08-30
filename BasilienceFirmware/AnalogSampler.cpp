@@ -118,3 +118,29 @@ float AnalogSampler::average() const
 
     return (float)sum / sampleCount;
 }
+
+int AnalogSampler::minValue() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int lo = samples[0];
+    for (int i = 1; i < sampleCount; i++)
+    {
+        if (samples[i] < lo) lo = samples[i];
+    }
+    return lo;
+}
+
+int AnalogSampler::maxValue() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int hi = samples[0];
+    for (int i = 1; i < sampleCount; i++)
+    {
+        if (samples[i] > hi) hi = samples[i];
+    }
+    return hi;
+}

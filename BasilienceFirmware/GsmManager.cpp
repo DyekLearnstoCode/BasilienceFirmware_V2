@@ -1,5 +1,6 @@
 #include "GsmManager.h"
 #include "Config.h"
+#include "Globals.h"
 
 void GsmManager::begin()
 {
@@ -29,9 +30,12 @@ void GsmManager::beginSerialAtCurrentBaudCandidate()
 {
     const unsigned long baud = BAUD_CANDIDATES[baudCandidateIndex];
     serial.begin(baud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
-    Serial.print("[GSM] Probing at ");
-    Serial.print(baud);
-    Serial.println(" baud");
+    if (debugManager.shouldPrintDebug(DebugCategory::GSM))
+    {
+        Serial.print("[GSM] Probing at ");
+        Serial.print(baud);
+        Serial.println(" baud");
+    }
 }
 
 void GsmManager::update()

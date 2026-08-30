@@ -1,6 +1,60 @@
 #include "AlertManager.h"
 
 #include "Globals.h"
+
+namespace
+{
+    // Serial Monitor Focus Mode (tiny logging-only addition - see
+    // DebugManager::shouldPrintDebug()'s own comment). Decides only whether
+    // this alert's [ALERT] transition line prints; the alert STATE itself
+    // (currentValue, alertsDirty - synced to Firebase/notifications exactly
+    // as before) is set unconditionally by the caller regardless of this
+    // return value. Every name not explicitly mapped here (target-range
+    // temperature/humidity alerts, sensorFault's own fallback) is
+    // conservatively suppressed while ANY controller is isolated - never
+    // shown to the wrong one, only ever hidden from an unrelated one.
+    bool alertRelevantToActiveTest(const char* name)
+    {
+        if (systemState.automationTestSubsystem == AutomationTestSubsystem::NONE)
+            return true;
+
+        if (strcmp(name, "lowWater") == 0 || strcmp(name, "criticalLowWater") == 0 ||
+            strcmp(name, "waterLevelLow") == 0 || strcmp(name, "waterLevelHigh") == 0)
+        {
+            return debugManager.shouldPrintDebug(DebugCategory::WATER);
+        }
+
+        if (strcmp(name, "phLow") == 0 || strcmp(name, "phHigh") == 0 ||
+            strcmp(name, "phOutOfRange") == 0)
+        {
+            return debugManager.shouldPrintDebug(DebugCategory::PH);
+        }
+
+        if (strcmp(name, "ecLow") == 0 || strcmp(name, "ecHigh") == 0)
+        {
+            return debugManager.shouldPrintDebug(DebugCategory::EC);
+        }
+
+        if (strcmp(name, "waterTempOutOfRange") == 0 || strcmp(name, "waterTempLow") == 0)
+        {
+            return debugManager.shouldPrintDebug(DebugCategory::COOLING);
+        }
+
+        // sensorFault spans waterTemp/pH/EC/waterLevel (see
+        // AlertManager::updateSensorFaultAlert()) - relevant to any of the
+        // reservoir-adjacent controllers, not suppressed for them.
+        if (strcmp(name, "sensorFault") == 0)
+        {
+            return debugManager.shouldPrintDebug(DebugCategory::WATER) ||
+                   debugManager.shouldPrintDebug(DebugCategory::PH) ||
+                   debugManager.shouldPrintDebug(DebugCategory::EC) ||
+                   debugManager.shouldPrintDebug(DebugCategory::COOLING);
+        }
+
+        return false;
+    }
+}
+
 void AlertManager::begin()
 {
     alertsDirty = true;
@@ -25,6 +79,8 @@ void AlertManager::setAlert(const char* name, bool& currentValue, bool nextValue
 
     currentValue = nextValue;
     alertsDirty = true;
+
+    if (!alertRelevantToActiveTest(name)) return;
 
     Serial.print("[ALERT] ");
     Serial.print(name);
@@ -89,12 +145,29 @@ void AlertManager::updateLowWaterAlert()
 {
     const bool valid = isfinite(sensors.waterLevel);
 
-    // CONTROL signal - stays on refillStartLevel because automatic refill is
-    // driven by it. Retargeting this at minWaterLevel would change when the
-    // valve opens, which is a control change, not a reporting one.
+    // CONTROL signal - stays on refillStartLevelCm (water depth, cm)
+    // because it gates AutomationManager::handleNormal()'s automatic refill
+    // trigger and SafetyManager::canResetSafety() - see Config.h's "Water
+    // Reservoir Geometry" section. Deliberately NOT criticalLowWaterCm
+    // (the stricter bar that blocks pH/EC/fogging/cooling directly in
+    // SafetyManager/ActuatorManager, independent of this alert): this flag
+    // means "eligible to refill," a materially less severe condition.
+    // Retargeting this at minWaterLevel would change when the valve opens,
+    // which is a control change, not a reporting one.
     setAlertDebounced("lowWater", alertState.lowWater,
-        valid && sensors.waterLevel < systemState.refillStartLevel,
+        valid && sensors.waterLevelCm <= systemState.refillStartLevelCm,
         lowWaterPendingCount);
+
+    // Severity escalation on top of lowWater - same debounce shape (see
+    // setAlertDebounced()'s own comment), same `valid` NaN gate, so an
+    // invalid/unavailable HC-SR04 reading can never raise this any more than
+    // it can raise lowWater. No actuator gate reads this directly - the
+    // <=2.0cm operational block above already covers pH/EC/fogging/cooling;
+    // this is purely a status/notification severity signal for a reservoir
+    // that has fallen even further, past criticalLowWaterCm.
+    setAlertDebounced("criticalLowWater", alertState.criticalLowWater,
+        valid && sensors.waterLevelCm <= systemState.criticalLowWaterCm,
+        criticalLowWaterPendingCount);
 
     // TARGET-RANGE classification, reported alongside it.
     setAlertDebounced("waterLevelLow", alertState.waterLevelLow,
@@ -108,7 +181,11 @@ void AlertManager::updateLowWaterAlert()
 
 void AlertManager::updateTemperatureAlert()
 {
-    const bool valid = isfinite(sensors.temperature);
+    // dhtAvailable, not isfinite(sensors.temperature) - see the automation
+    // resilience pass report. A held last-good reading (dhtStale=true) is
+    // finite but must not drive a fresh target-range classification; only a
+    // currently-fresh measurement should be able to raise/clear these.
+    const bool valid = sensors.dhtAvailable;
 
     // Both sides now come from the configured target range. Previously the low
     // side compared against the hard-coded COLD_FOG_TEMPERATURE constant, which
@@ -130,7 +207,9 @@ void AlertManager::updateTemperatureAlert()
 
 void AlertManager::updateHumidityAlert()
 {
-    const bool valid = isfinite(sensors.humidity);
+    // dhtAvailable, not isfinite(sensors.humidity) - see
+    // updateTemperatureAlert()'s matching comment.
+    const bool valid = sensors.dhtAvailable;
 
     setAlertDebounced("humidityLow", alertState.humidityLow,
         valid && sensors.humidity < systemState.minHumidity,
@@ -166,6 +245,14 @@ void AlertManager::updateWaterTemperatureAlert()
 
 void AlertManager::updatePHAlert()
 {
+    // sensors.ph is now the stable-value filter's authoritative output (see
+    // SensorManager::applyEffectiveSensors()/updateStabilityWindow()) - it
+    // only ever changes when a new 10-sample window has actually agreed
+    // within tolerance, so a plain single-threshold comparison here no
+    // longer chatters. The decision-layer Schmitt-trigger hysteresis this
+    // function used to carry (PH_ALERT_HYSTERESIS) was a second, overlapping
+    // anti-flicker system on top of that upstream fix and has been removed;
+    // minPH/maxPH stay the sole, simple, authoritative comparison.
     const bool valid = isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
     const bool low = valid && sensors.ph < systemState.minPH;
     const bool high = valid && sensors.ph > systemState.maxPH;
@@ -195,11 +282,16 @@ void AlertManager::updateECAlert()
 
 void AlertManager::updateSensorFaultAlert()
 {
+    // RESERVOIR/ROOT-ZONE sensor fault only - see the automation resilience
+    // pass report. DHT22 is an ENVIRONMENT/CANOPY sensor and is deliberately
+    // NOT part of this aggregation any more: this flag feeds
+    // SafetyManager::canResetSafety(), which gates whether the GLOBAL
+    // systemState.safetyLock can ever clear, so an unstable DHT (a known,
+    // recurring electrical-environment issue - see readDHT()) must never be
+    // able to keep REFILL/PH/EC/COOLING locked out system-wide. DHT health is
+    // published separately as sensors.dhtAvailable/dhtStale (see
+    // FirebaseManager::writeSensors()) rather than folded back in here.
     const bool sensorFault =
-
-        !isfinite(sensors.temperature) ||
-
-        !isfinite(sensors.humidity) ||
 
         !isfinite(sensors.waterTemp) ||
 
@@ -208,12 +300,6 @@ void AlertManager::updateSensorFaultAlert()
         !isfinite(sensors.ec) ||
 
         !isfinite(sensors.waterLevel) ||
-
-        sensors.temperature < -40.0f ||
-        sensors.temperature > 100.0f ||
-
-        sensors.humidity < 0.0f ||
-        sensors.humidity > 100.0f ||
 
         sensors.waterTemp < 0.0f ||
         sensors.waterTemp > 100.0f ||

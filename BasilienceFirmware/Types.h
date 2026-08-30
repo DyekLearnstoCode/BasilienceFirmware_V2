@@ -12,9 +12,36 @@
 
 struct SensorData
 {
+    // Air temperature/humidity - see the automation resilience pass report.
+    // Once a valid pair has ever been read, these fields become the
+    // "lastGoodAirTemperature"/"lastGoodHumidity" the app must be able to
+    // display continuously: SensorManager::readDHT() keeps holding them at
+    // that last accepted value through a confirmed-unavailable streak
+    // instead of collapsing to NaN, exactly like waterLevelCm/waterTemp
+    // already never invent a fake reading but do hold the last real one.
+    // dhtAvailable/dhtStale (below) are what distinguish "this number is a
+    // fresh measurement" from "this number is a stale hold-over" - a control/
+    // alert consumer must gate on dhtAvailable, never on isfinite() alone,
+    // since isfinite() no longer implies freshness.
     float temperature = NAN;
     float humidity    = NAN;
     float waterTemp   = NAN;
+
+    // True exactly when the most recent DHT22 acquisition is a fresh,
+    // trusted measurement (not within a confirmed-unavailable streak - see
+    // readDHT()'s SENSOR_TRANSIENT_FAILURE_THRESHOLD debounce). False while
+    // confirmed unavailable OR before any reading has ever succeeded since
+    // boot.
+    bool dhtAvailable = false;
+
+    // True only when dhtAvailable is false AND temperature/humidity hold a
+    // genuine last-good value from before the outage (i.e. NOT the "never
+    // had a valid reading since boot" case, which must display as plainly
+    // unavailable rather than inventing a fake stale reading - see
+    // temperature/humidity's own comment above). isfinite(temperature) is
+    // the tell: dhtStale is true only when there is something real to be
+    // stale.
+    bool dhtStale = false;
 
     // Electrical Conductivity
     float ec        = NAN;
@@ -26,11 +53,52 @@ struct SensorData
     float ph          = NAN;
     int   phMilliVolts = 0;
 
-    // Water Level
-    float waterLevel = 0; // 0 is valid (empty tank) — kept as-is
+    // True while the pH temporal step filter has an unconfirmed
+    // confirmation streak in progress - either the very first baseline
+    // (boot/reacquisition) or a later large jump (quick-response
+    // refinement task; see SensorManager::isPhConfirming()). ph above still
+    // holds the last TRUSTED value the whole time (never NaN'd out just
+    // because a new candidate is being confirmed, never replaced by the
+    // unconfirmed candidate itself) - this flag is what lets a consumer
+    // (Android) show "confirming a new reading" instead of silently
+    // presenting a possibly-stale value as fully current. Purely a
+    // display/status signal - automatic dosing is independently blocked by
+    // the existing stability-window gate regardless of this flag.
+    bool phConfirming = false;
+
+    // Water Level (water-depth model - see Config.h's "Water Reservoir
+    // Geometry" section and SensorManager::readWaterLevel())
+    float waterLevel = 0; // Derived 0-100 working percentage. 0 is valid (empty tank) — kept as-is
+
+    // Actual measured water DEPTH in centimeters. AUTHORITATIVE for
+    // automation - refill/low-water control compares this directly, never
+    // the derived percentage. Clamped only at the lower bound (0) - a
+    // genuine overfill above MAX_WORKING_WATER_CM (6.0) is reported as its
+    // real depth, never capped; only waterLevel (the derived percentage
+    // below) clamps at 100%. NaN exactly when waterLevel is NaN (both set
+    // together in readWaterLevel()).
+    float waterLevelCm = NAN;
+
+    // Estimated reservoir volume in liters, derived from waterLevelCm and
+    // the fixed reservoir base area. Diagnostics/reporting only - no control
+    // path consumes this.
+    float waterVolumeLiters = NAN;
+
+    // Refill threshold confirmation (see the automation resilience pass
+    // follow-up report). waterLevelCm is already the step-filtered
+    // accepted control value, but a small transient (e.g. one bad reading
+    // 0.20cm off) can still pass that filter's WATER_LEVEL_STEP_ACCEPT_CM
+    // band and momentarily cross REFILL_START_CM/REFILL_STOP_CM on its own.
+    // These flags require WATER_LEVEL_STEP_CONFIRM_COUNT consecutive
+    // ACCEPTED readings (SensorManager::readWaterLevel(), ~300ms apart) on
+    // the correct side of the threshold before the crossing is trusted -
+    // REFILL START/COMPLETE must read these, never waterLevelCm compared
+    // against the threshold directly.
+    bool refillStartConfirmed = false;
+    bool refillStopConfirmed = false;
 
     // Diagnostics only: raw HC-SR04 measured distance in centimeters, before
-    // percentage conversion. Never consumed by automation/alerts/safety.
+    // depth conversion. Never consumed by automation/alerts/safety.
     float waterLevelDistanceCm = NAN;
 };
 
@@ -57,6 +125,64 @@ enum SystemMode
     STABILIZING_EC,
 
     SAFETY_LOCK
+};
+
+// Temporary developer-only controller isolation. NONE is the existing full
+// system; every other value permits exactly one automatic controller plus
+// its explicit support dependencies. Sensor acquisition/publication and
+// actuator-level safety/manual arbitration are intentionally outside this
+// enum and continue normally in every mode.
+enum class AutomationTestSubsystem : uint8_t
+{
+    NONE,
+    STARTUP,
+    REFILL,
+    PH,
+    EC,
+    COOLING,
+    FOGGING,
+    CANOPY,
+    GROW_LIGHT
+};
+
+inline const char* automationTestSubsystemName(AutomationTestSubsystem subsystem)
+{
+    switch(subsystem)
+    {
+        case AutomationTestSubsystem::STARTUP: return "STARTUP";
+        case AutomationTestSubsystem::REFILL: return "REFILL";
+        case AutomationTestSubsystem::PH: return "PH";
+        case AutomationTestSubsystem::EC: return "EC";
+        case AutomationTestSubsystem::COOLING: return "COOLING";
+        case AutomationTestSubsystem::FOGGING: return "FOGGING";
+        case AutomationTestSubsystem::CANOPY: return "CANOPY";
+        case AutomationTestSubsystem::GROW_LIGHT: return "GROW_LIGHT";
+        case AutomationTestSubsystem::NONE:
+        default: return "OFF";
+    }
+}
+
+// Serial Monitor Focus Mode (see DebugManager::shouldPrintDebug()) - groups
+// the codebase's existing Serial diagnostic tags by the subsystem they
+// describe, so a single AutomationTestSubsystem selection can decide which
+// categories stay visible without touching every individual print call
+// site. Purely a Serial-output classification - has no effect on any
+// control/automation decision.
+enum class DebugCategory : uint8_t
+{
+    WATER,        // HC-SR04 acquisition, water step filter, refill control
+    PH,           // pH ADC/stability/dosing diagnostics
+    EC,           // EC ADC/stability/dosing diagnostics
+    COOLING,      // DS18B20/cooling decision diagnostics
+    FOGGING,      // fog cadence/cycle diagnostics
+    CANOPY,       // canopy climate decision diagnostics
+    DHT,          // DHT raw/health diagnostics - shared by CANOPY and FOGGING
+    LIGHT,        // grow-light schedule/RTC diagnostics
+    STARTUP,      // startup-phase-specific diagnostics
+    NETWORK,      // WiFi/Firebase/upload/sync chatter
+    GSM,          // GSM/SMS chatter
+    NOTIFICATION, // notification/fogging-event queue chatter
+    SYSTEM        // periodic dashboards, settings/mock/manual, misc
 };
 
 enum class SafetyResult
@@ -329,15 +455,21 @@ struct SystemState
 
     // Developer testing override: bypasses ONLY the automatic
     // water-level/refill gate (AutomationManager's handleNormal(),
-    // processReadyLocalRegulation(), handleRefilling()) so pH/EC/fogging/
+    // handleRefilling()) so pH/EC/fogging/
     // cooling automation can be exercised on hardware sitting below
-    // refillStartLevel. The water-level sensor itself, its alerts, and
+    // criticalLowWaterCm. The water-level sensor itself, its alerts, and
     // manual refill are all untouched - see FirebaseManager::
     // setIgnoreWaterLevelAutomation()/readWaterLevelOverrideCommand().
     // Deliberately not restored from NVS: resets to false on every reboot,
     // same as sensorTestEnabled above, so a developer testing session never
     // silently survives a power cycle.
     bool ignoreWaterLevelAutomation = false;
+
+    // Temporary developer-only automation isolation. FirebaseManager applies
+    // commands/automationTestMode and echoes this confirmed value under
+    // status/automationTestMode. It is deliberately not persisted in NVS.
+    AutomationTestSubsystem automationTestSubsystem =
+        AutomationTestSubsystem::NONE;
 
     // Remote Mocking
     bool mockSensorsEnabled = false;
@@ -351,6 +483,20 @@ struct SystemState
     // reboot/brownout can't let temporary physical readings drive automation
     // before a previously-enabled mock mode is restored.
     bool sensorSourceResolved = false;
+
+    // Coherent-snapshot readiness baseline (see the real-time sensor
+    // presentation task report) - millis() of the most recent boot or
+    // mock/physical source transition. 0 at true boot (millis() is already
+    // ~0 then, so "elapsed since 0" naturally satisfies
+    // SENSOR_SNAPSHOT_READY_DELAY_MS shortly after real power-on with no
+    // special-case needed). Reset by SensorManager::applyEffectiveSensors()
+    // on a genuine source transition, mirroring how phStabilityWindow/
+    // ecStabilityWindow/the pH temporal filter are reset at the same
+    // instant - published as /sensors/sensorState/{stabilizing,ready} by
+    // FirebaseManager::writeSensors() so Android knows when a coherent
+    // initial snapshot exists, without requiring every sensor to be fully
+    // settled (see SENSOR_SNAPSHOT_READY_DELAY_MS's own comment).
+    unsigned long sensorSnapshotBaselineAt = 0;
 
     // Armed by AutomationManager::completeCurrentOperation() the instant an
     // automatic PH_UP/PH_DOWN/EC_CORRECTION reaches COMPLETED locally.
@@ -432,22 +578,66 @@ struct SystemState
     uint8_t lightOffHour = 22;
     uint8_t lightOffMinute = 0;
 
+    // Developer-only mock "current time" for deterministically testing Grow
+    // Light scheduling while the physical RTC is invalid/unavailable. Never
+    // written to the DS3231 and never influences anything outside
+    // AutomationManager::getCurrentMinutes()/updateGrowLightSchedule() - see
+    // their own comments for the strict activation condition (both
+    // automationTestSubsystem == GROW_LIGHT and this flag must be true).
+    // Minutes since midnight, clamped to 0..1439 on receipt from Firebase.
+    bool mockGrowLightTimeEnabled = false;
+    uint16_t mockGrowLightMinutes = 0;
+
     //==================================================
     // Reservoir
     //==================================================
 
+    // LEGACY percentage-based control thresholds - no longer read by any
+    // control path (see Config.h's matching comment). Kept only so existing
+    // NVS/RTDB data is not silently discarded.
     float refillStartLevel =
         REFILL_START_LEVEL;
 
     float refillStopLevel =
         REFILL_STOP_LEVEL;
 
-    // Ultrasonic sensor-to-water-surface distance (cm) at empty/full - see
-    // Config.h's WATER_LEVEL_EMPTY_DISTANCE_CM/WATER_LEVEL_FULL_DISTANCE_CM
-    // for why these need to be configurable rather than fixed constants.
+    // AUTHORITATIVE water-depth control thresholds (centimeters) - see
+    // Config.h's "Water Reservoir Geometry" section for the full design.
+    // Settable via /settings (FirebaseManager::readSettings()), same pattern
+    // as the legacy percentage fields above.
+    float criticalLowWaterCm =
+        CRITICAL_LOW_WATER_CM;
+
+    float refillStartLevelCm =
+        REFILL_START_CM;
+
+    float refillStopLevelCm =
+        REFILL_STOP_CM;
+
+    // LEGACY - see the automation resilience pass report. No longer
+    // consumed by readWaterLevel(); superseded by sensorToBottomCm below.
+    // Left in place, unmodified, so existing NVS/RTDB data and any external
+    // reader of /settings/waterLevelEmptyDistanceCm is not silently broken.
+    // Deliberately NOT reused as the authoritative field: a stale persisted
+    // value under this same key (NVS "wlEmptyCm" / RTDB
+    // waterLevelEmptyDistanceCm) is exactly what let runtime keep computing
+    // depth against 30.00cm long after the compiled default was corrected to
+    // 28.67cm - reusing this key would let that same stale value silently
+    // survive again.
     float waterLevelEmptyDistanceCm =
         WATER_LEVEL_EMPTY_DISTANCE_CM;
 
+    // AUTHORITATIVE ultrasonic sensor-to-reservoir-bottom distance (cm) -
+    // see Config.h's WATER_LEVEL_EMPTY_DISTANCE_CM for why this needs to be
+    // configurable rather than a fixed constant (sensor mounting height
+    // varies per installation). Its own NVS key ("sensorBottomCm") and its
+    // own RTDB /settings field ("sensorToBottomCm"), independent of the
+    // legacy waterLevelEmptyDistanceCm above - see this field's own comment.
+    float sensorToBottomCm =
+        WATER_LEVEL_EMPTY_DISTANCE_CM;
+
+    // LEGACY - no longer consumed by the water-depth/percent/liters
+    // conversion (see Config.h's matching comment).
     float waterLevelFullDistanceCm =
         WATER_LEVEL_FULL_DISTANCE_CM;
 
@@ -482,6 +672,14 @@ struct SystemState
     float airTempRelease =
         AIR_TEMP_RELEASE;
 
+    // Canopy Fan's own cold-side control pair - see LOW_AIR_TEMP/
+    // COLD_AIR_RELEASE's own comment in Config.h.
+    float lowAirTemp =
+        LOW_AIR_TEMP;
+
+    float coldAirRelease =
+        COLD_AIR_RELEASE;
+
     float highHumidity =
         HIGH_HUMIDITY;
 
@@ -497,6 +695,13 @@ struct SystemState
     float hotFogTemperature = 30.0f;
 
     float coldFogTemperature = 20.0f;
+
+    // Automatic Blower PWM speed used while the Fogger/Blower pair is
+    // automatically ON (real-hardware Canopy/Blower PWM follow-up) - see
+    // AutomationManager::processFogCycle() and Config.h's
+    // BLOWER_SPEED_DEFAULT_PERCENT/MIN/MAX for the full contract. Explicit
+    // manual Blower speed commands are unaffected by this field entirely.
+    uint8_t blowerSpeedPercent = BLOWER_SPEED_DEFAULT_PERCENT;
 };
 
 //==================================================
@@ -506,6 +711,15 @@ struct SystemState
 struct AlertState
 {
     bool lowWater = false;
+
+    // Severity escalation ON TOP of lowWater above (see the static automation
+    // integration audit) - waterLevelCm <= criticalLowWaterCm (1.0cm), a
+    // stricter bar than lowWater's refillStartLevelCm (2.0cm). Purely a
+    // notification/status severity signal: the <=2.0cm operational block
+    // (pH/EC dosing, fogging, cooling) is already fully enforced by lowWater
+    // via SafetyManager/ActuatorManager, so this flag drives no additional
+    // actuator gating of its own.
+    bool criticalLowWater = false;
 
     bool highTemperature = false;
 
@@ -533,7 +747,7 @@ struct AlertState
 
     // Target-range classification for water level. Deliberately separate from
     // lowWater above, which is the CONTROL signal that triggers automatic
-    // refill and must keep following refillStartLevel.
+    // refill and must keep following refillStartLevelCm.
     bool waterLevelLow = false;
     bool waterLevelHigh = false;
 

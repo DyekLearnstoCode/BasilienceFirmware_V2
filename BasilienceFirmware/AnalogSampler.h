@@ -30,6 +30,15 @@ public:
 
     float average() const;
 
+    // Diagnostic-only accessors over the current filled buffer (real-hardware
+    // pH ADC audit) - the distribution width these expose is what median()
+    // is chosen over average() to resist; not used by any filtering
+    // decision itself. Return 0 if the buffer isn't filled yet, matching
+    // median()/average()'s own not-ready convention.
+    int minValue() const;
+
+    int maxValue() const;
+
 private:
     uint8_t pin;
 

@@ -20,7 +20,7 @@ These regulate the acidity of the water.
 ### 4. Water Solenoid (`SOLENOID`)
 This is the automated refill valve.
 *   **Behavior**: When `alertState.lowWater` triggers, `handleRefilling()` kicks in. It turns the Solenoid ON to open the water line.
-*   **Duration**: It keeps the Solenoid open until `sensors.waterLevel >= systemState.refillStopLevel`, at which point it turns it off.
+*   **Duration**: It keeps the Solenoid open until `sensors.waterLevelCm >= systemState.refillStopLevelCm` (water-depth model - see Config.h's "Water Reservoir Geometry"), at which point it turns it off.
 *   **Safety**: If `safetyManager.canRefill()` returns an unsafe status (e.g., a leak is detected), it instantly aborts the refill operation.
 
 ### 5. Peltier (`PELTIER`)

@@ -305,9 +305,34 @@ bool DHT::read(bool force) {
     // if the bit is a 0 (high state cycle count < low state cycle count), or a
     // 1 (high state cycle count > low state cycle count). Note that for speed
     // all the pulses are read into a array and then examined in a later step.
+    //
+    // LOCAL PATCH (ESP32 Interrupt WDT fix - see this repo's own note above
+    // DHT::expectPulse() for the full explanation): abort immediately on the
+    // first timed-out pulse instead of unconditionally calling expectPulse()
+    // all 80 times. Every call in this loop runs inside the InterruptLock
+    // above (interrupts globally disabled), and on ESP32 each expectPulse()
+    // busy-loop iteration goes through digitalRead()->gpio_get_level(), far
+    // slower than the 1-cycle-per-iteration AVR direct port read _maxcycles
+    // was calibrated for - so a sensor that stops responding partway through
+    // could previously hold interrupts off for up to 80 individually-timed-
+    // out pulses, long enough to trip the ESP32 Interrupt WDT (confirmed via
+    // a decoded on-device crash: DHT::expectPulse() -> digitalRead(),
+    // Interrupt wdt timeout on CPU1). Returning here still runs inside this
+    // block, so the InterruptLock destructor still restores interrupts via
+    // normal C++ stack unwinding.
     for (int i = 0; i < 80; i += 2) {
       cycles[i] = expectPulse(LOW);
+      if (cycles[i] == TIMEOUT) {
+        DEBUG_PRINTLN(F("DHT timeout waiting for pulse."));
+        _lastresult = false;
+        return _lastresult;
+      }
       cycles[i + 1] = expectPulse(HIGH);
+      if (cycles[i + 1] == TIMEOUT) {
+        DEBUG_PRINTLN(F("DHT timeout waiting for pulse."));
+        _lastresult = false;
+        return _lastresult;
+      }
     }
   } // Timing critical code is now complete.
 

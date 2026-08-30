@@ -61,6 +61,15 @@ private:
     // ActuatorManager state - see onDeadlineExpired().
     volatile bool deadlineExpired[ACTUATOR_COUNT] = { false };
 
+    // Change-detection for the [CANOPY-PWM]/[BLOWER-PWM] diagnostics (real-
+    // hardware PWM verification follow-up) - only CANOPY_FAN/BLOWER indices
+    // are ever used (see isPwmActuator()), but sized per-actuator for a
+    // direct index match with commands[]/statuses[]. -1 means "never
+    // logged yet", so the first PWM application always logs once; set in
+    // begin()'s existing per-actuator init loop rather than here, so this
+    // doesn't need to know ACTUATOR_COUNT's exact value at declaration.
+    int16_t lastLoggedPwmPercent[ACTUATOR_COUNT];
+
     uint8_t getPin(Actuator actuator) const;
     bool validateCommand(Actuator actuator, bool targetState, String& outReason, bool runningValidation = false);
     void armDeadline(Actuator actuator, unsigned long durationMs);
