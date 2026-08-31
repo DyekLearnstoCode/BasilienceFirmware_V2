@@ -3473,6 +3473,8 @@ void FirebaseManager::writeStatus()
     json.set(
         "mockData",
         systemState.mockSensorsEnabled);
+    json.set("mockDataDynamic",
+        systemState.mockSensorsEnabled && systemState.mockSensorsDynamic);
 
     json.set("sensorTest", systemState.sensorTestEnabled);
 
@@ -4304,6 +4306,11 @@ void FirebaseManager::readMockSensors()
     json.get(data, "enabled");
     const bool nextEnabled = data.success && data.boolValue;
 
+    // Backward compatible: every existing/static payload omits this field
+    // and therefore remains deterministic static mock data.
+    json.get(data, "dynamic");
+    const bool nextDynamic = data.success && data.boolValue;
+
     // A successful read with mock mode disabled resolves the effective source
     // to physical sensors even if optional mock payload fields are incomplete.
     // Persisting here (not only in the change branch below) means a malformed
@@ -4318,7 +4325,7 @@ void FirebaseManager::readMockSensors()
         sensorManager.cancelMockBootWait();
     }
 
-    SensorData nextMock = systemState.mockSensors;
+    SensorData nextBase = systemState.mockSensorBases;
 
     // Air Temperature
     json.get(data, "airTemperature");
@@ -4326,9 +4333,9 @@ void FirebaseManager::readMockSensors()
         (data.typeNum == FirebaseJson::JSON_FLOAT ||
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
-        nextMock.temperature = data.to<float>();
+        nextBase.temperature = data.to<float>();
     else 
-        nextMock.temperature = NAN;
+        nextBase.temperature = NAN;
 
     // Humidity
     json.get(data, "humidity");
@@ -4336,9 +4343,9 @@ void FirebaseManager::readMockSensors()
         (data.typeNum == FirebaseJson::JSON_FLOAT ||
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
-        nextMock.humidity = data.to<float>();
+        nextBase.humidity = data.to<float>();
     else 
-        nextMock.humidity = NAN;
+        nextBase.humidity = NAN;
 
     // Water Temperature
     json.get(data, "waterTemperature");
@@ -4346,9 +4353,9 @@ void FirebaseManager::readMockSensors()
         (data.typeNum == FirebaseJson::JSON_FLOAT ||
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
-        nextMock.waterTemp = data.to<float>();
+        nextBase.waterTemp = data.to<float>();
     else 
-        nextMock.waterTemp = NAN;
+        nextBase.waterTemp = NAN;
 
     // Water Level
     json.get(data, "waterLevel");
@@ -4356,9 +4363,9 @@ void FirebaseManager::readMockSensors()
         (data.typeNum == FirebaseJson::JSON_FLOAT ||
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
-        nextMock.waterLevel = data.to<float>();
+        nextBase.waterLevel = data.to<float>();
     else
-        nextMock.waterLevel = NAN;
+        nextBase.waterLevel = NAN;
 
     // Water Level Depth (cm) - AUTHORITATIVE for refill/low-water control
     // (see Config.h's "Water Reservoir Geometry"). A tester injecting
@@ -4372,19 +4379,19 @@ void FirebaseManager::readMockSensors()
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
     {
-        nextMock.waterLevelCm = data.to<float>();
+        nextBase.waterLevelCm = data.to<float>();
     }
-    else if (isfinite(nextMock.waterLevel))
+    else if (isfinite(nextBase.waterLevel))
     {
-        nextMock.waterLevelCm = (nextMock.waterLevel / 100.0f) * MAX_WORKING_WATER_CM;
+        nextBase.waterLevelCm = (nextBase.waterLevel / 100.0f) * MAX_WORKING_WATER_CM;
     }
     else
     {
-        nextMock.waterLevelCm = NAN;
+        nextBase.waterLevelCm = NAN;
     }
 
-    nextMock.waterVolumeLiters = isfinite(nextMock.waterLevelCm)
-        ? nextMock.waterLevelCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f
+    nextBase.waterVolumeLiters = isfinite(nextBase.waterLevelCm)
+        ? nextBase.waterLevelCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f
         : NAN;
 
     // pH
@@ -4406,7 +4413,7 @@ void FirebaseManager::readMockSensors()
         return;
     }
 
-    nextMock.ph = parsedPh;
+    nextBase.ph = parsedPh;
 
     // EC
     const bool ecExtracted = json.get(data, "ec") && data.success;
@@ -4427,18 +4434,28 @@ void FirebaseManager::readMockSensors()
         return;
     }
 
-    nextMock.ec = parsedEc;
+    nextBase.ec = parsedEc;
 
     const bool enabledChanged = nextEnabled != systemState.mockSensorsEnabled;
-    const bool payloadChanged =
-        floatValuesDiffer(nextMock.temperature, systemState.mockSensors.temperature) ||
-        floatValuesDiffer(nextMock.humidity, systemState.mockSensors.humidity) ||
-        floatValuesDiffer(nextMock.waterTemp, systemState.mockSensors.waterTemp) ||
-        floatValuesDiffer(nextMock.waterLevel, systemState.mockSensors.waterLevel) ||
-        floatValuesDiffer(nextMock.ph, systemState.mockSensors.ph) ||
-        floatValuesDiffer(nextMock.ec, systemState.mockSensors.ec);
+    const bool dynamicChanged = nextDynamic != systemState.mockSensorsDynamic;
+    const bool baseChanged =
+        floatValuesDiffer(nextBase.temperature, systemState.mockSensorBases.temperature) ||
+        floatValuesDiffer(nextBase.humidity, systemState.mockSensorBases.humidity) ||
+        floatValuesDiffer(nextBase.waterTemp, systemState.mockSensorBases.waterTemp) ||
+        floatValuesDiffer(nextBase.waterLevel, systemState.mockSensorBases.waterLevel) ||
+        floatValuesDiffer(nextBase.ph, systemState.mockSensorBases.ph) ||
+        floatValuesDiffer(nextBase.ec, systemState.mockSensorBases.ec);
 
-    systemState.mockSensors = nextMock;
+    systemState.mockSensorBases = nextBase;
+    systemState.mockSensorsDynamic = nextDynamic;
+    // A new base or mode transition starts exactly at the configured values.
+    // Static mode always mirrors the command payload. Dynamic mode alone may
+    // mutate mockSensors between command polls.
+    if (!nextEnabled || !nextDynamic || enabledChanged || dynamicChanged || baseChanged)
+    {
+        systemState.mockSensors = nextBase;
+        systemState.mockDynamicUpdatedAt = millis();
+    }
     systemState.sensorSourceResolved = true;
 
     // Reaching this point means every field parsed and validated, so this is a
@@ -4450,7 +4467,7 @@ void FirebaseManager::readMockSensors()
         sensorManager.notifyMockPayloadReceived();
     }
 
-    if (!enabledChanged && !(nextEnabled && payloadChanged))
+    if (!enabledChanged && !(nextEnabled && (dynamicChanged || baseChanged)))
         return;
 
     if (enabledChanged)
@@ -4470,12 +4487,13 @@ void FirebaseManager::readMockSensors()
     {
         Serial.println("[MOCK] Command received");
         Serial.println("[MOCK] enabled=true");
-        Serial.print("[MOCK] pH="); Serial.println(nextMock.ph, 2);
-        Serial.print("[MOCK] EC="); Serial.println(nextMock.ec, 2);
-        Serial.print("[MOCK] AirTemp="); Serial.println(nextMock.temperature, 2);
-        Serial.print("[MOCK] Humidity="); Serial.println(nextMock.humidity, 2);
-        Serial.print("[MOCK] WaterTemp="); Serial.println(nextMock.waterTemp, 2);
-        Serial.print("[MOCK] WaterLevel="); Serial.println(nextMock.waterLevel, 2);
+        Serial.print("[MOCK] dynamic="); Serial.println(nextDynamic ? "true" : "false");
+        Serial.print("[MOCK] Base pH="); Serial.println(nextBase.ph, 2);
+        Serial.print("[MOCK] Base EC="); Serial.println(nextBase.ec, 2);
+        Serial.print("[MOCK] Base AirTemp="); Serial.println(nextBase.temperature, 2);
+        Serial.print("[MOCK] Base Humidity="); Serial.println(nextBase.humidity, 2);
+        Serial.print("[MOCK] Base WaterTemp="); Serial.println(nextBase.waterTemp, 2);
+        Serial.print("[MOCK] Base WaterLevel="); Serial.println(nextBase.waterLevel, 2);
     }
 }
 

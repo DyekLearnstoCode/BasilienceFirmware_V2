@@ -358,6 +358,54 @@ void SensorManager::resetStabilityWindow(StabilityWindow& window)
     window.staleLogged = false;
 }
 
+float SensorManager::boundedMockWalk(float current, float base,
+                                     float envelope, float maxStep) const
+{
+    if (!isfinite(base)) return NAN;
+    if (!isfinite(current)) current = base;
+
+    const float randomUnit = static_cast<float>(random(-1000L, 1001L)) / 1000.0f;
+    const float randomDelta = randomUnit * maxStep;
+    // A light pull toward the base prevents a walk from lingering against an
+    // envelope edge without making the sequence snap back or oscillate.
+    const float baseTendency = (base - current) * 0.12f;
+    const float candidate = current + randomDelta + baseTendency;
+    return constrain(candidate, base - envelope, base + envelope);
+}
+
+void SensorManager::updateDynamicMockSensors()
+{
+    if (!systemState.mockSensorsEnabled || !systemState.mockSensorsDynamic) return;
+    if (millis() - systemState.mockDynamicUpdatedAt < MOCK_DYNAMIC_UPDATE_INTERVAL_MS) return;
+    systemState.mockDynamicUpdatedAt = millis();
+
+    const SensorData& base = systemState.mockSensorBases;
+    SensorData& current = systemState.mockSensors;
+    current.ph = constrain(
+        boundedMockWalk(current.ph, base.ph, MOCK_DYNAMIC_PH_ENVELOPE, MOCK_DYNAMIC_PH_STEP),
+        0.0f, 14.0f);
+    current.ec = max(0.0f,
+        boundedMockWalk(current.ec, base.ec, MOCK_DYNAMIC_EC_ENVELOPE, MOCK_DYNAMIC_EC_STEP));
+    current.temperature = boundedMockWalk(current.temperature, base.temperature,
+        MOCK_DYNAMIC_AIR_TEMP_ENVELOPE, MOCK_DYNAMIC_AIR_TEMP_STEP);
+    current.humidity = constrain(
+        boundedMockWalk(current.humidity, base.humidity,
+            MOCK_DYNAMIC_HUMIDITY_ENVELOPE, MOCK_DYNAMIC_HUMIDITY_STEP),
+        0.0f, 100.0f);
+    current.waterTemp = boundedMockWalk(current.waterTemp, base.waterTemp,
+        MOCK_DYNAMIC_WATER_TEMP_ENVELOPE, MOCK_DYNAMIC_WATER_TEMP_STEP);
+    current.waterLevel = constrain(
+        boundedMockWalk(current.waterLevel, base.waterLevel,
+            MOCK_DYNAMIC_WATER_LEVEL_ENVELOPE, MOCK_DYNAMIC_WATER_LEVEL_STEP),
+        0.0f, 100.0f);
+    current.waterLevelCm = isfinite(current.waterLevel)
+        ? (current.waterLevel / 100.0f) * MAX_WORKING_WATER_CM
+        : NAN;
+    current.waterVolumeLiters = isfinite(current.waterLevelCm)
+        ? current.waterLevelCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f
+        : NAN;
+}
+
 void SensorManager::applyEffectiveSensors()
 {
     // Evaluated before the source is selected below, so the tick that times
@@ -432,6 +480,7 @@ void SensorManager::applyEffectiveSensors()
     // reverting to a real, possibly noisy physical reading.
     if (systemState.mockSensorsEnabled)
     {
+        updateDynamicMockSensors();
         sensors = systemState.mockSensors;
         sensors.tds = isnan(sensors.ec) ? NAN : sensors.ec * 500.0f;
         // Mock is a fully controlled dataset - a field the payload didn't
