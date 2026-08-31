@@ -1197,6 +1197,23 @@ void SensorManager::readWaterTemperature()
 
 void SensorManager::readWaterLevel()
 {
+    // The fogger and the water-level sensor share the same reservoir, and
+    // the fogger's mist and surface turbulence are a real source of bad
+    // ultrasonic echoes, not just ordinary sensor noise the median/step
+    // filters below are built to reject. Rather than let a disturbed
+    // reading fight its way through those filters, skip sampling entirely
+    // while the fogger is on and hold the last accepted values - the
+    // interval timer is deliberately not advanced here either, so the very
+    // first tick after the fogger turns off takes a fresh reading
+    // immediately rather than waiting out the rest of WATER_LEVEL_READ_
+    // INTERVAL_MS.
+    if (actuatorManager.isOn(FOGGER))
+    {
+        physicalSensors.waterLevelHeldForFogger = true;
+        return;
+    }
+    physicalSensors.waterLevelHeldForFogger = false;
+
     // The HC-SR04 trigger/echo cycle needs real settling time; re-triggering
     // on every loop iteration is a common cause of spurious pulseIn()
     // timeouts unrelated to the sensor or wiring actually failing. Not due

@@ -200,7 +200,20 @@ SafetyResult SafetyManager::canDiluteEC() const
     SafetyResult result = canDoseEC();
     if(result != SafetyResult::SAFE) return result;
     if(systemState.refillSubsystemLocked) return SafetyResult::SUBSYSTEM_LOCKED;
-    if(sensors.waterLevelCm >= systemState.refillStopLevelCm &&
+    // Confirmed live bug: this used to compare against refillStopLevelCm
+    // (the "stop actively refilling" threshold, 3.0cm/50% of working depth
+    // by default - see Config.h's "Water Reservoir Geometry") to decide
+    // whether there is room to add diluting water. That is a materially
+    // lower bar than "actually full" - a half-full reservoir already sits at
+    // or above refillStopLevelCm, so EC dilution was reported RESERVOIR_FULL
+    // (and, via AutomationManager::processECCorrection(), permanently
+    // ecSubsystemLocked pending a manual Reset Safety) at 50% depth just as
+    // readily as at true capacity. MAX_WORKING_WATER_CM is the actual
+    // working-capacity ceiling - "no more room, full stop" - and is the
+    // correct bar for this specific "can we physically add more water"
+    // question, distinct from refillStopLevelCm's "have we topped up enough
+    // for now" one.
+    if(sensors.waterLevelCm >= MAX_WORKING_WATER_CM &&
        sensors.ec > systemState.ecTargetMax) return SafetyResult::RESERVOIR_FULL;
     return SafetyResult::SAFE;
 }

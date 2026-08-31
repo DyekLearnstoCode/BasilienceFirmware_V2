@@ -100,6 +100,14 @@ struct SensorData
     // Diagnostics only: raw HC-SR04 measured distance in centimeters, before
     // depth conversion. Never consumed by automation/alerts/safety.
     float waterLevelDistanceCm = NAN;
+
+    // True while the fogger is running, during which SensorManager::
+    // readWaterLevel() skips taking new readings entirely rather than
+    // trusting an ultrasonic echo disturbed by the fogger's own mist and
+    // surface turbulence in the same reservoir. waterLevelCm/waterLevel/
+    // waterVolumeLiters are left untouched while this is true, so they keep
+    // reporting the last accepted reading from before the fogger started.
+    bool waterLevelHeldForFogger = false;
 };
 
 

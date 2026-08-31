@@ -740,6 +740,28 @@ void FirebaseManager::update()
 
     if (suspendedForProvisioning)
     {
+        // Confirmed live bug this fixes: /status/provisioning was set true
+        // when entering provisioning (see the startProvisioning command
+        // handler below) but was never cleared back to false anywhere in
+        // this firmware. DeviceConnectionManager.resolveState() on the app
+        // side treats provisioning==true as an unconditional "always show
+        // Reconnecting," with no time bound of its own - so any device that
+        // had EVER gone through Wi-Fi Configuration/AP mode once would show
+        // Reconnecting in the app permanently, even while fully online.
+        // Written here (not unconditionally alongside the in-memory flag
+        // below) so a failed write leaves suspendedForProvisioning true and
+        // this retries on the very next tick, mirroring the existing
+        // retry-by-not-advancing-state pattern the startProvisioning command
+        // handler already uses for its own "set true" write.
+        const unsigned long provisioningClearStartedAt = millis();
+        const bool provisioningCleared = Firebase.RTDB.setBool(
+            &fbdo, deviceRoot() + "/status/provisioning", false);
+        logFirebaseDuration("Provisioning state clear", millis() - provisioningClearStartedAt);
+        if (!provisioningCleared)
+        {
+            Serial.println("[FIREBASE] Unable to clear provisioning state; will retry next tick");
+            return;
+        }
         Serial.println("[FIREBASE] Resuming after Wi-Fi reconnect");
         suspendedForProvisioning = false;
     }
@@ -3246,6 +3268,11 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     if (isfinite(publishedSensors.waterLevelCm)) json.set("waterLevelCm", publishedSensors.waterLevelCm);
     if (isfinite(publishedSensors.waterVolumeLiters)) json.set("waterVolumeLiters", publishedSensors.waterVolumeLiters);
     if (isfinite(publishedSensors.waterLevelDistanceCm)) json.set("waterLevelDistanceCm", publishedSensors.waterLevelDistanceCm);
+    // Always published (boolean, no NaN state) - same shape as dhtAvailable/
+    // dhtStale, so the app can eventually show "reading held (fogger
+    // running)" instead of silently displaying a frozen number as if it
+    // were live.
+    json.set("waterLevelHeldForFogger", publishedSensors.waterLevelHeldForFogger);
 
     //--------------------------------------------------
     // Nutrient

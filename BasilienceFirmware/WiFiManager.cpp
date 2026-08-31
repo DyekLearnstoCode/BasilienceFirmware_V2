@@ -82,6 +82,23 @@ void WiFiManager::begin()
     // later never reset it back to its default-true state.
     WiFi.setAutoReconnect(false);
 
+    // Sibling fix to setAutoReconnect(false) above, same root cause: the
+    // ESP-IDF WiFi driver keeps its OWN internal, NVS-backed STA config
+    // (ssid/password), entirely separate from this app's own Preferences
+    // "wifi" namespace below. WiFi.persistent() defaults to true, so every
+    // WiFi.begin(ssid, password) call this firmware makes - including every
+    // FAILED attempt against an old/replaced network from the self-heal
+    // retry loop or a normal reconnect - also silently overwrites that
+    // internal store. An explicit WiFi.begin(ssid, password) call always
+    // wins over it, but leaving persistence on means stale credentials sit
+    // in a second, undocumented location this app's own saveCredentials()/
+    // loadCredentials() never touches or clears - exactly the kind of
+    // hidden state the setAutoReconnect(false) fix above was written to
+    // rule out for auto-reconnect. Disabling it here makes this app's own
+    // Preferences "wifi" namespace the SOLE source of truth for every
+    // connection attempt, with no other cached fallback able to take effect.
+    WiFi.persistent(false);
+
     preferences.begin("wifi", false);
     firebaseResumePending = preferences.getBool("resumeFirebase", false);
     if (firebaseResumePending)
@@ -365,11 +382,42 @@ bool WiFiManager::saveCredentials(
 {
     preferences.begin("wifi", false);
 
-    preferences.putString("ssid", ssid);
-
-    preferences.putString("password", password);
+    size_t ssidBytes = preferences.putString("ssid", ssid);
+    size_t passwordBytes = preferences.putString("password", password);
+    // Diagnostic for the failure mode this function fixes: putString()
+    // internally does nvs_set_str() THEN nvs_commit(), returning 0 if
+    // either fails (e.g. a full/fragmented NVS partition) - only logged via
+    // ESP-IDF's own log_e(), invisible at this project's serial log level.
+    // freeEntries() surfaces that same health signal on this app's own log
+    // instead, so a save failure is diagnosable without raising the core
+    // debug level.
+    size_t freeEntries = preferences.freeEntries();
 
     preferences.end();
+
+    Serial.print("[WIFI] saveCredentials: ssidBytes=");
+    Serial.print(ssidBytes);
+    Serial.print(" passwordBytes=");
+    Serial.print(passwordBytes);
+    Serial.print(" nvsFreeEntries=");
+    Serial.println(freeEntries);
+
+    // putString() returning 0 was previously never checked here, so a
+    // write that silently failed (NVS full/corrupted, or nvs_commit()
+    // failing after a successful nvs_set_str()) still reported success to
+    // this function's caller and to the /setup HTTP handler, leaving
+    // whatever credentials already existed in NVS untouched - the confirmed
+    // cause of "credentials always revert to the previous network."
+    // /setup already rejects an empty SSID before ever calling this, so
+    // ssidBytes==0 here is unambiguously a real failure, not a legitimate
+    // empty value; password may legitimately be empty (open networks), so
+    // passwordBytes==0 only counts as a failure when a non-empty password
+    // was actually submitted.
+    if (ssidBytes == 0 || (password.length() > 0 && passwordBytes == 0))
+    {
+        Serial.println("[WIFI] saveCredentials FAILED: NVS write did not persist - keeping previous in-memory credentials");
+        return false;
+    }
 
     this->ssid = ssid;
     this->password = password;
@@ -477,6 +525,21 @@ void WiFiManager::update()
         dnsServer.processNextRequest();
         server.handleClient();
 
+        // MANUAL provisioning is a user actively submitting NEW credentials
+        // through this same setup AP (WifiConfigFragment's POST /setup) - the
+        // self-heal retry below has no business running here, and actively
+        // breaks that submission. ESP32's AP and STA share one radio: every
+        // AP_RECONNECT_INTERVAL (30s) this used to force WIFI_AP_STA and call
+        // WiFi.begin() to retry the OLD saved network, an association attempt
+        // that stays in flight for up to RECOVERY_TIMEOUT (20s) - i.e. the
+        // softAP's radio was destabilized roughly 2/3 of the time. If the
+        // phone's POST /setup landed during that window, the request would
+        // time out or the connection would reset (confirmed bug: "credentials
+        // submit fails"). Only FALLBACK provisioning (unattended, entered
+        // because the device itself lost its known network) should keep
+        // trying to self-heal in the background.
+        if (provisioningMode == ProvisioningMode::MANUAL) return;
+
         // Keep the setup portal available while occasionally trying the retained
         // network in STA mode. This lets a temporary router outage self-heal.
         if (!hasCredentials()) return;
@@ -486,16 +549,6 @@ void WiFiManager::update()
         {
             systemState.wifiConnected = true;
             apReconnectInProgress = false;
-            if (provisioningMode == ProvisioningMode::MANUAL)
-            {
-                if (!manualReachabilityLogged)
-                {
-                    Serial.println("[WIFI] Saved network still reachable");
-                    Serial.println("[WIFI] Manual provisioning active - keeping setup AP open");
-                    manualReachabilityLogged = true;
-                }
-                return;
-            }
 
             Serial.println("[WIFI] Saved network restored");
             Serial.println("[WIFI] Returning to normal operation");
@@ -503,8 +556,6 @@ void WiFiManager::update()
             WiFi.mode(WIFI_STA);
             return;
         }
-
-        manualReachabilityLogged = false;
 
         if (apReconnectInProgress)
         {
@@ -766,6 +817,20 @@ void WiFiManager::setupAPServer()
             return;
         }
         Serial.println("[AP] Credentials saved");
+
+        // Explicit read-back, independent of the in-memory this->ssid
+        // saveCredentials() already set - proves what actually landed in
+        // flash rather than assuming the write stuck. Compared directly
+        // against the just-submitted value so a divergence (encoding
+        // corruption, a write that silently failed) is visible immediately
+        // in this same log, instead of only showing up indirectly as a
+        // failed reconnect after reboot.
+        preferences.begin("wifi", true);
+        String verifySsid = preferences.getString("ssid", "");
+        preferences.end();
+        Serial.print("[AP] NVS read-back ssid=");
+        Serial.print(verifySsid);
+        Serial.println(verifySsid == newSsid ? " (matches submitted value)" : " (MISMATCH vs submitted value)");
 
         preferences.begin("wifi", false);
         preferences.putBool("resumeFirebase", true);

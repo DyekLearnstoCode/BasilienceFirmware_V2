@@ -2579,11 +2579,18 @@ void AutomationManager::completeRefillSuccess()
 
 bool AutomationManager::handleBoundedAutomaticRefill()
 {
-    // Preserve Off / Full System exactly: the bounded 3-attempt policy is a
-    // temporary Water Refill isolation-test contract, not a silent redesign
-    // of the production refill lifecycle.
-    if(systemState.automationTestSubsystem != AutomationTestSubsystem::REFILL ||
-       systemState.operationRequest.source != RequestSource::AUTOMATIC)
+    // Bounded 3-attempt policy is the production automatic-refill lifecycle
+    // (promoted from what was originally a REFILL-isolation-test-only
+    // contract): run the solenoid for AUTOMATIC_REFILL_RUN_TIME, then let
+    // the reading settle for AUTOMATIC_REFILL_SETTLE_TIME before trusting
+    // it - the ultrasonic sensor reads unreliably while water is actively
+    // flowing into the reservoir - and give up after MAX_REFILL_ATTEMPTS
+    // rather than holding the solenoid open continuously for up to
+    // OPERATION_TIMEOUT_MS. Manual refill requests (an admin's "Start
+    // Reservoir Refill" button) are deliberately excluded - an operator
+    // watching the refill happen can stop it manually if something looks
+    // wrong, so manual keeps the simpler continuous-run behavior below.
+    if(systemState.operationRequest.source != RequestSource::AUTOMATIC)
     {
         return false;
     }
@@ -2746,15 +2753,15 @@ void AutomationManager::handleRefilling()
         lastRefillStopLevel = systemState.refillStopLevelCm;
     }
 
-    // Isolated REFILL test mode (automatic source) must be evaluated
-    // exclusively by handleBoundedAutomaticRefill()'s run+settle cycle - see
-    // that function's matching gate. Without this guard, the ordinary
-    // continuous-refill "already at/above stop level" shortcut below fires
-    // the instant waterLevelCm crosses the threshold, even mid-run,
-    // completing the refill immediately instead of waiting out the 30s run
-    // + 5s settle and evaluating once, per attempt.
-    const bool isolatedRefillTestActive =
-        systemState.automationTestSubsystem == AutomationTestSubsystem::REFILL &&
+    // An automatic refill is evaluated exclusively by
+    // handleBoundedAutomaticRefill()'s run+settle cycle - see that
+    // function's matching gate. Without this guard, the plain "already
+    // at/above stop level" shortcut below fires the instant waterLevelCm
+    // crosses the threshold, even mid-run, completing the refill
+    // immediately instead of waiting out the run + settle window and
+    // evaluating once per attempt. Manual refill requests are excluded,
+    // same as handleBoundedAutomaticRefill()'s own gate.
+    const bool boundedRefillActive =
         systemState.operationRequest.source == RequestSource::AUTOMATIC;
 
     // refillStopConfirmed (resilience pass follow-up) requires
@@ -2762,7 +2769,7 @@ void AutomationManager::handleRefilling()
     // refillStopLevelCm - see SensorManager::readWaterLevel(). Not a plain
     // sensors.waterLevelCm >= refillStopLevelCm comparison any more: that
     // alone let one small transient reading falsely complete a refill.
-    if(!isolatedRefillTestActive &&
+    if(!boundedRefillActive &&
        sensors.refillStopConfirmed)
     {
         if (debugManager.shouldPrintDebug(DebugCategory::WATER))
