@@ -90,6 +90,15 @@ struct NotificationEvent
 
     bool queuedForCloud = false;
     CloudReplayStatus cloudStatus = CloudReplayStatus::NOT_QUEUED;
+
+    // millis() at enqueue time - a same-boot-only fallback for giving up on
+    // SMS delivery when occurredAtEpoch/timestampValid can't be trusted (no
+    // RTC hardware present). Meaningless across a reboot (millis() resets to
+    // 0), which is fine: a slot that was still waiting when the device
+    // rebooted gives up on its very next tick post-reboot rather than
+    // silently holding a queue slot forever - see NotificationManager.cpp's
+    // reapSettledSlots()/startSmsFanOutIfIdle() for how this is used.
+    unsigned long enqueuedAtMillis = 0;
 };
 
 inline const char* notificationEventTypeName(NotificationEventType type)

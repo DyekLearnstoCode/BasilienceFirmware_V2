@@ -4373,8 +4373,16 @@ void FirebaseManager::readMockSensors()
     // the percentage above so existing percentage-only mock payloads keep
     // driving refill/low-water control exactly as before, just recalibrated
     // to the new working-depth scale.
-    json.get(data, "waterLevelCm");
-    if (data.success &&
+    // Capture get()'s own return value, not just data.success: FirebaseJsonBase::mGet()
+    // only clears/repopulates `data` when the key IS found (see FirebaseJson.cpp) - when
+    // "waterLevelCm" is absent (deleted, e.g. by the app's null-override-clear), `data`
+    // is left completely untouched from the "waterLevel" get() immediately above, so
+    // data.success was still true and this branch silently reused the PERCENTAGE value
+    // as if it were the cm override. Confirmed live bug: a mock waterLevel of 20%/33%/75%
+    // with no cm override sent was read back as a literal 20/33/75cm depth (should be
+    // 1.2/1.98/4.5cm), falsely tripping the reservoir-full EC-dilution block.
+    bool waterLevelCmFound = json.get(data, "waterLevelCm");
+    if (waterLevelCmFound && data.success &&
         (data.typeNum == FirebaseJson::JSON_FLOAT ||
          data.typeNum == FirebaseJson::JSON_DOUBLE ||
          data.typeNum == FirebaseJson::JSON_INT))
@@ -4394,47 +4402,60 @@ void FirebaseManager::readMockSensors()
         ? nextBase.waterLevelCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f
         : NAN;
 
-    // pH
-    const bool phExtracted = json.get(data, "ph") && data.success;
-    if (!phExtracted ||
-        (data.typeNum != FirebaseJson::JSON_FLOAT &&
-         data.typeNum != FirebaseJson::JSON_DOUBLE &&
-         data.typeNum != FirebaseJson::JSON_INT))
+    // pH. Unlike the environmental fields above, a value is also rejected
+    // for being out of the 0-14 domain, not just absent/wrong-typed - but
+    // either failure only NaNs this one field (same as every field above)
+    // instead of aborting the whole read. This used to `return` here, which
+    // meant a payload that mocked only e.g. water level while leaving pH/EC
+    // blank (the app's DevOptionsFragment.pushMockValues() omits a field
+    // entirely from the write when its input box is empty) silently dropped
+    // every other field too, not just pH.
+    json.get(data, "ph");
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
     {
-        Serial.println("[MOCK] pH parse failed");
-        return;
+        const float parsedPh = data.to<float>();
+        if (isfinite(parsedPh) && parsedPh >= 0.0f && parsedPh <= 14.0f)
+        {
+            nextBase.ph = parsedPh;
+        }
+        else
+        {
+            Serial.print("[MOCK] pH rejected: ");
+            Serial.println(parsedPh, 2);
+            nextBase.ph = NAN;
+        }
+    }
+    else
+    {
+        nextBase.ph = NAN;
     }
 
-    const float parsedPh = data.to<float>();
-    if (!isfinite(parsedPh) || parsedPh < 0.0f || parsedPh > 14.0f)
+    // EC - same treatment as pH above.
+    json.get(data, "ec");
+    if (data.success &&
+        (data.typeNum == FirebaseJson::JSON_FLOAT ||
+         data.typeNum == FirebaseJson::JSON_DOUBLE ||
+         data.typeNum == FirebaseJson::JSON_INT))
     {
-        Serial.print("[MOCK] pH rejected: ");
-        Serial.println(parsedPh, 2);
-        return;
+        const float parsedEc = data.to<float>();
+        if (isfinite(parsedEc) && parsedEc >= 0.0f)
+        {
+            nextBase.ec = parsedEc;
+        }
+        else
+        {
+            Serial.print("[MOCK] EC rejected: ");
+            Serial.println(parsedEc, 2);
+            nextBase.ec = NAN;
+        }
     }
-
-    nextBase.ph = parsedPh;
-
-    // EC
-    const bool ecExtracted = json.get(data, "ec") && data.success;
-    if (!ecExtracted ||
-        (data.typeNum != FirebaseJson::JSON_FLOAT &&
-         data.typeNum != FirebaseJson::JSON_DOUBLE &&
-         data.typeNum != FirebaseJson::JSON_INT))
+    else
     {
-        Serial.println("[MOCK] EC parse failed");
-        return;
+        nextBase.ec = NAN;
     }
-
-    const float parsedEc = data.to<float>();
-    if (!isfinite(parsedEc) || parsedEc < 0.0f)
-    {
-        Serial.print("[MOCK] EC rejected: ");
-        Serial.println(parsedEc, 2);
-        return;
-    }
-
-    nextBase.ec = parsedEc;
 
     const bool enabledChanged = nextEnabled != systemState.mockSensorsEnabled;
     const bool dynamicChanged = nextDynamic != systemState.mockSensorsDynamic;
@@ -4458,10 +4479,12 @@ void FirebaseManager::readMockSensors()
     }
     systemState.sensorSourceResolved = true;
 
-    // Reaching this point means every field parsed and validated, so this is a
-    // fresh valid payload for THIS session - the only thing that confirms a
-    // boot-restored mock source. Malformed payloads return earlier and
-    // deliberately do not count.
+    // Reaching this point means the command payload itself was read
+    // successfully (individual fields may still be NaN if the app left them
+    // unset or out of range - see the per-field handling above), so this is
+    // a fresh payload for THIS session - the only thing that confirms a
+    // boot-restored mock source. A failed Firebase read returns earlier
+    // (mockReadBackoffActive path above) and deliberately does not count.
     if (nextEnabled)
     {
         sensorManager.notifyMockPayloadReceived();

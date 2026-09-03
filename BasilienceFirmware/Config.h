@@ -482,7 +482,15 @@ constexpr unsigned long EC_DOSE_COOLDOWN =
 
 // ======================================================
 
-constexpr unsigned long SENSOR_STABILIZATION_TIME = 10000UL;
+// Hard cap on the SENSOR_STABILIZATION boot state (see
+// AutomationManager::handleSensorStabilization()). That state now exits as
+// soon as pH/EC actually confirm stable (isPhCurrentlyStable()/
+// isEcCurrentlyStable()), not on a blind timer - this is only the fallback
+// so a genuinely stuck/disconnected probe still reaches STARTUP eventually
+// instead of hanging forever. 1 minute still comfortably covers
+// PH_EC_ANALOG_SETTLE_TIME (20s) plus the pH step filter's confirmation
+// window with margin for a slow-to-settle probe.
+constexpr unsigned long SENSOR_STABILIZATION_TIME = 60000UL; // 1 minute
 
 // Coherent-snapshot readiness (quick-response refinement task) - deliberately
 // NOT SENSOR_STABILIZATION_TIME above, which is AutomationManager's own
@@ -509,7 +517,7 @@ constexpr unsigned long SENSOR_READY_MAX_MS = 3000UL;
 constexpr unsigned long PH_EC_ANALOG_SETTLE_TIME = 20000UL;
 
 constexpr unsigned long STARTUP_ON_TIME =
-    180UL * 1000UL; // 3 minutes
+    120UL * 1000UL; // 2 minutes
 
 constexpr unsigned long STARTUP_OFF_TIME =
     60UL * 1000UL; // 1 minute
@@ -548,7 +556,7 @@ constexpr unsigned long BLOWER_PURGE_MS =
 // FirebaseManager::readSettings()'s own comment for the accept/reject
 // rule. Range mirrors validPercentage()-style bounds but narrower, since a
 // fogging airflow test below 30% is not a realistic operating point.
-constexpr uint8_t BLOWER_SPEED_DEFAULT_PERCENT = 50;
+constexpr uint8_t BLOWER_SPEED_DEFAULT_PERCENT = 30;
 constexpr uint8_t BLOWER_SPEED_MIN_PERCENT = 30;
 constexpr uint8_t BLOWER_SPEED_MAX_PERCENT = 100;
 
@@ -601,7 +609,7 @@ constexpr float REFILL_STOP_LEVEL = 75.0f;
 // Manual refill commands retain their existing OperationRequest timeout.
 constexpr uint8_t MAX_REFILL_ATTEMPTS = 3;
 constexpr unsigned long AUTOMATIC_REFILL_RUN_TIME = 30UL * 1000UL;
-constexpr unsigned long AUTOMATIC_REFILL_SETTLE_TIME = 5UL * 1000UL;
+constexpr unsigned long AUTOMATIC_REFILL_SETTLE_TIME = 10UL * 1000UL;
 
 constexpr unsigned long MANUAL_PUMP_RUNTIME = 5000UL;
 

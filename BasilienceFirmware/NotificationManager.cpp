@@ -27,6 +27,41 @@ void NotificationManager::update()
     observeConnectivity();
     observeHarvestSchedule();
     updateSmsFanOut();
+    reapSettledSlots();
+}
+
+// A slot that was only ever needed for SMS fan-out (queuedForCloud=false -
+// either because Firestore already owns its history directly while online,
+// per observeAlertTransitions()'s own comment, or because it's one of the
+// two types that are unconditionally SMS-only) previously had no code path
+// that ever freed it once SMS finished, `inUse` is set exactly once, at
+// enqueue, and nothing but markCloudReplayAcked() (which only ever runs for
+// queuedForCloud=true entries) ever clears it. In practice every alert-
+// worthy event permanently consumed one of the 20 total slots for the life
+// of the device, confirmed by the captured boot log where the NVS-persisted
+// queue reached 20/20 and started silently dropping new events ("no low-
+// priority event to evict"). Cloud-queued entries are deliberately left
+// untouched here - markCloudReplayAcked() already owns freeing those, and
+// touching cloudReplayInFlightEventId bookkeeping from a second place would
+// risk racing FirebaseManager's job cursor.
+void NotificationManager::reapSettledSlots()
+{
+    bool freedAny = false;
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        NotificationEvent& event = queue[i];
+        if (!event.inUse || event.queuedForCloud) continue;
+
+        bool smsSettled = !event.smsEligible ||
+            event.smsStatus == SmsDeliveryStatus::DELIVERED ||
+            event.smsStatus == SmsDeliveryStatus::PARTIAL ||
+            event.smsStatus == SmsDeliveryStatus::FAILED;
+        if (!smsSettled) continue;
+
+        event = NotificationEvent();
+        freedAny = true;
+    }
+    if (freedAny) persistQueue();
 }
 
 // --------------------------------------------------------------------
@@ -238,6 +273,7 @@ void NotificationManager::enqueueEvent(NotificationEventType type, NotificationS
 
     event.smsEligible = smsEligible;
     event.smsStatus = SmsDeliveryStatus::PENDING;
+    event.enqueuedAtMillis = millis();
     event.queuedForCloud = queuedForCloud;
     event.cloudStatus = queuedForCloud ? CloudReplayStatus::PENDING : CloudReplayStatus::NOT_QUEUED;
 
@@ -413,6 +449,19 @@ void NotificationManager::startSmsFanOutIfIdle()
         }
         else if (!gsmManager.isReady())
         {
+            // Previously this just skipped forever with no bound at all on
+            // a unit whose GSM module never becomes ready (no SIM800L
+            // wired, or it never registers) - the event's slot, and by
+            // extension one of the 20 total queue slots, was held hostage
+            // permanently. Give up attempting SMS for it once it's clearly
+            // not going to happen soon; the alert itself is not lost, it
+            // still reached /alerts and Firestore through the normal online
+            // path, this only concerns the redundant SMS channel.
+            if (millis() - event.enqueuedAtMillis >= SMS_START_TIMEOUT_MS)
+            {
+                event.smsStatus = SmsDeliveryStatus::FAILED;
+                persistQueue();
+            }
             continue;
         }
 

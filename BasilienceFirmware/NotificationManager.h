@@ -60,6 +60,14 @@ private:
     // information a day later; ordinary alerts do not.
     static constexpr unsigned long GENERAL_SMS_FRESHNESS_MS = 6UL * 60UL * 60UL * 1000UL;       // 6 hours
     static constexpr unsigned long HARVEST_DUE_SMS_FRESHNESS_MS = 24UL * 60UL * 60UL * 1000UL;  // 24 hours
+    // A PENDING event whose GSM module never becomes ready (no SIM800L
+    // wired, or it never registers) previously waited forever with no
+    // bound at all - this is the timeout that gives up on ATTEMPTING SMS in
+    // that case (distinct from GENERAL_SMS_FRESHNESS_MS above, which governs
+    // whether an already-DEFERRED send is still worth attempting once GSM
+    // does recover). 5 minutes is generous enough not to punish a real
+    // SIM800L's normal power-on/network-registration delay.
+    static constexpr unsigned long SMS_START_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
     Preferences preferences;
     NotificationEvent queue[NOTIFICATION_QUEUE_CAPACITY];
@@ -106,6 +114,7 @@ private:
 
     int findQueueSlot(const char* eventId);
     int findFreeOrEvictableSlot();
+    void reapSettledSlots();
     void loadQueue();
     void persistQueue();
 };

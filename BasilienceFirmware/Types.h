@@ -555,6 +555,19 @@ struct SystemState
 
     uint8_t phAttempts = 0;
 
+    // millis() a pH-Up/pH-Down pump last actually finished running, from
+    // EITHER source (manual or automatic) - see
+    // ActuatorManager::update()'s STOPPING case, the single funnel every
+    // pump-off transition passes through. 0 means "never dosed this boot,"
+    // a sentinel rather than a real timestamp so the cooldown below never
+    // blocks the very first correction. Consumed by
+    // AutomationManager::canStartNewPHCorrection() as PH_DOSE_COOLDOWN - a
+    // real minimum wait, not just the stability window's own "has the
+    // reading stopped moving" check, since a probe can settle into a
+    // misleadingly steady reading before the dosed chemical has actually
+    // finished mixing into the reservoir.
+    unsigned long lastPhDoseEndedAt = 0;
+
     float minPH = MIN_PH;
 
     float maxPH = MAX_PH;
@@ -570,6 +583,11 @@ struct SystemState
     unsigned long ecDoseTime = 0;
 
     uint8_t ecAttempts = 0;
+
+    // Same purpose/sentinel convention as lastPhDoseEndedAt above, for the
+    // Grow/Bloom pumps - EC_DOSE_COOLDOWN is enforced from this in
+    // AutomationManager::canStartNewECCorrection().
+    unsigned long lastEcDoseEndedAt = 0;
 
     float minEC = MIN_EC;
 

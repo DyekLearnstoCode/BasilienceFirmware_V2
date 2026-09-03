@@ -938,8 +938,13 @@ void SensorManager::readDHT()
     // FOGGING (DHT-dependent/optional-cadence controllers), suppressed
     // everywhere else - see DebugManager::shouldPrintDebug()'s own comment.
     // Purely a print gate; every failure/recovery streak and physicalSensors
-    // update below is unconditional.
-    const bool dbgDht = debugManager.shouldPrintDebug(DebugCategory::DHT);
+    // update below is unconditional. Also suppressed outright while mock
+    // sensors are driving automation - the physical DHT's own raw readings
+    // (or lack of them) aren't relevant to what's actually being tested then,
+    // and this is exactly the noise a full mock-driven automation test wants
+    // filtered out.
+    const bool dbgDht = debugManager.shouldPrintDebug(DebugCategory::DHT)
+        && !systemState.mockSensorsEnabled;
 
     // [DHT-RAW] diagnostic: an invalid sample is always printed immediately
     // (already naturally rate-limited to once per DHT_READ_INTERVAL_MS, and
@@ -1118,8 +1123,12 @@ void SensorManager::readWaterTemperature()
     // the COOLING controller's own sensor input - see
     // DebugManager::shouldPrintDebug()'s own comment. Purely a print gate;
     // every failure/recovery streak and physicalSensors update below is
-    // unconditional.
-    const bool dbgCooling = debugManager.shouldPrintDebug(DebugCategory::COOLING);
+    // unconditional. Also suppressed outright while mock sensors are
+    // driving automation, same reasoning as dbgDht above - the actual
+    // COOLING-INPUT/TEMP automation decision logs elsewhere are unaffected,
+    // only this raw-hardware diagnostic is filtered.
+    const bool dbgCooling = debugManager.shouldPrintDebug(DebugCategory::COOLING)
+        && !systemState.mockSensorsEnabled;
 
     if (waterSensorDeviceCount == 0)
     {
@@ -1764,9 +1773,11 @@ void SensorManager::readPH()
 
     // Throttled diagnostic - readPH() itself runs every loop() tick, far
     // more often than this needs to print. See DHT_RAW_DIAGNOSTIC_INTERVAL_MS
-    // for the same pattern.
+    // for the same pattern. Suppressed outright while mock sensors are
+    // driving automation, same reasoning as dbgDht/dbgCooling above.
     const unsigned long now = millis();
     if (debugManager.shouldPrintDebug(DebugCategory::PH) &&
+        !systemState.mockSensorsEnabled &&
         (lastPhAdcDiagnosticAt == 0 ||
         now - lastPhAdcDiagnosticAt >= PH_ADC_DIAGNOSTIC_INTERVAL_MS))
     {

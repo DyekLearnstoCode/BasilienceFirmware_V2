@@ -776,7 +776,20 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 // ownership already works.
                 automationManager.setManualCoolingDemand(true);
             }
+            if (!manual)
             {
+                // HARD safety check, AUTOMATIC only: running the Peltier
+                // without active circulation risks localized freezing/
+                // overheating right at the plate instead of the whole
+                // reservoir settling toward the target evenly. For MANUAL,
+                // this previously blocked the Peltier from ever running on
+                // its own - by explicit choice, manual actuators are meant
+                // to be independently controllable rather than one gating
+                // another (same reasoning already applied to the SOFT
+                // temperature-target rule just above), so this interlock
+                // now only applies to automatic commands. An operator who
+                // manually commands only the Peltier is trusted to know
+                // circulation isn't running.
                 const ActuatorStatus& circulation = statuses[CIRCULATION_PUMP];
                 if (!isOn(CIRCULATION_PUMP) ||
                     !circulation.running ||
@@ -908,13 +921,6 @@ void ActuatorManager::update()
 
         const ActuatorStatus previousStatus = status;
 
-        // Set only when this tick's STOPPING transition came from an
-        // explicit manual OFF command (just below), never from the
-        // loop-polled runtime watchdog or a soft-rule "target already
-        // reached" stop further down - see the STOPPING case's use of this
-        // flag for why the two must stay distinguishable.
-        bool explicitManualStop = false;
-
         if (cmd.isPending)
         {
             cmd.isPending = false;
@@ -940,13 +946,9 @@ void ActuatorManager::update()
                 if (status.state == ActuatorCommandState::RUNNING || status.state == ActuatorCommandState::ACTIVATING)
                 {
                     status.state = ActuatorCommandState::STOPPING;
-                    if (status.source == "manual")
+                    if (status.source == "manual" && status.reason.isEmpty())
                     {
-                        explicitManualStop = true;
-                        if (status.reason.isEmpty())
-                        {
-                            status.reason = "Manual stop";
-                        }
+                        status.reason = "Manual stop";
                     }
                 }
                 else
@@ -1147,25 +1149,45 @@ void ActuatorManager::update()
                     }
                     turnOff(a);
                     status.running = false;
+
+                    // A dose just finished, from EITHER source (manual or
+                    // automatic) - this funnel is the one place every
+                    // pump-off transition passes through regardless of who
+                    // requested it. Feeds PH_DOSE_COOLDOWN/EC_DOSE_COOLDOWN
+                    // in AutomationManager::canStartNewPHCorrection()/
+                    // canStartNewECCorrection(): the stability window alone
+                    // only proves the probe's reading has stopped moving,
+                    // not that the dosed chemical has actually finished
+                    // mixing into the reservoir, so a real minimum wait is
+                    // enforced on top of it.
+                    if (a == PH_UP_PUMP || a == PH_DOWN_PUMP)
+                    {
+                        systemState.lastPhDoseEndedAt = currentMillis;
+                    }
+                    else if (a == GROW_PUMP || a == BLOOM_PUMP)
+                    {
+                        systemState.lastEcDoseEndedAt = currentMillis;
+                    }
+
                     if (isManualSource(status.source))
                     {
-                        // An explicit manual OFF (any actuator other than
-                        // CIRCULATION_PUMP - see its dedicated demand-mirror
-                        // handling in requestCommand()) HOLDS ownership so
-                        // automatic control cannot reclaim the actuator on
-                        // the very next tick; only a natural stop - the
-                        // runtime watchdog above, or validateCommand's
-                        // soft-rule "target already reached" - releases it
-                        // here. See explicitManualStop's declaration above.
-                        if (a == CIRCULATION_PUMP || !explicitManualStop)
+                        // An explicit manual OFF now always hands the
+                        // actuator straight back to automation, the same
+                        // tick, rather than holding it until manual mode is
+                        // toggled off entirely or a deadline timer elsewhere
+                        // expires. Automation still has to independently
+                        // decide the actuator needs to change - it re-reads
+                        // current sensor conditions from scratch next tick,
+                        // it does not resume anything - and every existing
+                        // safety gate (stability windows, dose cooldown
+                        // above, reservoir/subsystem locks, target-reached
+                        // soft rules) still applies in full before it acts.
+                        if (manuallyOverridden[i])
                         {
-                            if (manuallyOverridden[i])
-                            {
-                                manuallyOverridden[i] = false;
-                                Serial.print("[MANUAL] ");
-                                Serial.print(actuatorLogName(a));
-                                Serial.println(" manual hold expired; automation ownership restored");
-                            }
+                            manuallyOverridden[i] = false;
+                            Serial.print("[MANUAL] ");
+                            Serial.print(actuatorLogName(a));
+                            Serial.println(" released; automation ownership restored");
                         }
                         if (a == PELTIER)
                         {

@@ -1095,12 +1095,25 @@ void AutomationManager::handleSensorStabilization()
 
     // SENSOR_STABILIZATION is a true initialization/wait phase: ordinary
     // automatic refill/pH/EC regulation must not pre-empt it (see the
-    // automation case-matrix resolution, cases 2/3). The only thing this
-    // state does is wait out the stabilization timer, then hand off to
-    // validateSystem() to decide STARTUP.
-    if(millis() -
-       systemState.stateStartTime >=
-       SENSOR_STABILIZATION_TIME)
+    // automation case-matrix resolution, cases 2/3). This state now waits
+    // for pH and EC to actually confirm a stable reading (the same
+    // isPhCurrentlyStable()/isEcCurrentlyStable() gate canStartNewPHCorrection()/
+    // canStartNewECCorrection() trust elsewhere) rather than a blind timer -
+    // a fixed wait could either hand off to STARTUP before
+    // PH_EC_ANALOG_SETTLE_TIME's analog charge-up window has even finished
+    // (leaving pH/EC published as NaN into STARTUP), or needlessly hold the
+    // system in this state after readings are already good. In mock mode
+    // there is no analog settle to wait out, so mock sensors are treated as
+    // immediately ready. SENSOR_STABILIZATION_TIME remains as a hard cap so
+    // a genuinely stuck/disconnected probe still reaches STARTUP - where
+    // SafetyManager's own validPH()/validEC() gates continue to hold dosing
+    // off - instead of hanging here indefinitely.
+    const bool sensorsReady =
+        systemState.mockSensorsEnabled ||
+        (sensorManager.isPhCurrentlyStable() && sensorManager.isEcCurrentlyStable());
+
+    if(sensorsReady ||
+       millis() - systemState.stateStartTime >= SENSOR_STABILIZATION_TIME)
     {
         validateSystem();
     }
@@ -2116,15 +2129,42 @@ bool AutomationManager::canStartNewPHCorrection() const
     // physical stability window in SensorManager::applyEffectiveSensors().
     // Requiring that physical window here made mock pH tests depend on stale
     // hardware state. Validity and all dosing safety checks still run at the
-    // call sites before an operation starts and throughout dosing.
-    return systemState.mockSensorsEnabled || sensorManager.isPhCurrentlyStable();
+    // call sites before an operation starts and throughout dosing. Mock also
+    // bypasses PH_DOSE_COOLDOWN below for the same reason - there is no real
+    // chemical mixing delay to wait out on a developer-supplied value.
+    if (systemState.mockSensorsEnabled) return true;
+
+    // A settled reading is not proof the dosed chemical has actually finished
+    // mixing into the reservoir - the probe can report a steady value before
+    // that's true. PH_DOSE_COOLDOWN is a real minimum wait since the last
+    // pH-Up/pH-Down pump run (either source - see the pump-off funnel in
+    // ActuatorManager::update() that sets lastPhDoseEndedAt), enforced on top
+    // of, not instead of, the stability window below. 0 is the "never dosed
+    // this boot" sentinel, not a real timestamp.
+    if (systemState.lastPhDoseEndedAt != 0 &&
+        millis() - systemState.lastPhDoseEndedAt < PH_DOSE_COOLDOWN)
+    {
+        return false;
+    }
+
+    return sensorManager.isPhCurrentlyStable();
 }
 
 bool AutomationManager::canStartNewECCorrection() const
 {
     // Same controlled-source rule as pH above. A finite, validated mock EC
     // payload is current by definition; physical EC retains the full window.
-    return systemState.mockSensorsEnabled || sensorManager.isEcCurrentlyStable();
+    if (systemState.mockSensorsEnabled) return true;
+
+    // Same reasoning as canStartNewPHCorrection() above, for the Grow/Bloom
+    // pumps and EC_DOSE_COOLDOWN.
+    if (systemState.lastEcDoseEndedAt != 0 &&
+        millis() - systemState.lastEcDoseEndedAt < EC_DOSE_COOLDOWN)
+    {
+        return false;
+    }
+
+    return sensorManager.isEcCurrentlyStable();
 }
 
 // See the header's own comment. Deliberately re-derives its answer from the
