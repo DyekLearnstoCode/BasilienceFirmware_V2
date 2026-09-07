@@ -19,6 +19,15 @@
 // checked with the legacy circuit-switched AT+CREG? instead - the response
 // shape (+CREG: <n>,<stat>) and status codes are the same as CEREG's, so the
 // parsing logic needed no change beyond the command/tag string itself.
+//
+// Hardened against the physically bench-validated SIM800L V2 unit (see the
+// GSM physical validation report): READY now periodically re-verifies
+// registration rather than trusting it forever (a lost registration used to
+// be invisible until a send silently hung), and an unsolicited "RDY" line -
+// SIM800L's own signature for "I just (re)booted" - is recognized from any
+// state so a genuine modem restart (e.g. a power blip) cleanly aborts any
+// in-flight send and re-enters initialization instead of leaving the state
+// machine wedged in a READY that no longer reflects reality.
 class GsmManager
 {
 public:
@@ -93,21 +102,12 @@ private:
 
     unsigned long stageStartedAt = 0;
 
-    // SIM800L's actual UART baud on this specific board isn't known in
-    // advance - unlike the previous module, there's no single confirmed
-    // fixed rate for it, and there is no way to ask it (AT+IPR) without
-    // already talking to it at its current rate. Rather than hardcode a
-    // guess, WAITING_FOR_MODULE cycles the UART through a short list of
-    // candidate bauds, giving each MODULE_PROBE_RETRY_INTERVAL_MS to answer
-    // "AT" with "OK" before moving to the next - same bounded, non-blocking
-    // retry shape this state already used for a single baud, just applied
-    // across a small list instead of one fixed value. 115200 (this
-    // firmware's existing default) is tried first so an already-correctly-
-    // configured module still responds on the very first attempt.
-    static constexpr unsigned long BAUD_CANDIDATES[] = {115200UL, 9600UL, 57600UL, 38400UL};
-    static constexpr uint8_t BAUD_CANDIDATE_COUNT =
-        sizeof(BAUD_CANDIDATES) / sizeof(BAUD_CANDIDATES[0]);
-    uint8_t baudCandidateIndex = 0;
+    // Timestamp of the last confirmed-registered CREG check (set both on
+    // the initial CHECKING_REGISTRATION -> READY transition and on every
+    // periodic re-check from READY). Compared against
+    // REGISTRATION_HEALTH_INTERVAL_MS to decide when READY is due for
+    // another look - see updateReady().
+    unsigned long lastRegistrationCheckAt = 0;
 
     // Every duration below is a bound on how long GsmManager will wait for a
     // given AT response before retrying or giving up - never an indefinite
@@ -115,20 +115,42 @@ private:
     static constexpr unsigned long MODULE_PROBE_RETRY_INTERVAL_MS = 3000UL;
     static constexpr unsigned long SIM_CHECK_RETRY_INTERVAL_MS = 3000UL;
     static constexpr unsigned long REGISTRATION_RETRY_INTERVAL_MS = 5000UL;
+    // Bounded health poll: how often READY re-issues AT+CREG? to catch a
+    // registration loss that happens after the initial connect (previously
+    // unmonitored - see the class-level comment). Conservative on purpose -
+    // this is a liveness check, not a diagnostic feed, and must not spam
+    // the modem or contend with an in-flight send.
+    static constexpr unsigned long REGISTRATION_HEALTH_INTERVAL_MS = 60000UL;
     static constexpr unsigned long TEXT_MODE_TIMEOUT_MS = 2000UL;
     static constexpr unsigned long PROMPT_TIMEOUT_MS = 3000UL;
-    static constexpr unsigned long SEND_RESULT_TIMEOUT_MS = 15000UL;
+    // Bench sends completed quickly, but real SMSC submission over the air
+    // can legitimately take longer than that under load - and because this
+    // is purely a state-machine bound (update() never blocks loop() while
+    // waiting it out), there is no cost to giving it generous room before
+    // declaring TIMEOUT.
+    static constexpr unsigned long SEND_RESULT_TIMEOUT_MS = 45000UL;
     static constexpr size_t RX_BUFFER_CAP = 512;
 
     void drainSerial();
     void sendCommand(const char* command);
     void beginSendStage(SendStage stage);
     void finishSend(SendResult result);
-    void beginSerialAtCurrentBaudCandidate();
+    void beginSerial();
+    void logSendError(const String& response) const;
+
+    // Detects an unsolicited "RDY" anywhere in rxBuffer - SIM800L's own
+    // signal that it just (re)booted - from any state other than
+    // WAITING_FOR_MODULE (where it's expected/harmless noise ahead of the
+    // next "AT" probe). Aborts any in-flight send and resets the state
+    // machine back to module initialization. Returns true if it acted, in
+    // which case update() must not also run this tick's normal state
+    // handler against now-stale state.
+    bool checkForModemRestart(unsigned long now);
 
     void updateWaitingForModule(unsigned long now);
     void updateCheckingSim(unsigned long now);
     void updateCheckingRegistration(unsigned long now);
+    void updateReady(unsigned long now);
     void updateSendingSms(unsigned long now);
 };
 

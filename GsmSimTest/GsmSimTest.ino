@@ -1,182 +1,413 @@
-// Standalone SIM800L test sketch - answers one question: is the SIM card
-// actually being read by the module. Not part of the main Basilience
-// firmware build (separate sketch folder, so it won't get pulled into
-// BasilienceFirmware.ino's compile) - flash this by itself onto the ESP32,
-// watch the Serial Monitor at 115200 baud, and read the printed results.
-//
-// Wiring (see GSM_RX_PIN/GSM_TX_PIN below - currently 16/17, swapped from
-// the main firmware's Config.h pins of 36/23 to rule out a pin-specific
-// fault after a first run showed the module healthy but every SIM command
-// erroring):
-//   ESP32 GPIO 16 (RX) <- SIM800L TXD
-//   ESP32 GPIO 17 (TX) -> SIM800L RXD
-//   Common ground between ESP32 and the SIM800L's own power supply.
-//   SIM800L needs its own 4V-ish, multi-amp-capable supply - the ESP32's
-//   3.3V/5V rail cannot drive it, especially not during the transmit current
-//   spikes. If the module won't even answer "AT", check power first.
-//
-// What "SIM is being read" actually means here, in order of what each
-// command proves:
-//   AT          - the module itself is alive and talking over UART.
-//   AT+CPIN?    - a SIM is physically inserted and not PIN-locked.
-//   AT+CCID     - reads the SIM's own ICCID (its serial number) straight off
-//                 the card. This is the clearest possible proof the SIM is
-//                 being read, not just detected as "present."
-//   AT+CIMI     - reads the SIM's IMSI (subscriber identity), a second,
-//                 independent read from the card itself.
-//   AT+CSQ      - signal quality, useful context but not SIM-specific.
-//   AT+CREG?    - network registration status, useful context but not
-//                 SIM-specific (a SIM can read fine and still fail to
-//                 register, e.g. no signal, wrong APN, expired load).
+#include <SoftwareSerial.h>
 
-#include <Arduino.h>
+// ============================================================
+// ESP8266 ↔ SIM800L
+// ------------------------------------------------------------
+// ESP8266 D2 / GPIO4 = RX <- SIM800L TX
+// ESP8266 D1 / GPIO5 = TX -> SIM800L RX
+// ============================================================
+SoftwareSerial sim800(D2, D1);
 
-// Swapped from the main firmware's GSM_RX_PIN=36/GSM_TX_PIN=23 to rule out a
-// pin-specific fault, now that a first run showed the module itself healthy
-// (clean AT/CSQ/CREG replies) but every SIM-specific command erroring. 16/17
-// are plain GPIOs (not input-only like 36, not strapping pins), and nothing
-// else is running in this standalone sketch to conflict with them.
-//   ESP32 GPIO 16 (RX) <- SIM800L TXD
-//   ESP32 GPIO 17 (TX) -> SIM800L RXD
-// Rewire accordingly before flashing this version.
-static const uint8_t GSM_RX_PIN = 16;
-static const uint8_t GSM_TX_PIN = 17;
+// ============================================================
+// SETTINGS
+// ============================================================
+const unsigned long STATUS_INTERVAL = 15000; // 15 seconds
 
-static const unsigned long BAUD_CANDIDATES[] = {115200UL, 9600UL, 57600UL, 38400UL};
-static const uint8_t BAUD_CANDIDATE_COUNT =
-    sizeof(BAUD_CANDIDATES) / sizeof(BAUD_CANDIDATES[0]);
+unsigned long lastStatusCheck = 0;
 
-HardwareSerial gsm(1);
+unsigned long testStart = 0;
 
-// Sends `command`, waits up to `timeoutMs` for any response, and returns the
-// raw bytes received. Blocking is fine here - this is a one-shot diagnostic
-// tool, not the always-on cultivation firmware, so there is nothing else
-// that needs to keep running underneath it.
-String sendATAndWait(const char* command, unsigned long timeoutMs)
-{
-    while (gsm.available()) gsm.read(); // drop any stale bytes first
+unsigned int rdyCount = 0;
+unsigned int callReadyCount = 0;
+unsigned int smsReadyCount = 0;
 
-    gsm.print(command);
-    gsm.print("\r\n");
+// ============================================================
+// PRINT ELAPSED TIME
+// ============================================================
+void printTime() {
+  unsigned long seconds = (millis() - testStart) / 1000;
 
-    String response;
-    unsigned long startedAt = millis();
-    while (millis() - startedAt < timeoutMs)
-    {
-        while (gsm.available())
-        {
-            response += (char)gsm.read();
-            startedAt = millis(); // keep waiting while bytes are still arriving
-        }
-    }
-    return response;
+  unsigned long minutes = seconds / 60;
+  seconds = seconds % 60;
+
+  Serial.print("[");
+  Serial.print(minutes);
+  Serial.print("m ");
+  Serial.print(seconds);
+  Serial.print("s] ");
 }
 
-void printResult(const char* label, const String& response)
-{
-    Serial.print("[");
-    Serial.print(label);
-    Serial.println("]");
-    if (response.length() == 0)
-    {
-        Serial.println("  (no response - module did not answer in time)");
-    }
-    else
-    {
-        Serial.println("  " + response);
-    }
+// ============================================================
+// WATCH FOR IMPORTANT UNSOLICITED MESSAGES
+// ============================================================
+void inspectResponse(const String &response) {
+
+  if (response.indexOf("RDY") >= 0) {
+    rdyCount++;
+
+    Serial.println();
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println("WARNING: MODEM RDY DETECTED");
+    Serial.println("Possible SIM800L restart");
+    Serial.print("RDY count: ");
+    Serial.println(rdyCount);
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  }
+
+  if (response.indexOf("Call Ready") >= 0) {
+    callReadyCount++;
+  }
+
+  if (response.indexOf("SMS Ready") >= 0) {
+    smsReadyCount++;
+  }
 }
 
-// Cycles through candidate bauds repeatedly - not just once - until the
-// module answers "AT" with "OK" or PROBE_BUDGET_MS runs out. A single pass
-// (roughly 2s x 4 bauds = 8s) is too impatient: SIM800L modules commonly
-// take several seconds after power-on before they'll answer anything, and
-// the production GsmManager this mirrors never gives up at all, it keeps
-// cycling indefinitely. Returns true and leaves `gsm` open at the working
-// baud if found.
-bool findModuleBaud()
-{
-    const unsigned long PROBE_BUDGET_MS = 60000UL; // total time before giving up
-    unsigned long startedAt = millis();
-    uint8_t pass = 1;
+// ============================================================
+// READ MODEM RESPONSE
+// ============================================================
+String readSIM(unsigned long timeout) {
 
-    while (millis() - startedAt < PROBE_BUDGET_MS)
-    {
-        Serial.print("--- Pass ");
-        Serial.print(pass++);
-        Serial.println(" ---");
+  String response = "";
 
-        for (uint8_t i = 0; i < BAUD_CANDIDATE_COUNT; i++)
-        {
-            unsigned long baud = BAUD_CANDIDATES[i];
-            Serial.print("Probing at ");
-            Serial.print(baud);
-            Serial.println(" baud...");
+  unsigned long start = millis();
 
-            gsm.begin(baud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
-            delay(200); // let the UART settle after (re)configuring it
+  while (millis() - start < timeout) {
 
-            // Two tries per baud, not one - the module can eat the very
-            // first byte it receives while still finishing its own boot.
-            for (uint8_t attempt = 0; attempt < 2; attempt++)
-            {
-                String response = sendATAndWait("AT", 2000);
-                if (response.indexOf("OK") >= 0)
-                {
-                    Serial.print("Module responding at ");
-                    Serial.print(baud);
-                    Serial.println(" baud.");
-                    return true;
-                }
-            }
-        }
+    while (sim800.available()) {
+
+      char c = sim800.read();
+
+      response += c;
+      Serial.write(c);
     }
-    return false;
+
+    yield();
+  }
+
+  inspectResponse(response);
+
+  return response;
 }
 
-void setup()
-{
-    Serial.begin(115200);
+// ============================================================
+// SEND AT COMMAND
+// ============================================================
+String sendAT(const char *command, unsigned long timeout = 2500) {
+
+  Serial.println();
+
+  printTime();
+
+  Serial.print(">>> ");
+  Serial.println(command);
+
+  sim800.println(command);
+
+  return readSIM(timeout);
+}
+
+// ============================================================
+// SYNCHRONIZE WITH SIM800L
+// ============================================================
+bool syncSIM800() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("SYNCING SIM800L");
+  Serial.println("================================");
+
+  for (int attempt = 1; attempt <= 15; attempt++) {
+
+    Serial.print("AT attempt ");
+    Serial.println(attempt);
+
+    sim800.println("AT");
+
+    String response = readSIM(2000);
+
+    if (response.indexOf("OK") >= 0) {
+
+      Serial.println();
+      Serial.println("SIM800L SYNCED");
+
+      return true;
+    }
+
     delay(1000);
-    Serial.println();
-    Serial.println("=== SIM800L SIM Read Test ===");
-    Serial.println();
+  }
 
-    if (!findModuleBaud())
-    {
-        Serial.println();
-        Serial.println("Module never answered \"AT\" on any candidate baud.");
-        Serial.println("Check: power to the SIM800L (needs its own supply, not the");
-        Serial.println("ESP32 rail), the RX/TX wiring (they cross: ESP32 RX to");
-        Serial.println("module TXD, ESP32 TX to module RXD), and a shared ground.");
-        return;
-    }
-
-    Serial.println();
-    printResult("AT+CPIN? (SIM present / unlocked)", sendATAndWait("AT+CPIN?", 3000));
-
-    Serial.println();
-    printResult("AT+CCID (SIM serial number, read from the card)", sendATAndWait("AT+CCID", 3000));
-
-    Serial.println();
-    printResult("AT+CIMI (subscriber identity, read from the card)", sendATAndWait("AT+CIMI", 3000));
-
-    Serial.println();
-    printResult("AT+CSQ (signal quality)", sendATAndWait("AT+CSQ", 3000));
-
-    Serial.println();
-    printResult("AT+CREG? (network registration)", sendATAndWait("AT+CREG?", 3000));
-
-    Serial.println();
-    Serial.println("=== Done ===");
-    Serial.println("If AT+CCID and AT+CIMI both returned real numbers (not");
-    Serial.println("\"ERROR\" or blank), the SIM is being read correctly.");
-    Serial.println("If AT+CPIN? did not say \"+CPIN: READY\", the SIM either");
-    Serial.println("isn't seated properly or is PIN-locked.");
+  return false;
 }
 
-void loop()
-{
-    // One-shot test - nothing to repeat. Re-run setup() by resetting the
-    // board if you want to test again (e.g. after reseating the SIM).
+// ============================================================
+// PRINT STATUS INTERPRETATION
+// ============================================================
+void explainCSQ(const String &response) {
+
+  int pos = response.indexOf("+CSQ:");
+
+  if (pos < 0) {
+    return;
+  }
+
+  int comma = response.indexOf(',', pos);
+
+  if (comma < 0) {
+    return;
+  }
+
+  String valueString =
+    response.substring(pos + 5, comma);
+
+  valueString.trim();
+
+  int rssi = valueString.toInt();
+
+  Serial.print("Signal interpretation: ");
+
+  if (rssi == 99) {
+    Serial.println("UNKNOWN");
+  }
+  else if (rssi <= 9) {
+    Serial.println("VERY WEAK");
+  }
+  else if (rssi <= 14) {
+    Serial.println("USABLE");
+  }
+  else if (rssi <= 19) {
+    Serial.println("GOOD");
+  }
+  else {
+    Serial.println("VERY GOOD");
+  }
+}
+
+// ============================================================
+// EXPLAIN NETWORK REGISTRATION
+// ============================================================
+void explainCREG(const String &response) {
+
+  int pos = response.indexOf("+CREG:");
+
+  if (pos < 0) {
+    return;
+  }
+
+  int comma = response.indexOf(',', pos);
+
+  if (comma < 0) {
+    return;
+  }
+
+  int end = response.indexOf('\r', comma);
+
+  if (end < 0) {
+    end = response.length();
+  }
+
+  String stateString =
+    response.substring(comma + 1, end);
+
+  stateString.trim();
+
+  int state = stateString.toInt();
+
+  Serial.print("Network interpretation: ");
+
+  switch (state) {
+
+    case 0:
+      Serial.println("NOT REGISTERED");
+      break;
+
+    case 1:
+      Serial.println("REGISTERED - HOME NETWORK");
+      break;
+
+    case 2:
+      Serial.println("SEARCHING FOR NETWORK");
+      break;
+
+    case 3:
+      Serial.println("REGISTRATION DENIED");
+      break;
+
+    case 4:
+      Serial.println("REGISTRATION UNKNOWN");
+      break;
+
+    case 5:
+      Serial.println("REGISTERED - ROAMING");
+      break;
+
+    default:
+      Serial.println("UNKNOWN STATE");
+      break;
+  }
+}
+
+// ============================================================
+// RUN ONE COMPLETE STATUS CHECK
+// ============================================================
+void runStatusCheck() {
+
+  Serial.println();
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("STATUS CHECK");
+  Serial.println("================================");
+
+  // ----------------------------------------------------------
+  // 1. INTERNAL VOLTAGE
+  // ----------------------------------------------------------
+  String cbc = sendAT("AT+CBC", 2500);
+
+  // ----------------------------------------------------------
+  // 2. SIGNAL
+  // ----------------------------------------------------------
+  String csq = sendAT("AT+CSQ", 2500);
+
+  explainCSQ(csq);
+
+  // ----------------------------------------------------------
+  // 3. NETWORK REGISTRATION
+  // ----------------------------------------------------------
+  String creg = sendAT("AT+CREG?", 2500);
+
+  explainCREG(creg);
+
+  // ----------------------------------------------------------
+  // COUNTERS
+  // ----------------------------------------------------------
+  Serial.println();
+  Serial.println("--- EVENT COUNTERS ---");
+
+  Serial.print("RDY: ");
+  Serial.println(rdyCount);
+
+  Serial.print("Call Ready: ");
+  Serial.println(callReadyCount);
+
+  Serial.print("SMS Ready: ");
+  Serial.println(smsReadyCount);
+
+  Serial.println("================================");
+}
+
+// ============================================================
+// PROCESS UNSOLICITED MODEM OUTPUT
+// ============================================================
+void processUnsolicitedOutput() {
+
+  if (!sim800.available()) {
+    return;
+  }
+
+  String unsolicited = "";
+
+  unsigned long start = millis();
+
+  while (millis() - start < 1000) {
+
+    while (sim800.available()) {
+
+      char c = sim800.read();
+
+      unsolicited += c;
+      Serial.write(c);
+    }
+
+    yield();
+  }
+
+  inspectResponse(unsolicited);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  sim800.begin(9600);
+
+  testStart = millis();
+
+  Serial.println();
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("SIM800L POWER / NETWORK LOGGER");
+  Serial.println("================================");
+
+  Serial.println();
+  Serial.println("Monitoring:");
+  Serial.println("- AT+CBC");
+  Serial.println("- AT+CSQ");
+  Serial.println("- AT+CREG?");
+  Serial.println("- RDY");
+  Serial.println("- Call Ready");
+  Serial.println("- SMS Ready");
+
+  Serial.println();
+  Serial.println("Waiting 5 seconds...");
+  delay(5000);
+
+  // ==========================================================
+  // 1. SYNC MODEM
+  // ==========================================================
+  if (!syncSIM800()) {
+
+    Serial.println();
+    Serial.println("ERROR: FAILED TO SYNC WITH SIM800L");
+
+    return;
+  }
+
+  // ==========================================================
+  // 2. BASIC INFORMATION
+  // ==========================================================
+  sendAT("ATI", 3000);
+
+  sendAT("AT+CFUN?", 3000);
+
+  sendAT("AT+CSMINS?", 3000);
+
+  sendAT("AT+CPIN?", 3000);
+
+  // ==========================================================
+  // 3. INITIAL STATUS
+  // ==========================================================
+  runStatusCheck();
+
+  lastStatusCheck = millis();
+
+  Serial.println();
+  Serial.println();
+  Serial.println("CONTINUOUS MONITOR STARTED");
+  Serial.println("Status check every 15 seconds.");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+
+  // ----------------------------------------------------------
+  // Always listen for unsolicited modem messages
+  // ----------------------------------------------------------
+  processUnsolicitedOutput();
+
+  // ----------------------------------------------------------
+  // Periodic CBC / CSQ / CREG test
+  // ----------------------------------------------------------
+  if (millis() - lastStatusCheck >= STATUS_INTERVAL) {
+
+    lastStatusCheck = millis();
+
+    runStatusCheck();
+  }
+
+  yield();
 }

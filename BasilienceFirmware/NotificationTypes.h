@@ -17,7 +17,8 @@ enum class NotificationEventType : uint8_t
     HIGH_AIR_TEMP,
     SENSOR_FAULT,
     DEVICE_UNREACHABLE,
-    HARVEST_DUE
+    HARVEST_DUE,
+    PROVISIONING_MODE
 };
 
 // Prefixed (SEV_*) because Arduino.h's esp32-hal-gpio.h #defines bare LOW/HIGH
@@ -111,6 +112,7 @@ inline const char* notificationEventTypeName(NotificationEventType type)
         case NotificationEventType::SENSOR_FAULT: return "SENSOR_FAULT";
         case NotificationEventType::DEVICE_UNREACHABLE: return "DEVICE_UNREACHABLE";
         case NotificationEventType::HARVEST_DUE: return "HARVEST_DUE";
+        case NotificationEventType::PROVISIONING_MODE: return "PROVISIONING_MODE";
     }
     return "EVENT";
 }

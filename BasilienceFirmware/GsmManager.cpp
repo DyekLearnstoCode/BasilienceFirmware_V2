@@ -12,28 +12,27 @@ void GsmManager::begin()
     rxBuffer = "";
     pendingNumber = "";
     pendingMessage = "";
-    baudCandidateIndex = 0;
+    lastRegistrationCheckAt = 0;
 
-    // First probe fires immediately; begin() only writes a few bytes to the
-    // UART and returns, so this does not block setup().
-    beginSerialAtCurrentBaudCandidate();
+    // begin() only opens the UART and writes a few bytes, so this does not
+    // block setup().
+    beginSerial();
     stageStartedAt = millis();
     sendCommand("AT");
 }
 
-// (Re)opens the GSM UART at BAUD_CANDIDATES[baudCandidateIndex]. HardwareSerial::
-// begin() on this core tears down and reconfigures the peripheral itself, so
-// calling it again with a different rate - which updateWaitingForModule() does
-// each time a candidate's window expires with no "OK" - is safe and does not
-// require an explicit end() first.
-void GsmManager::beginSerialAtCurrentBaudCandidate()
+// Opens the GSM UART at the bench-confirmed GSM_BAUD_RATE (Config.h). This
+// specific SIM800L V2 unit only ever answers at 9600 - see the GSM physical
+// validation report - so there is nothing to probe for; a single fixed rate
+// is both simpler and avoids repeatedly tearing down/reconfiguring the UART
+// peripheral the way multi-baud cycling used to.
+void GsmManager::beginSerial()
 {
-    const unsigned long baud = BAUD_CANDIDATES[baudCandidateIndex];
-    serial.begin(baud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    serial.begin(GSM_BAUD_RATE, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
     if (debugManager.shouldPrintDebug(DebugCategory::GSM))
     {
-        Serial.print("[GSM] Probing at ");
-        Serial.print(baud);
+        Serial.print("[GSM] UART open at ");
+        Serial.print(GSM_BAUD_RATE);
         Serial.println(" baud");
     }
 }
@@ -42,6 +41,11 @@ void GsmManager::update()
 {
     drainSerial();
     const unsigned long now = millis();
+
+    // A genuine modem restart invalidates whatever state/stage this tick
+    // would otherwise act on - handle it first and skip the normal handler
+    // this tick if it fired.
+    if (checkForModemRestart(now)) return;
 
     switch (state)
     {
@@ -55,12 +59,46 @@ void GsmManager::update()
             updateCheckingRegistration(now);
             break;
         case State::READY:
-            // Idle. sendSms() drives the next transition.
+            updateReady(now);
             break;
         case State::SENDING_SMS:
             updateSendingSms(now);
             break;
     }
+}
+
+// SIM800L emits an unsolicited "RDY" as the first line of its own boot
+// sequence (RDY / +CFUN: 1 / +CPIN: READY / Call Ready / SMS Ready) - a
+// reliable, distinct signature that it just powered on or reset, separate
+// from any AT command/response text this class ever matches on. Ignored
+// while already in WAITING_FOR_MODULE (that's exactly where a fresh boot
+// belongs, and a probe there is already in flight). Seen in any other
+// state, it means whatever this class currently believes about SIM/
+// registration/in-flight-send state is stale.
+bool GsmManager::checkForModemRestart(unsigned long now)
+{
+    if (state == State::WAITING_FOR_MODULE) return false;
+    if (rxBuffer.indexOf("RDY") < 0) return false;
+
+    Serial.println("[GSM] Unsolicited RDY - modem restarted, reinitializing");
+
+    if (state == State::SENDING_SMS)
+    {
+        // Report the same way "cellular unavailable" is reported elsewhere
+        // so NotificationManager defers the whole event rather than
+        // charging this recipient a bounded TIMEOUT/ERROR retry for a
+        // failure that had nothing to do with the recipient or message.
+        lastResult = SendResult::MODULE_NOT_READY;
+        sendStage = SendStage::NONE;
+        pendingNumber = "";
+        pendingMessage = "";
+    }
+
+    state = State::WAITING_FOR_MODULE;
+    rxBuffer = "";
+    stageStartedAt = now;
+    sendCommand("AT");
+    return true;
 }
 
 bool GsmManager::sendSms(const String& phoneNumber, const String& message)
@@ -161,27 +199,26 @@ void GsmManager::updateWaitingForModule(unsigned long now)
 {
     if (rxBuffer.indexOf("OK") >= 0)
     {
-        Serial.print("[GSM] Module responding at ");
-        Serial.print(BAUD_CANDIDATES[baudCandidateIndex]);
-        Serial.println(" baud");
+        Serial.println("[GSM] Module responding");
         rxBuffer = "";
         state = State::CHECKING_SIM;
         stageStartedAt = now;
+        // Fire-and-forget: enables numeric/verbose +CME ERROR reporting for
+        // diagnostics (see logSendError()). Not on the critical path - its
+        // own "OK" is simply overwritten by the CPIN query's rxBuffer reset
+        // immediately below, and CMS/CMGS behavior is unaffected either way.
+        serial.print("AT+CMEE=1\r\n");
         sendCommand("AT+CPIN?");
         return;
     }
 
     if (now - stageStartedAt >= MODULE_PROBE_RETRY_INTERVAL_MS)
     {
+        // No "OK" within this window - retry. Unbounded overall (never
+        // gives up, matching this state's existing "the module may just be
+        // slow to power up" policy), but each individual wait is bounded
+        // and update() never blocks while doing it.
         stageStartedAt = now;
-
-        // No "OK" within this candidate's window - move to the next baud
-        // and reopen the UART there before probing again. Wraps around
-        // indefinitely (same "never give up, just keep polling" policy this
-        // state already used for a single baud) so a module that's slow to
-        // power up is still found eventually, not just on this pass.
-        baudCandidateIndex = (baudCandidateIndex + 1) % BAUD_CANDIDATE_COUNT;
-        beginSerialAtCurrentBaudCandidate();
         sendCommand("AT");
     }
 }
@@ -231,6 +268,7 @@ void GsmManager::updateCheckingRegistration(unsigned long now)
                 rxBuffer = "";
                 state = State::READY;
                 stageStartedAt = now;
+                lastRegistrationCheckAt = now;
                 return;
             }
         }
@@ -241,6 +279,24 @@ void GsmManager::updateCheckingRegistration(unsigned long now)
         stageStartedAt = now;
         sendCommand("AT+CREG?");
     }
+}
+
+// Registration was previously never re-checked once READY was first
+// reached, so a loss of signal/registration after boot was invisible until
+// a send simply hung. This reuses updateCheckingRegistration() wholesale by
+// demoting back to CHECKING_REGISTRATION - the same bounded, non-blocking
+// retry loop that got here the first time also handles recovering here,
+// and sendSms() already rejects with NOT_REGISTERED while in that state,
+// so NotificationManager defers rather than fails any send that lands in
+// the brief recheck window.
+void GsmManager::updateReady(unsigned long now)
+{
+    if (now - lastRegistrationCheckAt < REGISTRATION_HEALTH_INTERVAL_MS) return;
+
+    state = State::CHECKING_REGISTRATION;
+    stageStartedAt = now;
+    rxBuffer = "";
+    sendCommand("AT+CREG?");
 }
 
 void GsmManager::beginSendStage(SendStage stage)
@@ -301,8 +357,10 @@ void GsmManager::updateSendingSms(unsigned long now)
                 finishSend(SendResult::SUCCESS);
                 return;
             }
-            if (rxBuffer.indexOf("+CMS ERROR") >= 0 || rxBuffer.indexOf("ERROR") >= 0)
+            if (rxBuffer.indexOf("+CMS ERROR") >= 0 || rxBuffer.indexOf("+CME ERROR") >= 0 ||
+                rxBuffer.indexOf("ERROR") >= 0)
             {
+                logSendError(rxBuffer);
                 finishSend(SendResult::ERROR);
                 return;
             }
@@ -338,6 +396,36 @@ void GsmManager::finishSend(SendResult result)
 
     pendingNumber = "";
     pendingMessage = "";
+}
+
+// Best-effort diagnostic only - never changes SendResult or control flow.
+// Extracts and logs the numeric code from "+CMS ERROR: <n>" or
+// "+CME ERROR: <n>" (present because AT+CMEE=1 was sent once at module
+// detection) so a real failure reason survives in the serial log instead of
+// a bare "ERROR". Contains no phone number, so nothing here needs masking.
+void GsmManager::logSendError(const String& response) const
+{
+    int tagIdx = response.indexOf("+CMS ERROR:");
+    size_t tagLen = 11; // strlen("+CMS ERROR:")
+    if (tagIdx < 0)
+    {
+        tagIdx = response.indexOf("+CME ERROR:");
+        tagLen = 11; // strlen("+CME ERROR:")
+    }
+
+    if (tagIdx < 0)
+    {
+        Serial.println("[GSM] SMS send ERROR");
+        return;
+    }
+
+    int end = response.indexOf('\r', tagIdx);
+    String code = (end >= 0) ? response.substring(tagIdx + tagLen, end)
+                              : response.substring(tagIdx + tagLen);
+    code.trim();
+
+    Serial.print("[GSM] SMS send failed: ");
+    Serial.println(code);
 }
 
 String GsmManager::maskPhoneNumber(const String& phoneNumber)

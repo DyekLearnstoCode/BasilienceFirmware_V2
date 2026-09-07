@@ -60,7 +60,13 @@
 
 constexpr uint8_t CANOPY_FAN_PIN = 17;
 constexpr uint8_t BLOWER_PIN = 27;
-constexpr uint32_t PWM_FREQUENCY_HZ = 5000;
+// Lowered from 5000 Hz for testing: an optocoupler-based MOSFET module (e.g.
+// PC817) has turn-on/turn-off delays of tens of microseconds. At 5000 Hz
+// (200us/cycle) those delays eat a large share of every pulse, so low
+// percentages barely switch on and slightly-higher ones never fully switch
+// off, collapsing most of the range to what looks like full speed. 200 Hz
+// gives a 5ms cycle, comfortably longer than the opto's switching delay.
+constexpr uint32_t PWM_FREQUENCY_HZ = 200;
 constexpr uint8_t PWM_RESOLUTION_BITS = 8;
 constexpr uint16_t PWM_MAX_DUTY = (1u << PWM_RESOLUTION_BITS) - 1;
 

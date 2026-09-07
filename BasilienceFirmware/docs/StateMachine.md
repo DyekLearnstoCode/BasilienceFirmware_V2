@@ -132,8 +132,8 @@ Adaptive speed control.
 
 | Condition | Speed |
 |------------|--------|
-| Cold | 30% |
-| Normal | 60% |
+| Cold | 50% |
+| Normal | 70% |
 | Hot | 100% |
 
 Temperature range:

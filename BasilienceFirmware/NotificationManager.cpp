@@ -26,6 +26,7 @@ void NotificationManager::update()
     observeAlertTransitions();
     observeConnectivity();
     observeHarvestSchedule();
+    observeProvisioningMode();
     updateSmsFanOut();
     reapSettledSlots();
 }
@@ -81,46 +82,48 @@ void NotificationManager::observeAlertTransitions()
         return;
     }
 
-    // Cloud-replay ownership: while online, /alerts already reaches Firestore
-    // directly via onAlertUpdated (immediate FCM + history) the instant
-    // writeAlerts() publishes the same transition - queuing these same four
-    // types for cloud replay too produced a second, differently-worded
-    // Firestore history document under a different eventId scheme with
-    // nothing to deduplicate the two (see the task report's duplicate-history
-    // audit). Cloud replay is therefore only needed as the offline fallback,
-    // matching the ownership DEVICE_UNREACHABLE/HARVEST_DUE already use below
-    // (backend owns online history for both cases - its own independent
-    // presence detection there, the direct /alerts watch here). SMS
-    // eligibility is untouched: a farmer's phone connectivity is independent
-    // of the device's, so the redundant delivery channel stays unconditional.
+    // SMS is a fallback channel, not a second copy of the app notification:
+    // while online, /alerts already reaches Firestore directly via
+    // onAlertUpdated (immediate FCM + popup + history) the instant
+    // writeAlerts() publishes the same transition, so neither an SMS nor a
+    // cloud-replay queue entry is needed for these four types - queuing for
+    // cloud replay too produced a second, differently-worded Firestore
+    // history document under a different eventId scheme with nothing to
+    // deduplicate the two (see the task report's duplicate-history audit),
+    // and sending an SMS on top of an FCM/popup the farmer already got
+    // would just be noise. Both are therefore gated on the SAME condition -
+    // this device currently having no cloud connectivity of its own - matching
+    // the ownership DEVICE_UNREACHABLE/HARVEST_DUE already use below (backend
+    // owns online delivery for both of those too, via its own independent
+    // presence detection / hourly cron).
     const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
 
-    if (alertState.lowWater && !lastObservedAlerts.lowWater &&
+    if (alertState.lowWater && !lastObservedAlerts.lowWater && !cloudUp &&
         alertNotificationAllowed(NotificationEventType::LOW_WATER))
     {
         enqueueEvent(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
                      "Low Reservoir", "Water level dropped below the refill threshold.",
-                     String(millis()), true, !cloudUp);
+                     String(millis()), true, true);
     }
-    if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange &&
+    if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange && !cloudUp &&
         alertNotificationAllowed(NotificationEventType::HIGH_WATER_TEMP))
     {
         enqueueEvent(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Water Temperature", "Water temperature exceeded the configured limit.",
-                     String(millis()), true, !cloudUp);
+                     String(millis()), true, true);
     }
-    if (alertState.highTemperature && !lastObservedAlerts.highTemperature &&
+    if (alertState.highTemperature && !lastObservedAlerts.highTemperature && !cloudUp &&
         alertNotificationAllowed(NotificationEventType::HIGH_AIR_TEMP))
     {
         enqueueEvent(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
                      "High Air Temperature", "Air temperature exceeded the configured limit.",
-                     String(millis()), true, !cloudUp);
+                     String(millis()), true, true);
     }
-    if (alertState.sensorFault && !lastObservedAlerts.sensorFault)
+    if (alertState.sensorFault && !lastObservedAlerts.sensorFault && !cloudUp)
     {
         enqueueEvent(NotificationEventType::SENSOR_FAULT, NotificationSeverity::SEV_CRITICAL,
                      "Sensor Fault", "One or more sensors are reporting invalid readings.",
-                     String(millis()), true, !cloudUp);
+                     String(millis()), true, true);
     }
 
     lastObservedAlerts = alertState;
@@ -173,8 +176,18 @@ void NotificationManager::observeConnectivity()
             cloudWasDown = true;
         }
         else if (!deviceUnreachableEpisodeActive &&
-                 millis() - cloudDownSinceMillis >= OFFLINE_EPISODE_THRESHOLD_MS)
+                 millis() - cloudDownSinceMillis >= OFFLINE_EPISODE_THRESHOLD_MS &&
+                 !wifiManager.isProvisioningMode())
         {
+            // WiFiManager falls back to its own setup AP after just 20s of
+            // failed reconnection (RECOVERY_TIMEOUT) - well before this 2-
+            // minute threshold - so by the time this would fire, a FALLBACK
+            // episode below has essentially always already sent the more
+            // specific/actionable PROVISIONING_MODE SMS. Suppressing this
+            // one here avoids texting the farmer twice for the same root
+            // cause. A device that's connected to WiFi but only Firebase
+            // itself is unreachable (isProvisioningMode() false) still gets
+            // this alert normally.
             deviceUnreachableEpisodeActive = true;
             // SMS-only (queuedForCloud=false): backend already owns Device
             // Unreachable/Back Online history via its own independent RTDB
@@ -196,6 +209,41 @@ void NotificationManager::observeConnectivity()
     }
 }
 
+// FALLBACK provisioning means WiFiManager itself gave up reconnecting with
+// its saved credentials and fell back to broadcasting its own setup AP -
+// the farmer has no way to know this happened without physically checking
+// the device, and every other notification path (FCM, popup, even
+// DEVICE_UNREACHABLE above) needs the cloud connection this device no
+// longer has. SMS is the only channel that can possibly reach them.
+// Deliberately NOT fired for MANUAL provisioning: that's a farmer-initiated
+// action (e.g. from the app), so they already know WiFi is being changed.
+//
+// One real limitation worth knowing: this only helps a device that
+// previously connected and has recipients already cached in
+// SmsRecipientCache. A brand-new, never-configured device has no assigned
+// recipients yet the very first time it enters provisioning, so there is
+// no one to text - enqueueEvent() below still runs but the SMS fan-out
+// simply finds zero recipients and settles the slot as FAILED.
+void NotificationManager::observeProvisioningMode()
+{
+    const bool inFallback = wifiManager.isProvisioningMode() &&
+        wifiManager.getProvisioningMode() == WiFiManager::ProvisioningMode::FALLBACK;
+
+    if (!inFallback)
+    {
+        provisioningNotified = false; // arm for the next FALLBACK episode
+        return;
+    }
+
+    if (provisioningNotified) return; // already notified for this episode
+    provisioningNotified = true;
+
+    enqueueEvent(NotificationEventType::PROVISIONING_MODE, NotificationSeverity::SEV_HIGH,
+                 "WiFi Setup Needed",
+                 "Lost WiFi and is broadcasting its own setup network. Connect to it to reconfigure WiFi.",
+                 String(millis()), true, false);
+}
+
 void NotificationManager::observeHarvestSchedule()
 {
     if (!harvestScheduleCache.isActive()) return;
@@ -206,6 +254,15 @@ void NotificationManager::observeHarvestSchedule()
 
     uint32_t nowEpoch = rtcManager.getEpochTime();
     if (nowEpoch < nextHarvestAt) return; // not due yet
+
+    // SMS is only this device's offline fallback here too - while online,
+    // the backend's own hourly evaluateHarvestReminders cron already scans
+    // Firestore directly and reaches the app/FCM independent of this
+    // device, so there is nothing for this queue to do. Deliberately does
+    // NOT touch lastFiredHarvestEventId in that case, so if a later offline
+    // period starts while this same occurrence is still overdue, it still
+    // gets exactly one fallback SMS instead of being skipped forever.
+    if (systemState.wifiConnected && systemState.firebaseConnected) return;
 
     String cycleId = harvestScheduleCache.getCycleId();
     char identity[48];
@@ -222,12 +279,12 @@ void NotificationManager::observeHarvestSchedule()
     snprintf(message, sizeof(message), "Harvest for Cycle #%d is due today.",
              harvestScheduleCache.getCycleNumber());
 
-    // SMS-only (queuedForCloud=false): backend already owns Harvest Due
-    // history via its own independent hourly evaluateHarvestReminders cron,
-    // which scans Firestore's nextHarvestDate directly and needs no
-    // firmware action - it fires whether or not this device is online.
-    // Replaying this to Firestore too would risk a second, differently-
-    // worded history entry for the same scheduled harvest.
+    // Reached only while offline (see the guard above). SMS-only
+    // (queuedForCloud=false): backend already owns Harvest Due history via
+    // its own independent hourly evaluateHarvestReminders cron, which scans
+    // Firestore's nextHarvestDate directly - replaying this to Firestore
+    // too would risk a second, differently-worded history entry for the
+    // same scheduled harvest.
     enqueueEvent(NotificationEventType::HARVEST_DUE, NotificationSeverity::SEV_MEDIUM,
                  "Harvest Due", message, String(identity), true, false);
 

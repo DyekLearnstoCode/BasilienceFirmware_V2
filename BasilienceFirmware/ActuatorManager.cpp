@@ -278,13 +278,7 @@ void ActuatorManager::turnOff(Actuator actuator)
             }
             else if (actuator == BLOWER && debugManager.shouldPrintActuator(actuator))
             {
-                // configured= still reflects the standing automatic setting
-                // (systemState.blowerSpeedPercent) - only the commanded/
-                // applied speed drops to 0% when the blower turns off, the
-                // configuration itself is untouched.
-                Serial.print("[BLOWER-PWM] configured=");
-                Serial.print(systemState.blowerSpeedPercent);
-                Serial.print("% commanded=0% duty=0/");
+                Serial.print("[BLOWER-PWM] requested=0% duty=0/");
                 Serial.println(maxDuty);
             }
         }
@@ -1108,9 +1102,13 @@ void ActuatorManager::update()
                                 }
                                 else if (a == BLOWER && debugManager.shouldPrintActuator(a))
                                 {
-                                    Serial.print("[BLOWER-PWM] configured=");
-                                    Serial.print(systemState.blowerSpeedPercent);
-                                    Serial.print("% commanded=");
+                                    // Blower now shares the same air-temp/humidity
+                                    // threshold speed as the Canopy Fan (see
+                                    // AutomationManager::handleCanopyClimate()) rather
+                                    // than a separately configured percentage, so this
+                                    // mirrors [CANOPY-PWM]'s own format - no more
+                                    // "configured=" value distinct from what's commanded.
+                                    Serial.print("[BLOWER-PWM] requested=");
                                     Serial.print(status.speed);
                                     Serial.print("% duty=");
                                     Serial.print(pwmValue);

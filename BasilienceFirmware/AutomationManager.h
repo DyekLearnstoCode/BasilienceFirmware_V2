@@ -142,11 +142,13 @@ private:
     // reading (handleCanopyClimate()) - see the automation resilience pass
     // report. Retained (not reset to 100%) whenever DHT becomes unavailable,
     // so canopy ownership does not abruptly jump; both handleCanopyClimate()
-    // and the idle handleCultivationPaused() fallback consume this. 50% is
+    // and the idle handleCultivationPaused() fallback consume this. 70% is
     // the deliberate boot-time default (no valid DHT reading has ever
-    // existed yet), matching BLOWER_SPEED_DEFAULT_PERCENT-style fallbacks
-    // elsewhere in this codebase - PWM COMMAND only, never measured RPM.
-    uint8_t lastAutomaticCanopySpeed = 50;
+    // existed yet) - PWM COMMAND only, never measured RPM. Matches the
+    // NORMAL-demand speed in handleCanopyClimate(), itself set to the
+    // middle of the 65-75% band real-hardware bench testing found both fans
+    // run cleanest in (CANOPY_BLOWER_PWM_FREQUENCY_HZ's own comment).
+    uint8_t lastAutomaticCanopySpeed = 70;
 
     // 0 = circulation not yet confirmed running for the current
     // STABILIZING_PH episode. Set once, in updateCooling(), the first tick

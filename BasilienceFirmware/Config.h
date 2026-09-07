@@ -16,13 +16,13 @@ constexpr unsigned long CHEMISTRY_FOGGING_HOLD_TIMEOUT_MS = 30000UL;
 // itself is a blocking OneWire transaction, so it must not run every loop
 // iteration - both to stop it from dominating loop() timing and to reduce
 // how often it can collide with other blocking work (e.g. Firebase calls).
-constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 1000UL;
+constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 5000UL;
 
 // Minimum spacing between HC-SR04 trigger pulses. Without this, readWaterLevel()
 // re-triggers on literally every loop iteration - far faster than the sensor's
 // own echo/reverberation settling time - which is a common cause of spurious
 // pulseIn() timeouts unrelated to the sensor or wiring actually failing.
-constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 300UL;
+constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 5000UL;
 
 // Minimum spacing between DHT22 samples. Confirmed marginal at the previous
 // 2000ms value (DHT22 intermittent-communication audit): 2000ms is exactly
@@ -35,7 +35,7 @@ constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 300UL;
 // than the sensor can actually answer - which is why humidity/air
 // temperature would intermittently blank out and reappear even though the
 // sensor itself never lost contact.
-constexpr unsigned long DHT_READ_INTERVAL_MS = 2500UL;
+constexpr unsigned long DHT_READ_INTERVAL_MS = 5000UL;
 
 // DHT22 physical measurement range (datasheet: -40..80C, 0..100% RH) - pure
 // SENSOR VALIDITY, never an agronomic/automation threshold (28C or 10C are
@@ -243,11 +243,13 @@ constexpr uint8_t RTC_SCL_PIN = 22;
 constexpr uint8_t GSM_RX_PIN = 36;  // ESP32 RX <- SIM800L TXD
 constexpr uint8_t GSM_TX_PIN = 23;  // ESP32 TX -> SIM800L RXD
 
-// No single fixed baud here: unlike the previous module, SIM800L's actual
-// UART rate on a given board isn't known in advance (varies by unit/firmware
-// and isn't queryable without already talking to it at that rate), so
-// GsmManager::WAITING_FOR_MODULE probes a short list of candidate bauds
-// (GsmManager.h: BAUD_CANDIDATES) instead of assuming one. See GsmManager.h.
+// Bench-confirmed baud for the physically wired SIM800L V2 (blue board,
+// SIM800 R13.08 firmware) on Smart/SMART Gold (PH) - see the GSM physical
+// validation report. An earlier revision of this firmware probed a list of
+// candidate bauds because the previously-installed LTE module's rate wasn't
+// knowable in advance; this specific module only ever answers at 9600, so
+// GsmManager now opens the UART here directly instead of cycling candidates.
+constexpr unsigned long GSM_BAUD_RATE = 9600UL;
 
 // ======================================================
 // Sensor Thresholds
@@ -396,7 +398,7 @@ constexpr float LOW_WATER_LEVEL = 20.0f;
 // them from systemState.maxWaterTemp, and as the NVS-restore default. Not
 // the authoritative cooling threshold; see WATER_COOLING_HYSTERESIS.
 constexpr float HIGH_WATER_TEMP = 25.0f;
-constexpr float COOLER_OFF_TEMP = 22.5f;
+constexpr float COOLER_OFF_TEMP = 23.0f;
 
 // Effective cooling hysteresis: the app-configured maxWaterTemp is now the
 // single authoritative cooling-ON ceiling (updateCooling() applies
@@ -433,7 +435,7 @@ constexpr float TARGET_MAX_WATER_TEMP = 25.0f;
 constexpr float TARGET_MIN_WATER_LEVEL = 20.0f;
 constexpr float TARGET_MAX_WATER_LEVEL = 75.0f;
 
-constexpr float HIGH_AIR_TEMP = 28.0f;
+constexpr float HIGH_AIR_TEMP = 32.0f;
 constexpr float AIR_TEMP_RELEASE = 26.0f;
 constexpr float HIGH_HUMIDITY = 75.0f;
 constexpr float HUMIDITY_RELEASE = 70.0f;
@@ -443,7 +445,7 @@ constexpr float HUMIDITY_RELEASE = 70.0f;
 // and releases only once temperature has recovered to COLD_AIR_RELEASE (2C
 // above the trigger, matching HIGH_AIR_TEMP/AIR_TEMP_RELEASE's own 2C gap),
 // not merely back at LOW_AIR_TEMP - the same latch-with-hysteresis shape,
-// to avoid rapid 30%/50% toggling right at the boundary. Deliberately its
+// to avoid rapid 50%/70% toggling right at the boundary. Deliberately its
 // own control pair rather than the app-editable minAirTemp/maxAirTemp
 // target-range fields, for the same reason HOT uses HIGH_AIR_TEMP/
 // AIR_TEMP_RELEASE instead of maxAirTemp: control thresholds ("when does
@@ -452,7 +454,7 @@ constexpr float HUMIDITY_RELEASE = 70.0f;
 constexpr float LOW_AIR_TEMP = 20.0f;
 constexpr float COLD_AIR_RELEASE = 22.0f;
 
-constexpr float HOT_FOG_TEMPERATURE = 28.0f;
+constexpr float HOT_FOG_TEMPERATURE = 32.0f;
 constexpr float COLD_FOG_TEMPERATURE = 20.0f;
 
 // ======================================================
@@ -517,7 +519,7 @@ constexpr unsigned long SENSOR_READY_MAX_MS = 3000UL;
 constexpr unsigned long PH_EC_ANALOG_SETTLE_TIME = 20000UL;
 
 constexpr unsigned long STARTUP_ON_TIME =
-    120UL * 1000UL; // 2 minutes
+    90UL * 1000UL; // 1 minute 30 seconds
 
 constexpr unsigned long STARTUP_OFF_TIME =
     60UL * 1000UL; // 1 minute
@@ -566,11 +568,35 @@ constexpr uint8_t BLOWER_SPEED_MAX_PERCENT = 100;
 // converted to a duty value. Named here (rather than the previous inline
 // 5000/8 literals) so the max-duty calculation shared by percentToDuty()
 // and its own diagnostic logging has one source of truth.
-constexpr uint32_t CANOPY_BLOWER_PWM_FREQUENCY_HZ = 5000;
+//
+// Frequency lowered from 5000 Hz to 200 Hz after real-hardware bench testing
+// (FanPwmSpeedTest.ino) on the actual driver board, an opto-isolated 4-channel
+// MOSFET module. At 5000 Hz (200us/cycle) the optocoupler's turn-on/turn-off
+// delay ate a large share of every pulse: low percentages barely switched on
+// and anything a bit higher never fully switched off, so nearly the whole
+// 0-100% range collapsed to full speed. At 200 Hz (5ms/cycle) the fans
+// respond proportionally across the range - confirmed usable from 15%
+// (Blower) / 25% (Canopy Fan) up to 100%, with 65-75% the cleanest-running
+// band for both.
+constexpr uint32_t CANOPY_BLOWER_PWM_FREQUENCY_HZ = 200;
 constexpr uint8_t CANOPY_BLOWER_PWM_RESOLUTION_BITS = 8;
 
-constexpr unsigned long PH_STABILIZATION_TIME = 10000UL;
-constexpr unsigned long EC_STABILIZATION_TIME = 10000UL;
+// Initial circulation-only period after a dose, before the first stability
+// check is even attempted - lets the newly-dosed chemical actually mix
+// through the reservoir before a reading means anything. 1 minute per the
+// design spec.
+constexpr unsigned long PH_STABILIZATION_TIME = 60000UL;
+constexpr unsigned long EC_STABILIZATION_TIME = 60000UL;
+
+// After the initial circulation period, stability is evaluated in
+// alternating 30s circulate-only / 30s check windows (see
+// AutomationManager::handleStabilizingPH()/handleStabilizingEC()) rather
+// than polling every tick - circulation keeps running continuously across
+// both halves, this only gates when a check is allowed to accept the
+// reading. A check that finds the value already stable (isPhCurrentlyStable()/
+// isEcCurrentlyStable(), PH_STABILITY_TOLERANCE/EC_STABILITY_TOLERANCE)
+// accepts immediately rather than waiting out the full 30s.
+constexpr unsigned long PH_EC_RECHECK_INTERVAL_MS = 30000UL;
 
 constexpr unsigned long PH_DOSING_TIME = 5000UL;
 constexpr unsigned long EC_DOSING_TIME = 5000UL;

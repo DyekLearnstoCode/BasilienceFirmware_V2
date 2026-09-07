@@ -86,6 +86,12 @@ private:
 
     char lastFiredHarvestEventId[64] = {0};
 
+    // True once the running FALLBACK provisioning episode has already been
+    // notified about - reset back to false the moment provisioning mode
+    // ends, so the NEXT episode (a later, separate WiFi loss) notifies
+    // again instead of staying permanently silent after the first time.
+    bool provisioningNotified = false;
+
     bool smsFanOutActive = false;
     FanOutStep fanOutStep = FanOutStep::IDLE;
     uint8_t smsFanOutEventIndex = 0;
@@ -100,6 +106,7 @@ private:
     void observeAlertTransitions();
     void observeConnectivity();
     void observeHarvestSchedule();
+    void observeProvisioningMode();
 
     void enqueueEvent(NotificationEventType type, NotificationSeverity severity,
                        const char* title, const char* message,

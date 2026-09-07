@@ -563,7 +563,7 @@ void AutomationManager::handleCultivationPaused()
     // rather than forcing 100% while DHT is unavailable/stale.
     actuatorManager.requestCommand(
         CANOPY_FAN, true, "automatic", millis(),
-        sensors.dhtAvailable ? 50 : lastAutomaticCanopySpeed);
+        sensors.dhtAvailable ? 70 : lastAutomaticCanopySpeed);
 }
 
 void AutomationManager::setManualCoolingDemand(bool active)
@@ -1150,12 +1150,14 @@ void AutomationManager::handleStartup()
         {
             actuatorManager.requestCommand(FOGGER, true, "automatic", millis(), 100, "startup");
 
-            // Startup uses the same experimentally configured fog-
-            // distribution airflow as normal automatic fogging (real-
-            // hardware Canopy/Blower PWM follow-up) - previously a separate
-            // hardcoded 100%, now the one shared systemState.blowerSpeedPercent
-            // value used by processFogCycle()'s ON phase too.
-            actuatorManager.requestCommand(BLOWER, true, "automatic", millis(), systemState.blowerSpeedPercent, "startup");
+            // Startup runs the Blower at a fixed 100%, not the
+            // lastAutomaticCanopySpeed climate tiering NORMAL mode uses -
+            // startup is a one-time initial fog/airflow push, so it
+            // intentionally always runs at full speed regardless of the
+            // current air-temp/humidity demand. NORMAL mode (70/100/50%
+            // hysteresis - see handleCanopyClimate()) only takes over once
+            // startup finishes.
+            actuatorManager.requestCommand(BLOWER, true, "automatic", millis(), 100, "startup");
 
             if (startupProgressDue)
             {
@@ -2416,13 +2418,14 @@ void AutomationManager::processFogCycle()
         actuatorManager.requestCommand(
             FOGGER, true, "automatic", millis(), 100, activeFogStrategy);
 
-        // Configurable automatic Blower speed (real-hardware Canopy/Blower
-        // PWM follow-up) - replaces the previous hard-coded 100%. Only this
-        // ON case (the fogger/blower pair actively running) uses the
-        // configured value; the OFF/purge branch below is a separate,
-        // deliberately-untouched mechanism, not "the pair running".
+        // Blower speed follows the same air-temp/humidity threshold rule as
+        // the Canopy Fan (lastAutomaticCanopySpeed - see
+        // handleCanopyClimate()'s 70/100/50% hysteresis), not a fixed
+        // configured percentage. Only this ON case (the fogger/blower pair
+        // actively running) uses it; the OFF/purge branch below is a
+        // separate, deliberately-untouched mechanism, not "the pair running".
         actuatorManager.requestCommand(
-            BLOWER, true, "automatic", millis(), systemState.blowerSpeedPercent, activeFogStrategy);
+            BLOWER, true, "automatic", millis(), lastAutomaticCanopySpeed, activeFogStrategy);
 
         if(elapsed >= fogOnTime)
         {
@@ -3222,6 +3225,20 @@ void AutomationManager::handleStabilizingPH()
        millis() - phStabilizationCirculationConfirmedAt >=
        PH_STABILIZATION_TIME)
     {
+        // Past the initial 1-minute circulation period: alternate 30s
+        // circulate-only / 30s check windows rather than polling every tick.
+        // Circulation itself never stops across either half - only whether a
+        // check is allowed to accept the reading this tick changes.
+        const unsigned long sinceInitial =
+            millis() - phStabilizationCirculationConfirmedAt - PH_STABILIZATION_TIME;
+        const bool inCheckWindow =
+            (sinceInitial % (2UL * PH_EC_RECHECK_INTERVAL_MS)) >= PH_EC_RECHECK_INTERVAL_MS;
+
+        if(!inCheckWindow)
+        {
+            return;
+        }
+
         // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
         // value sensors.ph is still (correctly) retaining for
         // Firebase/display - wait here until the live pH signal has
@@ -3229,7 +3246,8 @@ void AutomationManager::handleStabilizingPH()
         // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDosePH() path already
         // re-checked every tick above, so a probe that never restabilizes
         // still aborts via the existing safety model rather than waiting
-        // forever.
+        // forever. A miss here simply falls through to the next 30s
+        // circulate/check cycle rather than retrying immediately.
         if(!canStartNewPHCorrection())
         {
             return;
@@ -3412,6 +3430,19 @@ void AutomationManager::handleStabilizingEC()
     {
         alertManager.update();
 
+        // Past the initial 1-minute circulation period: alternate 30s
+        // circulate-only / 30s check windows - see handleStabilizingPH()'s
+        // matching comment.
+        const unsigned long sinceInitial =
+            millis() - ecStabilizationCirculationConfirmedAt - EC_STABILIZATION_TIME;
+        const bool inCheckWindow =
+            (sinceInitial % (2UL * PH_EC_RECHECK_INTERVAL_MS)) >= PH_EC_RECHECK_INTERVAL_MS;
+
+        if(!inCheckWindow)
+        {
+            return;
+        }
+
         // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
         // value sensors.ec is still (correctly) retaining for
         // Firebase/display - wait here until the live EC signal has
@@ -3419,7 +3450,9 @@ void AutomationManager::handleStabilizingEC()
         // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDoseEC()/
         // canDiluteEC() path already re-checked every tick above, so a probe
         // that never restabilizes still aborts via the existing safety
-        // model rather than waiting forever.
+        // model rather than waiting forever. A miss here simply falls
+        // through to the next 30s circulate/check cycle rather than
+        // retrying immediately.
         if(!canStartNewECCorrection())
         {
             return;
@@ -3712,7 +3745,11 @@ void AutomationManager::handleCanopyClimate()
     }
     else
     {
-        speed = 50;
+        // 70% is the NORMAL-demand speed, the middle of the 65-75% band
+        // real-hardware bench testing (FanPwmSpeedTest.ino, on the actual
+        // opto-isolated MOSFET module) found both fans run cleanest in - see
+        // CANOPY_BLOWER_PWM_FREQUENCY_HZ's own comment in Config.h.
+        speed = 70;
 
         if (!highAirDemandActive && temp > systemState.highAirTemp)
             highAirDemandActive = true;
@@ -3729,12 +3766,12 @@ void AutomationManager::handleCanopyClimate()
         else if (highHumidityDemandActive && humidity <= systemState.humidityRelease)
             highHumidityDemandActive = false;
 
-        // Hot/humid (100%) is more protective than cold (30%) and wins if
+        // Hot/humid (100%) is more protective than cold (50%) and wins if
         // both apply at once (e.g. cold air, high humidity) - see this
-        // change's own task note. Plain NORMAL (50%, the default above)
+        // change's own task note. Plain NORMAL (70%, the default above)
         // applies only when none of the three demands are active.
         if (highAirDemandActive || highHumidityDemandActive) speed = 100;
-        else if (lowAirDemandActive) speed = 30;
+        else if (lowAirDemandActive) speed = 50;
 
         canopyRule = (highAirDemandActive || highHumidityDemandActive) ? "HIGH TEMP/HUMIDITY" :
             lowAirDemandActive ? "LOW TEMP" : "NORMAL";
