@@ -301,7 +301,16 @@ constexpr unsigned long STABILITY_SAMPLE_INTERVAL_MS = 1000UL;
 // near-threshold noise amplitude, never as a stand-in for fixing a noisy
 // connection.
 constexpr float PH_STABILITY_TOLERANCE = 0.05f;
-constexpr float EC_STABILITY_TOLERANCE = 0.05f;
+
+// EC's anchor-point calibration (Calibration.h) maps the 1.2-2.0 mS/cm
+// cultivation range to only ~168-280mV at the probe - the same 0.05 mS/cm
+// tolerance used for pH would allow just ~7mV of jitter there, tighter than
+// the ~10mV of ADC movement already observed on this hardware's flatter pH
+// channel (see SensorManager's own real-hardware note). Widened to keep the
+// window able to close at real operating voltage; this is an estimate, not
+// a measured value - re-tune against the EC-CAL diagnostic's actual jitter
+// once the probe is dipped at cultivation-range EC.
+constexpr float EC_STABILITY_TOLERANCE = 0.1f;
 
 // ======================================================
 // pH Temporal Step Filter
@@ -380,15 +389,22 @@ constexpr unsigned long AUTO_TEST_BLOCK_LOG_INTERVAL_MS = 5000UL;
 // own comment.
 constexpr unsigned long PH_ADC_DIAGNOSTIC_INTERVAL_MS = 5000UL;
 
+// EC calibration redesign task: same reasoning and cadence as
+// PH_ADC_DIAGNOSTIC_INTERVAL_MS above, for readEC()'s new "[EC-CAL]" line
+// (calibrated mV, uncompensated/compensated EC, and which calibration model
+// - one-point or two-point - is currently active).
+constexpr unsigned long EC_ADC_DIAGNOSTIC_INTERVAL_MS = 5000UL;
+
 // If no NEW stable window is accepted within this long of the last one,
 // the held value is too old to keep trusting and sensors.ph/ec fall back to
 // NaN (SENSOR_FAULT via the existing validPH()/validEC() path - see
 // SafetyManager.cpp) rather than silently acting on a stale reading forever.
-// 3 minutes gives generous headroom above the worst-case legitimate churn
-// during active dosing (MAX_PH_ATTEMPTS/MAX_EC_ATTEMPTS=3 retries, each up to
-// ~15s dose + PH_STABILIZATION_TIME/EC_STABILIZATION_TIME=10s stabilize =~75s
-// total) while still catching a genuinely dead/disconnected probe well
-// before "stale" would otherwise mean "silently wrong for a very long time."
+// A separate concern from PH_EC_CORRECTION_STALL_TIMEOUT_MS below (that one
+// bounds an active correction's dosing/lock decision; this one is purely
+// "has the probe stopped reporting anything trustworthy at all") - 3 minutes
+// gives headroom above legitimate churn during active dosing while still
+// catching a genuinely dead/disconnected probe well before "stale" would
+// otherwise mean "silently wrong for a very long time."
 constexpr unsigned long PH_EC_STABLE_TIMEOUT_MS = 180000UL;
 
 constexpr float LOW_WATER_LEVEL = 20.0f;
@@ -397,17 +413,48 @@ constexpr float LOW_WATER_LEVEL = 20.0f;
 // used only before the first AutomationManager::updateCooling() tick derives
 // them from systemState.maxWaterTemp, and as the NVS-restore default. Not
 // the authoritative cooling threshold; see WATER_COOLING_HYSTERESIS.
-constexpr float HIGH_WATER_TEMP = 25.0f;
-constexpr float COOLER_OFF_TEMP = 23.0f;
+// Water-temperature limit update (18-25C -> 18-28C task): kept consistent
+// with TARGET_MAX_WATER_TEMP below and the existing 2.5C hysteresis, fixing
+// the prior 25.0/23.0 fallback pair's 0.5C drift from its own documented
+// 2.5C gap in the process.
+constexpr float HIGH_WATER_TEMP = 28.0f;
+constexpr float COOLER_OFF_TEMP = 25.5f;
 
 // Effective cooling hysteresis: the app-configured maxWaterTemp is now the
 // single authoritative cooling-ON ceiling (updateCooling() applies
 // waterTemp > maxWaterTemp), and this is subtracted from it for the
 // cooling-OFF release threshold (waterTemp < maxWaterTemp -
-// WATER_COOLING_HYSTERESIS) - preserving the original 25.0/22.5 = 2.5C gap
-// as a single named constant rather than two independently configurable
+// WATER_COOLING_HYSTERESIS) - preserving the 28.0/25.5 = 2.5C gap as a
+// single named constant rather than two independently configurable
 // thresholds.
 constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
+
+// ======================================================
+// Pulse cooling (FILL / COOL_SOAK / FLUSH) - TEMPORARY, UNCALIBRATED
+// ======================================================
+// !!! NOT VALIDATED ON HARDWARE YET !!!
+// These four values are conservative bench-test placeholders only, picked
+// to be safe (short soak, generous confirm timeout) rather than efficient.
+// None of them come from a bench measurement of this specific cooling loop's
+// fill time, trapped-water cooling rate, or flush/mixing time - see the
+// pulse-cooling task's own calibration procedure (log DS18B20 through a
+// manual FILL, a manual Peltier-only soak, and a manual FLUSH via
+// DevOptionsFragment's existing manual actuator controls) before treating
+// any of these as final. Kept as their own named constants specifically so
+// they are easy to find and change once that calibration is done.
+constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 60UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 120UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 60UL * 1000UL;
+// Independent hardware-timer deadline for automatic Peltier during
+// COOL_SOAK = intended soak duration + this margin, mirroring
+// AUTOMATIC_DOSE_DEADLINE_MARGIN_MS's exact same "backstop only fires if
+// loop() couldn't apply the on-time software stop" reasoning for pumps.
+constexpr unsigned long COOLING_PULSE_SOAK_DEADLINE_MARGIN_MS = 30UL * 1000UL;
+// Safety bound (not a tuning value): how long the pulse state machine waits
+// for a commanded circulation/Peltier transition to physically confirm
+// before treating it as a stall and locking the cooling subsystem via the
+// existing coolingSubsystemLocked/Reset-Safety mechanism.
+constexpr unsigned long COOLING_PULSE_CONFIRM_TIMEOUT_MS = 30UL * 1000UL;
 
 // ======================================================
 // Target (acceptable) ranges
@@ -427,7 +474,7 @@ constexpr float TARGET_MIN_HUMIDITY = 60.0f;
 constexpr float TARGET_MAX_HUMIDITY = 75.0f;
 
 constexpr float TARGET_MIN_WATER_TEMP = 18.0f;
-constexpr float TARGET_MAX_WATER_TEMP = 25.0f;
+constexpr float TARGET_MAX_WATER_TEMP = 28.0f;
 
 // Derived from the band the system already maintains the reservoir between
 // (refill starts at 20%, stops at 75%). Kept as its own setting so the refill
@@ -581,29 +628,69 @@ constexpr uint8_t BLOWER_SPEED_MAX_PERCENT = 100;
 constexpr uint32_t CANOPY_BLOWER_PWM_FREQUENCY_HZ = 200;
 constexpr uint8_t CANOPY_BLOWER_PWM_RESOLUTION_BITS = 8;
 
-// Initial circulation-only period after a dose, before the first stability
-// check is even attempted - lets the newly-dosed chemical actually mix
-// through the reservoir before a reading means anything. 1 minute per the
-// design spec.
-constexpr unsigned long PH_STABILIZATION_TIME = 60000UL;
-constexpr unsigned long EC_STABILIZATION_TIME = 60000UL;
+// Initial circulation-only period after a dose, before the first checkpoint
+// is even considered - lets the newly-dosed chemical actually mix through
+// the reservoir before a reading means anything. Retimed from 60000UL: 30s
+// post-dose circulation + a further 60s silent read, per the quiet-
+// monitoring/4-minute-budget redesign. phStabilizationCirculationConfirmedAt/
+// ecStabilizationCirculationConfirmedAt (AutomationManager) still measure
+// from confirmed circulation, not state entry - see their own comments.
+constexpr unsigned long PH_STABILIZATION_TIME = 90000UL;
+constexpr unsigned long EC_STABILIZATION_TIME = 90000UL;
 
-// After the initial circulation period, stability is evaluated in
-// alternating 30s circulate-only / 30s check windows (see
-// AutomationManager::handleStabilizingPH()/handleStabilizingEC()) rather
-// than polling every tick - circulation keeps running continuously across
-// both halves, this only gates when a check is allowed to accept the
-// reading. A check that finds the value already stable (isPhCurrentlyStable()/
-// isEcCurrentlyStable(), PH_STABILITY_TOLERANCE/EC_STABILITY_TOLERANCE)
-// accepts immediately rather than waiting out the full 30s.
+// Past the initial PH_STABILIZATION_TIME/EC_STABILIZATION_TIME window, this
+// is the trend re-sample interval AutomationManager::handleStabilizingPH()/
+// handleStabilizingEC() use to tell "still improving on its own," "stalled,"
+// and "reversing" apart, rather than blindly redosing on a timer. See the
+// quiet-monitoring/4-minute-budget redesign.
 constexpr unsigned long PH_EC_RECHECK_INTERVAL_MS = 30000UL;
 
 constexpr unsigned long PH_DOSING_TIME = 5000UL;
 constexpr unsigned long EC_DOSING_TIME = 5000UL;
 constexpr unsigned long EC_DILUTION_TIME = 5000UL;
 
-constexpr uint8_t MAX_PH_ATTEMPTS = 3;
-constexpr uint8_t MAX_EC_ATTEMPTS = 3;
+// Whole-correction time budget: replaces the old MAX_PH_ATTEMPTS/
+// MAX_EC_ATTEMPTS=3 retry-count limit as the trigger for locking a stalled
+// subsystem. Anchored to systemState.correctionCycleStartAt, set once when
+// a correction first begins and not reset by an internal redose - see
+// AutomationManager::handleStabilizingPH()/handleStabilizingEC(). If still
+// improving on its own when this expires, dosing simply stops (no more
+// redoses) but the subsystem is NOT locked - it keeps monitoring and lets
+// the existing phOutOfRange/ecLow/ecHigh alert path fire normally on any
+// further drift. Only a genuinely stalled reading locks at this deadline.
+constexpr unsigned long PH_EC_CORRECTION_STALL_TIMEOUT_MS = 240000UL; // 4 min
+
+// A reading must hold continuously stable this long, past the first
+// checkpoint, before it is trusted enough to publish to Firebase and to end
+// a correction on. Longer than SensorManager's own stability window
+// (STABILITY_SAMPLE_WINDOW * STABILITY_SAMPLE_INTERVAL_MS = 10s) - that
+// window says "not currently moving," this says "stayed that way."
+constexpr unsigned long PH_EC_STABLE_HOLD_FOR_PUBLISH_MS = 25000UL;
+
+// Minimum change between two trend samples (PH_EC_RECHECK_INTERVAL_MS apart)
+// to count as real movement rather than probe/ADC noise. Starting values -
+// expect to tune after watching real dosing, same as every other tolerance
+// in this file.
+constexpr float PH_TREND_NOISE_FLOOR = 0.03f;
+constexpr float EC_TREND_NOISE_FLOOR = 0.02f;
+
+// ======================================================
+// Independent Automatic-Dose/Refill Deadline (esp_timer, ActuatorManager)
+// ======================================================
+// Critical verification report, Priority 3/4: automatic PH_UP_PUMP/
+// PH_DOWN_PUMP/GROW_PUMP/BLOOM_PUMP dosing and automatic SOLENOID
+// refill/dilution runs are now armed with the SAME independent esp_timer
+// deadline mechanism that already protects manual commands (see
+// ActuatorManager::isAutomaticDeadlineProtected()/automaticDeadlineMs()),
+// so a stalled loop() (e.g. a blocking Firebase reconnect) can never leave
+// a dosing pump or the refill solenoid physically energized past this
+// margin beyond its own intended duration. Deliberately LONGER than every
+// intended automatic duration it applies to (PH_DOSING_TIME, EC_DOSING_TIME,
+// EC_DILUTION_TIME, AUTOMATIC_REFILL_RUN_TIME) so AutomationManager's own
+// on-time millis() check is always given the first opportunity to stop the
+// actuator normally under ordinary (non-stalled) operation - this deadline
+// only ever fires as the backstop for a loop that could not return in time.
+constexpr unsigned long AUTOMATIC_DOSE_DEADLINE_MARGIN_MS = 5000UL;
 // ======================================================
 
 constexpr int OUT_OF_RANGE_REQUIRED = 3;

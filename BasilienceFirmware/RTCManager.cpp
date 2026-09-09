@@ -1,5 +1,6 @@
 #include "RTCManager.h"
 #include <Wire.h>
+#include <time.h>
 #include "Config.h"
 #include "Globals.h"
 
@@ -125,7 +126,24 @@ void RTCManager::update()
     // reasoning in the RTC finalization report: invalid-on-boot recovery
     // only, no periodic drift-correction resync).
     if (!connected) return;
-    if (hasValidTime()) return;
+    if (hasValidTime())
+    {
+        // The clock became valid through some other path (e.g. a fresh
+        // rtc.adjust() elsewhere) while an attempt was in flight - abandon
+        // it rather than let a stale poll keep running for nothing.
+        ntpSyncInProgress = false;
+        return;
+    }
+
+    // An attempt already in flight is polled every tick regardless of
+    // Wi-Fi/backoff state below - configTime() was already issued once when
+    // it started, and abandoning the poll here would leave ntpSyncInProgress
+    // stuck true with nothing ever clearing it.
+    if (ntpSyncInProgress)
+    {
+        pollNetworkTimeSync();
+        return;
+    }
 
     // WiFiManager remains the sole owner of the radio connection - this
     // only reads its already-established state and never calls any
@@ -136,26 +154,55 @@ void RTCManager::update()
     if (lastNtpAttemptAt != 0 && now - lastNtpAttemptAt < NTP_RETRY_INTERVAL_MS) return;
 
     lastNtpAttemptAt = now;
-    attemptNetworkTimeSync();
+    startNetworkTimeSync();
 }
 
-void RTCManager::attemptNetworkTimeSync()
+// Critical verification report, Priority 2: kicks off SNTP and returns
+// immediately. configTime() itself only starts the SNTP client - it was
+// never the blocking call. Actual completion is polled non-blockingly by
+// pollNetworkTimeSync() below, once per update() tick, instead of the
+// previous single call to getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS),
+// which blocked the calling loop() iteration for up to NTP_SYNC_TIMEOUT_MS
+// by looping internally on time()/delay(10) (confirmed directly against the
+// installed ESP32 core's own esp32-hal-time.c implementation).
+void RTCManager::startNetworkTimeSync()
 {
     Serial.println("[RTC] Network time synchronization requested");
 
     // GMT offset only, no DST - see the header for why UTC+8/Asia-Manila is
-    // this firmware's chosen convention. configTime() starts the SNTP
-    // client; getLocalTime() below performs one bounded wait for it to
-    // actually lock onto a server rather than blocking indefinitely.
+    // this firmware's chosen convention.
     configTime(TIMEZONE_OFFSET_SECONDS, 0, "pool.ntp.org", "time.google.com");
 
+    ntpSyncInProgress = true;
+    ntpSyncStartedAt = millis();
+}
+
+// Polled once per update() tick while ntpSyncInProgress is true. Mirrors
+// getLocalTime()'s own success condition exactly (tm_year > 2016-1900, the
+// ESP32 core's own placeholder-vs-real-time check) so behavior is otherwise
+// unchanged - only WHEN the check happens (every tick, non-blocking) instead
+// of inside one blocking wait differs.
+void RTCManager::pollNetworkTimeSync()
+{
+    time_t rawNow;
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS))
+    time(&rawNow);
+    localtime_r(&rawNow, &timeinfo);
+
+    if (timeinfo.tm_year <= (2016 - 1900))
     {
-        Serial.println("[RTC] Network time synchronization failed: timeout");
+        // SNTP has not locked on yet this tick - keep waiting, bounded by
+        // NTP_SYNC_TIMEOUT_MS below, exactly like the previous blocking
+        // getLocalTime() call was bounded.
+        if (millis() - ntpSyncStartedAt >= NTP_SYNC_TIMEOUT_MS)
+        {
+            ntpSyncInProgress = false;
+            Serial.println("[RTC] Network time synchronization failed: timeout");
+        }
         return;
     }
 
+    ntpSyncInProgress = false;
     Serial.println("[RTC] Network time acquired");
 
     // Reject an obviously-wrong value rather than adjusting the DS3231 to
@@ -189,11 +236,11 @@ void RTCManager::attemptNetworkTimeSync()
     syncSource = SyncSource::NTP;
     Serial.println("[RTC] DS3231 adjusted successfully");
 
-    DateTime now = rtc.now();
+    DateTime nowDt = rtc.now();
     char localTime[20];
     snprintf(localTime, sizeof(localTime), "%04u-%02u-%02u %02u:%02u:%02u",
-              now.year(), now.month(), now.day(),
-              now.hour(), now.minute(), now.second());
+              nowDt.year(), nowDt.month(), nowDt.day(),
+              nowDt.hour(), nowDt.minute(), nowDt.second());
     Serial.print("[RTC] local=");
     Serial.println(localTime);
 }

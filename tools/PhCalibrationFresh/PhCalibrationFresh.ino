@@ -1,7 +1,12 @@
-// Standalone pH probe calibration/bench-test tool for the Basilience ESP32
-// hardware. Reproduces the exact acquisition path used in production
-// (SensorManager::readPH()): GPIO35, 12-bit ADC, ADC_11db attenuation,
-// median of 51 millivolt samples taken every 20ms.
+// Fresh pH probe calibration/bench-test tool for the Basilience ESP32
+// hardware. Self-contained - does not include Calibration.h and does not
+// read or apply the previous PH_SLOPE/PH_OFFSET in any way. Every mV value
+// printed is the raw sampled voltage; the fit computed by "c" is derived
+// only from points captured in this run.
+//
+// Reproduces the production acquisition path (SensorManager::readPH()):
+// GPIO35, 12-bit ADC, ADC_11db attenuation, median of 51 millivolt samples
+// taken every 20ms.
 //
 // Usage:
 //   1. Flash this sketch alone (not the full firmware) and open the Serial
@@ -72,7 +77,8 @@ int sampleMedianMv()
 void printMenu()
 {
     Serial.println();
-    Serial.println(F("=== Basilience pH Calibration Test ==="));
+    Serial.println(F("=== Basilience pH Fresh Calibration ==="));
+    Serial.println(F("No previous calibration is loaded or applied - all mV readings below are raw."));
     Serial.println(F("1 = capture point 1   2 = capture point 2   3 = capture point 3 (optional check)"));
     Serial.println(F("c = compute calibration from captured points"));
     Serial.println(F("r = reset captured points"));
@@ -115,7 +121,7 @@ void computeCalibration()
     float offset = point1.ph - slope * point1.mv;
 
     Serial.println();
-    Serial.println(F("=== New calibration ==="));
+    Serial.println(F("=== New calibration (from this run only) ==="));
     Serial.print(F("Point 1: "));
     Serial.print(point1.ph, 2);
     Serial.print(F(" pH -> "));
@@ -128,7 +134,7 @@ void computeCalibration()
     Serial.println(F(" mV"));
 
     Serial.println();
-    Serial.println(F("Paste into Calibration.h:"));
+    Serial.println(F("Paste into Calibration.h (replaces the existing PH_SLOPE/PH_OFFSET):"));
     Serial.print(F("constexpr float PH_SLOPE  = "));
     Serial.print(slope, 8);
     Serial.println(F("f;"));

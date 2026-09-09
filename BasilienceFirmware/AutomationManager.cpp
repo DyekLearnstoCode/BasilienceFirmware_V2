@@ -1067,12 +1067,48 @@ if(newMode == STARTUP)
         // See the member's own comment: unset until updateCooling() confirms
         // circulation is actually running for this fresh episode.
         phStabilizationCirculationConfirmedAt = 0;
+
+        // Quiet-monitoring/4-minute-budget redesign: each dose cycle within
+        // a correction gets its own checkpoint/trend bookkeeping, reset here
+        // (not per whole-correction) so a redose still gets a fresh 90s
+        // checkpoint pulse and a fresh trend baseline - only
+        // correctionCycleStartAt itself (Types.h) persists across redoses.
+        systemState.phFirstCheckpointPublished = false;
+        systemState.phStableSince = 0;
+        systemState.phStableCheckpointPublished = false;
+        systemState.phTrendReferenceValue = NAN;
+        systemState.phLastTrendCheckAt = 0;
+
+        // Off on entry - handleStabilizingPH() sets it true itself, fresh
+        // every tick, once past the initial settle window.
+        systemState.phWatchPhaseActive = false;
     }
 
     if(newMode == STABILIZING_EC)
     {
         // See ecStabilizationCirculationConfirmedAt's own comment.
         ecStabilizationCirculationConfirmedAt = 0;
+
+        // Mirrors STABILIZING_PH's own reset above.
+        systemState.ecFirstCheckpointPublished = false;
+        systemState.ecStableSince = 0;
+        systemState.ecStableCheckpointPublished = false;
+        systemState.ecTrendReferenceValue = NAN;
+        systemState.ecLastTrendCheckAt = 0;
+        systemState.ecWatchPhaseActive = false;
+    }
+
+    // A redose (STABILIZING_PH/EC -> DOSING_PH/EC) leaves the watch flag
+    // stale-true otherwise - the pump is about to run, fogging must not be
+    // allowed to think it is still in the safe watch phase.
+    if(newMode == DOSING_PH)
+    {
+        systemState.phWatchPhaseActive = false;
+    }
+
+    if(newMode == DOSING_EC)
+    {
+        systemState.ecWatchPhaseActive = false;
     }
 
     if(newMode == DOSING_PH || newMode == STABILIZING_PH ||
@@ -1389,14 +1425,15 @@ void AutomationManager::handleNormal()
 
     // Automatic re-arm for a terminal PH failure latch, mirroring the
     // refillSubsystemLocked re-arm above: phSubsystemLocked only ever
-    // reflects MAX_PH_ATTEMPTS exhaustion for the LAST out-of-range episode
-    // (set in failCurrentSubsystem()'s PH branch), not that pH is
-    // permanently unsafe. Once pH itself genuinely recovers inside
-    // [minPH, maxPH], the condition the lock was raised for is gone, so
-    // clear it here - event-driven off the real reading, never a timer -
-    // together with phAttempts, so a later, independent out-of-range
-    // episode (in either direction) gets its own full MAX_PH_ATTEMPTS run
-    // from Attempt 1. Deliberately NOT the mere fact that phDirection would
+    // reflects the PH_EC_CORRECTION_STALL_TIMEOUT_MS budget expiring on a
+    // genuinely stalled reading for the LAST out-of-range episode (set in
+    // failCurrentSubsystem()'s PH branch), not that pH is permanently
+    // unsafe. Once pH itself genuinely recovers inside [minPH, maxPH], the
+    // condition the lock was raised for is gone, so clear it here -
+    // event-driven off the real reading, never a timer - together with
+    // phAttempts, so a later, independent out-of-range episode (in either
+    // direction) gets its own fresh budget from correctionCycleStartAt = 0.
+    // Deliberately NOT the mere fact that phDirection would
     // flip - e.g. 4.50 failing then jumping straight to 7.00 is still out
     // of range on both bounds and must stay locked; only an actual reading
     // inside both minPH and maxPH counts. phDirection is left at PH_NONE
@@ -1446,14 +1483,16 @@ void AutomationManager::handleNormal()
 
     // Automatic re-arm for a terminal EC failure latch - same architecture
     // as the PH re-arm above (see its comment for the full reasoning).
-    // ecSubsystemLocked reflects either MAX_EC_ATTEMPTS exhaustion or a
-    // RESERVOIR_FULL dilution block (both set it in failCurrentSubsystem()'s
-    // EC branch / processECCorrection()'s dilution-blocked branch), neither
-    // of which means EC is permanently unsafe. Once EC itself genuinely
-    // recovers inside [minEC, maxEC], clear it here - event-driven off the
-    // real reading, never a timer - together with ecAttempts, so a later,
-    // independent out-of-range episode (either direction) gets its own full
-    // MAX_EC_ATTEMPTS run from Attempt 1. Deliberately NOT the mere fact
+    // ecSubsystemLocked reflects either the PH_EC_CORRECTION_STALL_TIMEOUT_MS
+    // budget expiring on a genuinely stalled reading, or a RESERVOIR_FULL
+    // dilution block (both set it in failCurrentSubsystem()'s EC branch /
+    // processECCorrection()'s dilution-blocked branch), neither of which
+    // means EC is permanently unsafe. Once EC itself genuinely recovers
+    // inside [minEC, maxEC], clear it here - event-driven off the real
+    // reading, never a timer - together with ecAttempts, so a later,
+    // independent out-of-range episode (either direction) gets its own
+    // fresh budget from correctionCycleStartAt = 0. Deliberately NOT the
+    // mere fact
     // that the bad side flipped - e.g. 0.80 failing then jumping straight to
     // 2.20 is still out of range on both bounds and must stay locked; only
     // an actual reading inside both minEC and maxEC counts.
@@ -1734,8 +1773,35 @@ void AutomationManager::updateCooling()
     const bool ecStabilizationActive =
         systemState.currentMode == STABILIZING_EC;
 
+    // Pulse-cooling task: advance the FILL/COOL_SOAK/FLUSH state machine
+    // before deciding what cooling wants from the shared circulation pump
+    // this tick. manualCoolingDemandActive is entirely unaffected by this -
+    // manual Peltier keeps using the pre-existing circulationConfirmed-gated
+    // path further below, untouched.
+    updateCoolingPulseStateMachine(automaticCoolingAllowed, coolingSafety, phStabilizationActive || ecStabilizationActive);
+
+    // FILL and FLUSH both want circulation ON for the pulse cycle; COOL_SOAK
+    // deliberately contributes nothing here so circulation can be off while
+    // Peltier soaks. That exception lives narrowly in
+    // ActuatorManager::validateCommand()'s PELTIER case, not in this mask -
+    // this mask only ever asks for circulation ON, never forces it off out
+    // from under pH/EC (see updateCoolingPulseStateMachine()'s own comment
+    // on why a demand-mask OR would otherwise fight pH/EC for the pump).
+    // FILL's own WAIT_CIRCULATION_OFF sub-phase is deliberately excluded:
+    // that sub-phase exists specifically to let circulation actually turn
+    // off before COOL_SOAK begins, so cooling must stop contributing to the
+    // mask right when it starts waiting for OFF, not just once it reaches
+    // COOL_SOAK - otherwise this would keep demanding circulation ON for the
+    // entire time FILL is trying to confirm it's OFF, and FILL could never
+    // progress (see updateCoolingPulseStateMachine()'s WAIT_CIRCULATION_OFF
+    // case, which relies on exactly this to let the pump actually stop).
+    const bool coolingWantsCirculation =
+        (systemState.coolingPulseState == CoolingPulseState::FILL &&
+         coolingPulsePhase != CoolingPulsePhase::WAIT_CIRCULATION_OFF) ||
+        systemState.coolingPulseState == CoolingPulseState::FLUSH;
+
     uint8_t demandMask = 0;
-    if (coolingDemandActive || manualCoolingDemandActive) demandMask |= DEMAND_PELTIER;
+    if (coolingWantsCirculation || manualCoolingDemandActive) demandMask |= DEMAND_PELTIER;
     if (phStabilizationActive) demandMask |= DEMAND_PH;
     if (ecStabilizationActive) demandMask |= DEMAND_EC;
 
@@ -1820,22 +1886,46 @@ void AutomationManager::updateCooling()
         lastCirculationState = circulationStatus.state;
     }
 
-    if ((coolingDemandActive || manualCoolingDemandActive) && circulationConfirmed)
+    // Manual demand keeps the exact pre-existing behavior (wait for
+    // circulationConfirmed, "automatic" re-assertion - see
+    // setManualCoolingDemand()'s own comment for why this is safe alongside
+    // an actual manual command's own ownership; unaffected by pulse cooling).
+    // Automatic cooling now goes entirely through the pulse state machine:
+    // COOL_SOAK is the only state that ever requests Peltier ON, and it does
+    // so unconditionally here - ActuatorManager::validateCommand()'s narrow,
+    // automatic-only COOL_SOAK exception is what actually permits it to run
+    // without circulation; this call site is intent, not the safety gate.
+    if (manualCoolingDemandActive)
     {
+        if (circulationConfirmed)
+        {
+            actuatorManager.requestCommand(
+                PELTIER, true, "automatic", millis());
+        }
+        else
+        {
+            actuatorManager.requestCommand(
+                PELTIER, false, "automatic", millis(), 100, "", "waiting_for_circulation");
+        }
+    }
+    else if (systemState.coolingPulseState == CoolingPulseState::COOL_SOAK &&
+             coolingPulsePhase == CoolingPulsePhase::NONE)
+    {
+        // coolingPulsePhase == NONE specifically means "actively soaking,
+        // not yet asked to stop" - see updateCoolingPulseStateMachine().
+        // Once that function moves to WAIT_PELTIER_OFF (soak elapsed, its
+        // deadline reconciled, or pH/EC pre-emption), this condition goes
+        // false on the very next tick and falls through to the OFF branch
+        // below - the state machine only ever tracks state, this is the one
+        // place that actually commands the actuator either way.
         actuatorManager.requestCommand(
-            PELTIER, true, "automatic", millis());
+            PELTIER, true, "automatic", millis(), 100, "cool_soak");
     }
     else
     {
         actuatorManager.requestCommand(
-            PELTIER,
-            false,
-            "automatic",
-            millis(),
-            100,
-            "",
-            (coolingDemandActive || manualCoolingDemandActive)
-                ? "waiting_for_circulation" : "");
+            PELTIER, false, "automatic", millis(), 100, "",
+            coolingDemandActive ? "pulse_cooling_cycling" : "");
     }
 
     const bool peltierRunning = actuatorManager.getStatus(PELTIER).running;
@@ -1843,7 +1933,14 @@ void AutomationManager::updateCooling()
     {
         if (peltierRunning)
         {
-            Serial.println("[TEMP] Circulation confirmed");
+            // Only genuinely true outside COOL_SOAK - during COOL_SOAK,
+            // Peltier is running specifically BECAUSE circulation is
+            // confirmed off (the whole point of the pulse), not because it
+            // was confirmed running.
+            if (systemState.coolingPulseState != CoolingPulseState::COOL_SOAK)
+            {
+                Serial.println("[TEMP] Circulation confirmed");
+            }
             Serial.println("[TEMP] Peltier RUNNING");
         }
         else
@@ -1851,6 +1948,304 @@ void AutomationManager::updateCooling()
             Serial.println("[TEMP] Peltier OFF");
         }
         lastPeltierRunning = peltierRunning;
+    }
+}
+
+// Pulse-cooling state machine: advances systemState.coolingPulseState and
+// the internal coolingPulsePhase only - it never calls
+// actuatorManager.requestCommand() itself. Every actual circulation/Peltier
+// command is still issued from updateCooling()'s own tail (the
+// coolingWantsCirculation demand-mask contribution and the
+// coolingPulseState/coolingPulsePhase check right after it), so there is
+// exactly one place in the codebase that commands either actuator for
+// cooling - this function only decides what that place should do next tick.
+//
+// Deliberately reuses existing mechanisms instead of inventing new ones:
+//   - coolingDemandActive/systemState.coolerOffTemp's existing hysteresis
+//     (computed just above in updateCooling(), unchanged) decides WHEN a
+//     cycle should be running at all and when FLUSH has released - not
+//     re-implemented here.
+//   - ActuatorStatus::forcedOffByDeadline is how a stalled loop()'s
+//     independent-timer Peltier stop is detected and reconciled, exactly
+//     like processPHCorrection()/handleDosingEC() already do for their own
+//     pumps (see their own "Independent deadline confirmed..." handling).
+//   - systemState.coolingSubsystemLocked is the existing lock RESET_SAFETY
+//     already clears and SafetyManager::canCool() already checks - genuinely
+//     new failure modes this state machine introduces (an invalid sensor or
+//     a confirm-timeout mid-cycle) engage that same lock rather than a
+//     second, parallel one.
+void AutomationManager::updateCoolingPulseStateMachine(bool automaticCoolingAllowed, SafetyResult coolingSafety, bool chemistryNeedsCirculation)
+{
+    const bool dbgCooling = debugManager.shouldPrintDebug(DebugCategory::COOLING);
+
+    const ActuatorStatus circulation = actuatorManager.getStatus(CIRCULATION_PUMP);
+    const bool circulationRunning =
+        circulation.running && circulation.state == ActuatorCommandState::RUNNING;
+    const bool circulationStopped =
+        !circulation.running && circulation.state == ActuatorCommandState::OFF;
+
+    const ActuatorStatus peltier = actuatorManager.getStatus(PELTIER);
+    const bool peltierStopped =
+        !peltier.running && peltier.state == ActuatorCommandState::OFF;
+
+    // Debounced the same way SafetyManager::validWaterTemperature() already
+    // is (SENSOR_TRANSIENT_FAILURE_THRESHOLD consecutive invalid ticks) -
+    // this check used to be a raw isfinite()/range test with no debounce,
+    // which could disagree with canCool() (computed just above from the
+    // debounced value) on the very same tick a transient reading occurred,
+    // hard-locking cooling off a single glitch the rest of the system
+    // tolerates.
+    const bool waterTempRawValid =
+        isfinite(sensors.waterTemp) && sensors.waterTemp >= 0.0f && sensors.waterTemp <= 100.0f;
+    if (waterTempRawValid)
+    {
+        coolingPulseWaterTempInvalidStreak = 0;
+    }
+    else if (coolingPulseWaterTempInvalidStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        coolingPulseWaterTempInvalidStreak++;
+    }
+    const bool waterTempValid = coolingPulseWaterTempInvalidStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD;
+
+    // Unconditional aborts - "do not silently continue the pulse cycle"
+    // (task requirement). None of these let the current state finish its
+    // own sequencing first.
+    if (!automaticCoolingAllowed || coolingSafety != SafetyResult::SAFE)
+    {
+        // Mirrors updateCooling()'s own automaticCoolingAllowed/coolingSafety
+        // gate above - already forces coolingDemandActive false there;
+        // canCool() already covers coolingSubsystemLocked/safetyLock/invalid
+        // water itself, so this is reacting to an existing signal, not a new
+        // one. Just make sure a mid-cycle FILL/COOL_SOAK/FLUSH doesn't keep
+        // running underneath whichever of those is now true.
+        if (systemState.coolingPulseState != CoolingPulseState::IDLE)
+        {
+            if (dbgCooling)
+            {
+                Serial.print("[COOL-PULSE] Aborting to IDLE: ");
+                Serial.println(!automaticCoolingAllowed
+                    ? "automatic cooling isolated by test mode"
+                    : safetyManager.getSafetyReason(coolingSafety));
+            }
+            systemState.coolingPulseState = CoolingPulseState::IDLE;
+            coolingPulsePhase = CoolingPulsePhase::NONE;
+        }
+        return;
+    }
+
+    if (!waterTempValid)
+    {
+        if (systemState.coolingPulseState != CoolingPulseState::IDLE)
+        {
+            if (dbgCooling)
+            {
+                Serial.println("[COOL-PULSE] Water-temperature reading invalid mid-cycle - locking cooling subsystem");
+            }
+            systemState.coolingSubsystemLocked = true;
+        }
+        systemState.coolingPulseState = CoolingPulseState::IDLE;
+        coolingPulsePhase = CoolingPulsePhase::NONE;
+        return;
+    }
+
+    // Confirm-wait stall guard, shared by every WAIT_* phase below - not a
+    // tuning value, see COOLING_PULSE_CONFIRM_TIMEOUT_MS's own comment in
+    // Config.h. TIMED_RUN/NONE (COOL_SOAK's own active-soak marker) are
+    // deliberately excluded: those already have their own, much longer,
+    // intentional duration checks below. WAIT_CIRCULATION_OFF is also
+    // excluded - unlike the other two WAIT_* phases, it has no hardware
+    // failure to detect here: it waits on the shared demand mask releasing
+    // circulation to chemistry (pH/EC stabilization), which routinely runs
+    // up to PH_STABILIZATION_TIME/EC_STABILIZATION_TIME (90s) - longer than
+    // this 30s guard - during completely normal dosing, not a fault. See
+    // its own case below.
+    const bool waitingOnConfirmation =
+        coolingPulsePhase == CoolingPulsePhase::WAIT_CIRCULATION_ON ||
+        coolingPulsePhase == CoolingPulsePhase::WAIT_PELTIER_OFF;
+    if (waitingOnConfirmation &&
+        millis() - coolingPulsePhaseStartedAt >= COOLING_PULSE_CONFIRM_TIMEOUT_MS)
+    {
+        if (dbgCooling)
+        {
+            Serial.print("[COOL-PULSE] Stalled waiting to confirm ");
+            Serial.print(coolingPulsePhase == CoolingPulsePhase::WAIT_PELTIER_OFF ? "Peltier OFF" :
+                         coolingPulsePhase == CoolingPulsePhase::WAIT_CIRCULATION_ON ? "circulation ON" :
+                         "circulation OFF");
+            Serial.println(" - locking cooling subsystem");
+        }
+        systemState.coolingSubsystemLocked = true;
+        systemState.coolingPulseState = CoolingPulseState::IDLE;
+        coolingPulsePhase = CoolingPulsePhase::NONE;
+        return;
+    }
+
+    switch (systemState.coolingPulseState)
+    {
+        case CoolingPulseState::IDLE:
+        {
+            coolingPulsePhase = CoolingPulsePhase::NONE;
+            if (coolingDemandActive)
+            {
+                systemState.coolingPulseState = CoolingPulseState::FILL;
+                coolingPulsePhase = CoolingPulsePhase::WAIT_CIRCULATION_ON;
+                coolingPulsePhaseStartedAt = millis();
+                if (dbgCooling) Serial.println("[COOL-PULSE] IDLE -> FILL");
+            }
+            break;
+        }
+
+        case CoolingPulseState::FILL:
+        {
+            // pH/EC wanting circulation during FILL is not a conflict - both
+            // want it ON - so no pre-emption check here, only in COOL_SOAK
+            // below where cooling wants it OFF.
+            switch (coolingPulsePhase)
+            {
+                case CoolingPulsePhase::WAIT_CIRCULATION_ON:
+                    if (circulationRunning)
+                    {
+                        coolingPulsePhase = CoolingPulsePhase::TIMED_RUN;
+                        coolingPulsePhaseStartedAt = millis();
+                        if (dbgCooling) Serial.println("[COOL-PULSE] FILL: circulation confirmed, timing fill");
+                    }
+                    break;
+
+                case CoolingPulsePhase::TIMED_RUN:
+                    if (millis() - coolingPulsePhaseStartedAt >= COOLING_PULSE_FILL_DURATION_MS_TEMP)
+                    {
+                        coolingPulsePhase = CoolingPulsePhase::WAIT_CIRCULATION_OFF;
+                        coolingPulsePhaseStartedAt = millis();
+                        if (dbgCooling) Serial.println("[COOL-PULSE] FILL complete, stopping circulation before soak");
+                    }
+                    break;
+
+                case CoolingPulsePhase::WAIT_CIRCULATION_OFF:
+                    // If pH/EC is (still) demanding circulation, the shared
+                    // mask keeps it running regardless of what cooling wants
+                    // here - this simply waits rather than fighting that
+                    // demand, which is the deterministic "cooling pauses"
+                    // priority the task calls for. Nothing extra to check:
+                    // circulation genuinely cannot confirm OFF while
+                    // chemistry holds it, so this phase just stalls until
+                    // chemistry releases it - deliberately NOT bounded by
+                    // the confirm-timeout above (see its exclusion comment),
+                    // since a 60s pH/EC stabilization window outlasting a
+                    // 30s guard is normal operation, not a stall.
+                    if (circulationStopped)
+                    {
+                        systemState.coolingPulseState = CoolingPulseState::COOL_SOAK;
+                        coolingPulsePhase = CoolingPulsePhase::NONE;
+                        coolingPulsePhaseStartedAt = millis();
+                        if (dbgCooling) Serial.println("[COOL-PULSE] FILL -> COOL_SOAK");
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+            break;
+        }
+
+        case CoolingPulseState::COOL_SOAK:
+        {
+            // Highest-priority exit: pH/EC needs the pump. "End/pause the
+            // cooling pulse" per the task - straight to IDLE (not FLUSH) so
+            // the demand mask can hand circulation to chemistry the instant
+            // Peltier confirms off; IDLE's own entry condition restarts FILL
+            // later if the reservoir is still above threshold.
+            if (chemistryNeedsCirculation)
+            {
+                if (coolingPulsePhase != CoolingPulsePhase::WAIT_PELTIER_OFF)
+                {
+                    coolingPulsePhase = CoolingPulsePhase::WAIT_PELTIER_OFF;
+                    coolingPulsePhaseStartedAt = millis();
+                    if (dbgCooling) Serial.println("[COOL-PULSE] COOL_SOAK pre-empted by pH/EC - stopping Peltier");
+                }
+                if (peltierStopped)
+                {
+                    systemState.coolingPulseState = CoolingPulseState::IDLE;
+                    coolingPulsePhase = CoolingPulsePhase::NONE;
+                    if (dbgCooling) Serial.println("[COOL-PULSE] COOL_SOAK -> IDLE (pH/EC priority; may resume later)");
+                }
+                break;
+            }
+
+            // Normal exit: soak finished, on time or via the independent
+            // deadline reconciling a stalled loop() - forcedOffByDeadline is
+            // the exact same reconciliation signal the pH/EC pump deadlines
+            // already use (ActuatorManager's deadline-expiry block sets it;
+            // AutomationManager::processPHCorrection()/handleDosingEC()
+            // already read it the same way).
+            if (coolingPulsePhase == CoolingPulsePhase::NONE)
+            {
+                const bool softTimerElapsed =
+                    millis() - coolingPulsePhaseStartedAt >= COOLING_PULSE_SOAK_DURATION_MS_TEMP;
+                const bool deadlineReconciled = peltier.forcedOffByDeadline;
+
+                if (softTimerElapsed || deadlineReconciled)
+                {
+                    if (dbgCooling)
+                    {
+                        Serial.println(deadlineReconciled
+                            ? "[COOL-PULSE] Independent deadline confirmed soak end (loop delayed); stopping Peltier"
+                            : "[COOL-PULSE] COOL_SOAK duration elapsed, stopping Peltier");
+                    }
+                    coolingPulsePhase = CoolingPulsePhase::WAIT_PELTIER_OFF;
+                    coolingPulsePhaseStartedAt = millis();
+                }
+            }
+            else if (coolingPulsePhase == CoolingPulsePhase::WAIT_PELTIER_OFF && peltierStopped)
+            {
+                systemState.coolingPulseState = CoolingPulseState::FLUSH;
+                coolingPulsePhase = CoolingPulsePhase::WAIT_CIRCULATION_ON;
+                coolingPulsePhaseStartedAt = millis();
+                if (dbgCooling) Serial.println("[COOL-PULSE] COOL_SOAK -> FLUSH");
+            }
+            break;
+        }
+
+        case CoolingPulseState::FLUSH:
+        {
+            switch (coolingPulsePhase)
+            {
+                case CoolingPulsePhase::WAIT_CIRCULATION_ON:
+                    if (circulationRunning)
+                    {
+                        coolingPulsePhase = CoolingPulsePhase::TIMED_RUN;
+                        coolingPulsePhaseStartedAt = millis();
+                        if (dbgCooling) Serial.println("[COOL-PULSE] FLUSH: circulation confirmed, timing flush");
+                    }
+                    break;
+
+                case CoolingPulsePhase::TIMED_RUN:
+                    if (millis() - coolingPulsePhaseStartedAt >= COOLING_PULSE_FLUSH_DURATION_MS_TEMP)
+                    {
+                        // Reuse the existing hysteresis flag (coolingDemandActive,
+                        // computed once above from sensors.waterTemp vs.
+                        // systemState.coolerOffTemp) rather than re-comparing
+                        // the reading ourselves - one definition of the
+                        // release threshold.
+                        if (!coolingDemandActive)
+                        {
+                            systemState.coolingPulseState = CoolingPulseState::IDLE;
+                            coolingPulsePhase = CoolingPulsePhase::NONE;
+                            if (dbgCooling) Serial.println("[COOL-PULSE] FLUSH complete, released <= threshold -> IDLE");
+                        }
+                        else
+                        {
+                            systemState.coolingPulseState = CoolingPulseState::FILL;
+                            coolingPulsePhase = CoolingPulsePhase::WAIT_CIRCULATION_ON;
+                            if (dbgCooling) Serial.println("[COOL-PULSE] FLUSH complete, still above threshold -> FILL (repeat)");
+                        }
+                        coolingPulsePhaseStartedAt = millis();
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+            break;
+        }
     }
 }
 
@@ -2006,6 +2401,26 @@ bool AutomationManager::processPHCorrection()
 
     systemState.phAttempts = 0;
 
+    // Quiet-monitoring/4-minute-budget redesign: only initialize a fresh
+    // episode when one is not already running. correctionCycleStartAt is
+    // shared with EC (see its own comment, Types.h) but currentMode can
+    // only ever be in a pH or an EC state at once, never both, so this is
+    // safe. A guard on == 0 (not on firstCorrectionCycle above, which an
+    // internal redose also leaves true-then-false across its own tighter
+    // scope) ensures an internal redose - handleStabilizingPH() calling
+    // changeState(DOSING_PH) directly, never back through this function -
+    // never resets the budget clock or the checkpoint bookkeeping.
+    if (systemState.correctionCycleStartAt == 0)
+    {
+        systemState.correctionCycleStartAt = millis();
+        systemState.phTrendReferenceValue = NAN;
+        systemState.phLastTrendCheckAt = 0;
+        systemState.phLastTrendImproving = true;
+        systemState.phFirstCheckpointPublished = false;
+        systemState.phStableSince = 0;
+        systemState.phStableCheckpointPublished = false;
+    }
+
     changeState(
         DOSING_PH);
 
@@ -2109,6 +2524,21 @@ bool AutomationManager::processECCorrection()
     // where a safety rejection above would have left it stuck at
     // EC_DOSING_TIME while currentMode stayed NORMAL and nothing was dosing.
     systemState.ecDoseTime = EC_DOSING_TIME;
+
+    // Quiet-monitoring/4-minute-budget redesign - see processPHCorrection()'s
+    // matching comment for the full reasoning (correctionCycleStartAt is
+    // shared between pH and EC; the == 0 guard is what makes an internal
+    // redose never reset it).
+    if (systemState.correctionCycleStartAt == 0)
+    {
+        systemState.correctionCycleStartAt = millis();
+        systemState.ecTrendReferenceValue = NAN;
+        systemState.ecLastTrendCheckAt = 0;
+        systemState.ecLastTrendImproving = true;
+        systemState.ecFirstCheckpointPublished = false;
+        systemState.ecStableSince = 0;
+        systemState.ecStableCheckpointPublished = false;
+    }
 
     changeState(
         DOSING_EC);
@@ -2691,6 +3121,36 @@ bool AutomationManager::handleBoundedAutomaticRefill()
 
     if(automaticRefillPhase == AutomaticRefillPhase::RUNNING)
     {
+        // Independent-deadline reconciliation (critical verification report,
+        // Priority 4): ActuatorManager's esp_timer deadline may have already
+        // force-closed the solenoid - possibly while loop() was stalled
+        // inside a blocking Firebase/RTC call - before the elapsed-time
+        // check just below ever got a chance to run this tick. Mirrors
+        // handleDosingPH()/handleDosingEC()'s own reconciliation: an on-time-
+        // or-later cutoff continues into the normal RUNNING->SETTLING
+        // transition; an unexpectedly early one routes through the existing
+        // failure/abort path instead of being treated as a completed
+        // interval.
+        if(actuatorManager.getStatus(SOLENOID).forcedOffByDeadline)
+        {
+            actuatorManager.requestCommand(
+                SOLENOID, false, "automatic", now, 100, "refill", "independent deadline");
+
+            if(elapsed >= AUTOMATIC_REFILL_RUN_TIME)
+            {
+                automaticRefillPhase = AutomaticRefillPhase::SETTLING;
+                automaticRefillPhaseStartedAt = now;
+                Serial.print("[REFILL] attempt ");
+                Serial.print(automaticRefillAttempt);
+                Serial.println(" run interval complete (independent deadline); settling");
+            }
+            else
+            {
+                failCurrentSubsystem("Automatic refill stopped unexpectedly early by independent safety deadline.");
+            }
+            return true;
+        }
+
         if(elapsed < AUTOMATIC_REFILL_RUN_TIME)
         {
             return false;
@@ -3143,6 +3603,40 @@ void AutomationManager::handleDosingPH()
         return;
     }
 
+    // Independent-deadline reconciliation (critical verification report,
+    // Priority 3): ActuatorManager's esp_timer deadline may have already
+    // force-stopped the active pump - possibly while loop() was stalled
+    // inside a blocking Firebase/RTC call - before the dose-duration check
+    // below ever got a chance to run this tick. Check only the pump this
+    // dose is actually driving, not both, so a stale flag left on the
+    // opposite pump from an earlier, different-direction dose can never be
+    // misread as this one's own (ActuatorManager clears the flag on every
+    // fresh command, but this keeps the read itself unambiguous either way).
+    const Actuator activePhPump =
+        systemState.phDirection == PH_UP ? PH_UP_PUMP : PH_DOWN_PUMP;
+    if(actuatorManager.getStatus(activePhPump).forcedOffByDeadline)
+    {
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
+
+        if(millis() - systemState.stateStartTime >= systemState.phDoseTime)
+        {
+            // Fired at/after the dose's own intended duration - loop()
+            // simply could not get back in time to apply the normal on-time
+            // stop below. Treat exactly like that normal stop, not a fault.
+            Serial.println("[PH] Independent deadline confirmed dose end (loop delayed); continuing to stabilization");
+            changeState(STABILIZING_PH);
+        }
+        else
+        {
+            // Fired unexpectedly early relative to the dose's own intended
+            // duration - do not pretend the dose completed successfully;
+            // route through the existing failure/abort path instead.
+            failCurrentSubsystem("pH dose stopped unexpectedly early by independent safety deadline.");
+        }
+        return;
+    }
+
     systemState.reservoirLocked = true;
 
     if(systemState.phDirection == PH_UP)
@@ -3225,80 +3719,206 @@ void AutomationManager::handleStabilizingPH()
        millis() - phStabilizationCirculationConfirmedAt >=
        PH_STABILIZATION_TIME)
     {
-        // Past the initial 1-minute circulation period: alternate 30s
-        // circulate-only / 30s check windows rather than polling every tick.
-        // Circulation itself never stops across either half - only whether a
-        // check is allowed to accept the reading this tick changes.
-        const unsigned long sinceInitial =
-            millis() - phStabilizationCirculationConfirmedAt - PH_STABILIZATION_TIME;
-        const bool inCheckWindow =
-            (sinceInitial % (2UL * PH_EC_RECHECK_INTERVAL_MS)) >= PH_EC_RECHECK_INTERVAL_MS;
+        // Past the initial silent settle window and purely watching now -
+        // let fogging resume (SafetyManager::canFog() only allows it once
+        // this is true AND pH is confirmed within [minPH, maxPH], which
+        // canFog() checks independently). Mirrors handleNormal()'s own
+        // fogControllerAllowed/validateNormalOperation()/processFogCycle()
+        // sequence - reusing validateNormalOperation() here re-derives
+        // canFog() (and therefore this same watch-phase/range check) fresh
+        // every tick, so fogging still stops immediately if pH drifts back
+        // out of range or a redose starts.
+        systemState.phWatchPhaseActive = true;
 
-        if(!inCheckWindow)
+        const bool fogControllerAllowed =
+            automationAllowed(AutomationTestSubsystem::FOGGING);
+        if(fogControllerAllowed && validateNormalOperation())
         {
-            return;
+            processFogCycle();
         }
 
-        // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
-        // value sensors.ph is still (correctly) retaining for
-        // Firebase/display - wait here until the live pH signal has
-        // reconfirmed a fresh stable reading. Bounded by the existing
-        // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDosePH() path already
-        // re-checked every tick above, so a probe that never restabilizes
-        // still aborts via the existing safety model rather than waiting
-        // forever. A miss here simply falls through to the next 30s
-        // circulate/check cycle rather than retrying immediately.
-        if(!canStartNewPHCorrection())
+        // First checkpoint: one-shot publish of whatever value exists once
+        // the initial silent window (30s circulation + 60s silent read,
+        // PH_STABILIZATION_TIME) has passed, regardless of whether it has
+        // settled yet - quiet-monitoring/4-minute-budget redesign.
+        if(!systemState.phFirstCheckpointPublished)
         {
-            return;
+            systemState.phPublishPending = true;
+            systemState.phFirstCheckpointPublished = true;
         }
 
-        const bool targetReached =
-            systemState.phDirection == PH_UP
-                ? sensors.ph >= systemState.phTargetMin
-                : sensors.ph <= systemState.phTargetMax;
+        const bool budgetExpired =
+            millis() - systemState.correctionCycleStartAt >=
+            PH_EC_CORRECTION_STALL_TIMEOUT_MS;
 
-        if(!targetReached)
+        // Stable-hold-for-publish bookkeeping: tracks how long the reading
+        // has sat continuously inside SensorManager's own stability window,
+        // independent of the trend re-sample below - this is what
+        // eventually redoses a genuinely stalled-but-out-of-range plateau,
+        // or completes the correction, once it has held long enough to
+        // trust (PH_EC_STABLE_HOLD_FOR_PUBLISH_MS).
+        if(sensorManager.isPhCurrentlyStable())
         {
-            systemState.phAttempts++;
-
-            if(systemState.phAttempts >=
-            MAX_PH_ATTEMPTS)
+            if(systemState.phStableSince == 0)
             {
-                failCurrentSubsystem("Maximum pH correction attempts reached.");
-
-                return;
+                systemState.phStableSince = millis();
             }
-
-            // Continue toward the inner target. Only reverse direction after an
-            // actual overshoot beyond the opposite inner target.
-            if(systemState.phDirection == PH_UP && sensors.ph > systemState.phTargetMax)
-                systemState.phDirection = PH_DOWN;
-            else if(systemState.phDirection == PH_DOWN && sensors.ph < systemState.phTargetMin)
-                systemState.phDirection = PH_UP;
-
-            systemState.phDoseTime = PH_DOSING_TIME;
-
-            systemState.firstCorrectionCycle = false;
-
-            changeState(
-                DOSING_PH);
-
-            return;
+        }
+        else
+        {
+            systemState.phStableSince = 0;
+            systemState.phStableCheckpointPublished = false;
         }
 
-        systemState.phAttempts = 0;
+        if(systemState.phStableSince != 0 &&
+           !systemState.phStableCheckpointPublished &&
+           millis() - systemState.phStableSince >=
+           PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
+        {
+            systemState.phPublishPending = true;
+            systemState.phStableCheckpointPublished = true;
 
-        systemState.phDirection = PH_NONE;
+            // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
+            // value sensors.ph is still (correctly) retaining for
+            // Firebase/display - wait here until the live pH signal has
+            // reconfirmed a fresh stable reading. Bounded by the existing
+            // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDosePH() path
+            // already re-checked every tick above, so a probe that never
+            // restabilizes still aborts via the existing safety model
+            // rather than waiting forever.
+            if(canStartNewPHCorrection())
+            {
+                const bool targetReached =
+                    systemState.phDirection == PH_UP
+                        ? sensors.ph >= systemState.phTargetMin
+                        : sensors.ph <= systemState.phTargetMax;
 
-        systemState.reservoirLocked = false;
+                if(targetReached)
+                {
+                    systemState.phAttempts = 0;
+                    systemState.phDirection = PH_NONE;
+                    systemState.reservoirLocked = false;
+                    systemState.correctionCycleStartAt = 0;
 
-        completeCurrentOperation();
+                    completeCurrentOperation();
 
-        Serial.println("[PH] correction completed");
+                    Serial.println("[PH] correction completed");
 
-        changeState(
-            NORMAL);
+                    changeState(
+                        NORMAL);
+
+                    return;
+                }
+
+                if(!budgetExpired)
+                {
+                    // A confirmed stable-but-out-of-range plateau: the
+                    // clearest possible "no further passive movement,
+                    // redose now" signal - no need to wait for the next
+                    // trend re-sample below.
+                    systemState.phAttempts++;
+
+                    // Continue toward the inner target. Only reverse
+                    // direction after an actual overshoot beyond the
+                    // opposite inner target.
+                    if(systemState.phDirection == PH_UP && sensors.ph > systemState.phTargetMax)
+                        systemState.phDirection = PH_DOWN;
+                    else if(systemState.phDirection == PH_DOWN && sensors.ph < systemState.phTargetMin)
+                        systemState.phDirection = PH_UP;
+
+                    systemState.phDoseTime = PH_DOSING_TIME;
+                    systemState.firstCorrectionCycle = false;
+
+                    changeState(
+                        DOSING_PH);
+
+                    return;
+                }
+            }
+        }
+
+        // Trend re-sample: catches a reversal WHILE the reading is still
+        // actively moving, before it ever settles into a stable plateau
+        // (the block above only fires once SensorManager's own window
+        // confirms no movement for a full stability-window duration).
+        if(millis() - systemState.phLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
+        {
+            systemState.phLastTrendCheckAt = millis();
+
+            if(isnan(systemState.phTrendReferenceValue))
+            {
+                systemState.phTrendReferenceValue = sensors.ph;
+            }
+            else
+            {
+                auto distanceToTarget = [](float ph, float targetMin, float targetMax) -> float
+                {
+                    if(ph < targetMin) return targetMin - ph;
+                    if(ph > targetMax) return ph - targetMax;
+                    return 0.0f;
+                };
+
+                const float previousDistance = distanceToTarget(
+                    systemState.phTrendReferenceValue, systemState.phTargetMin, systemState.phTargetMax);
+                const float currentDistance = distanceToTarget(
+                    sensors.ph, systemState.phTargetMin, systemState.phTargetMax);
+
+                if(previousDistance - currentDistance > PH_TREND_NOISE_FLOOR)
+                {
+                    systemState.phLastTrendImproving = true;
+                }
+                else if(currentDistance - previousDistance > PH_TREND_NOISE_FLOOR)
+                {
+                    // Reversal - moving away from target rather than
+                    // toward it. Dose again right away rather than waiting
+                    // for the reading to settle into a stable plateau.
+                    systemState.phLastTrendImproving = false;
+
+                    if(!budgetExpired && canStartNewPHCorrection())
+                    {
+                        systemState.phAttempts++;
+
+                        if(systemState.phDirection == PH_UP && sensors.ph > systemState.phTargetMax)
+                            systemState.phDirection = PH_DOWN;
+                        else if(systemState.phDirection == PH_DOWN && sensors.ph < systemState.phTargetMin)
+                            systemState.phDirection = PH_UP;
+
+                        systemState.phDoseTime = PH_DOSING_TIME;
+                        systemState.firstCorrectionCycle = false;
+
+                        systemState.phTrendReferenceValue = sensors.ph;
+
+                        changeState(
+                            DOSING_PH);
+
+                        return;
+                    }
+                }
+                else
+                {
+                    // Within the noise floor: no meaningful movement either
+                    // way - treated as no-progress for the budget verdict
+                    // below, but not itself worth redosing before the
+                    // stable-hold-for-publish path above confirms a genuine
+                    // plateau.
+                    systemState.phLastTrendImproving = false;
+                }
+
+                systemState.phTrendReferenceValue = sensors.ph;
+            }
+        }
+
+        // Budget-expiry verdict: only a genuinely stalled reading locks
+        // here - one still improving (even slowly, via passive drift) just
+        // keeps being monitored quietly. alertManager.update() above
+        // already re-evaluates phOutOfRange/phHigh/phLow off sensors.ph
+        // every tick regardless of anything in this function, so a
+        // subsequent overshoot past the outer range still surfaces through
+        // the existing alert/notification path with no dosing and no lock.
+        if(budgetExpired && !systemState.phLastTrendImproving)
+        {
+            failCurrentSubsystem("Maximum pH correction time reached; pH is not responding to dosing.");
+        }
     }
 }
 
@@ -3315,6 +3935,42 @@ void AutomationManager::handleDosingEC()
     if(result != SafetyResult::SAFE)
     {
         abortCurrentOperation(result);
+        return;
+    }
+
+    // Independent-deadline reconciliation (critical verification report,
+    // Priority 3): mirrors handleDosingPH()'s own reconciliation above -
+    // checks only the actuator(s) this dose direction is actually driving
+    // (GROW_PUMP/BLOOM_PUMP for a raise, SOLENOID for a dilution), so a
+    // stale flag from an unrelated earlier run is never misread as this
+    // one's own.
+    const bool ecDeadlineFired = systemState.ecDirection == EC_RAISE
+        ? (actuatorManager.getStatus(GROW_PUMP).forcedOffByDeadline ||
+           actuatorManager.getStatus(BLOOM_PUMP).forcedOffByDeadline)
+        : actuatorManager.getStatus(SOLENOID).forcedOffByDeadline;
+    if(ecDeadlineFired)
+    {
+        actuatorManager.requestCommand(GROW_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(BLOOM_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(SOLENOID, false, "automatic", millis(), 100,
+            systemState.ecDirection == EC_DILUTE ? "dilution" : "");
+
+        if(millis() - systemState.stateStartTime >= systemState.ecDoseTime)
+        {
+            // Fired at/after the dose's own intended duration - loop()
+            // simply could not get back in time to apply the normal on-time
+            // stop below. Treat exactly like that normal stop, not a fault.
+            Serial.println("[EC] Independent deadline confirmed dose end (loop delayed); continuing to stabilization");
+            systemState.ecDoseTime = 0;
+            changeState(STABILIZING_EC);
+        }
+        else
+        {
+            // Fired unexpectedly early relative to the dose's own intended
+            // duration - do not pretend the dose completed successfully;
+            // route through the existing failure/abort path instead.
+            failCurrentSubsystem("EC dose stopped unexpectedly early by independent safety deadline.");
+        }
         return;
     }
 
@@ -3430,73 +4086,166 @@ void AutomationManager::handleStabilizingEC()
     {
         alertManager.update();
 
-        // Past the initial 1-minute circulation period: alternate 30s
-        // circulate-only / 30s check windows - see handleStabilizingPH()'s
+        // Past the initial silent settle window - let fogging resume. See
+        // handleStabilizingPH()'s matching comment.
+        systemState.ecWatchPhaseActive = true;
+
+        const bool fogControllerAllowed =
+            automationAllowed(AutomationTestSubsystem::FOGGING);
+        if(fogControllerAllowed && validateNormalOperation())
+        {
+            processFogCycle();
+        }
+
+        // First checkpoint: one-shot publish - see handleStabilizingPH()'s
         // matching comment.
-        const unsigned long sinceInitial =
-            millis() - ecStabilizationCirculationConfirmedAt - EC_STABILIZATION_TIME;
-        const bool inCheckWindow =
-            (sinceInitial % (2UL * PH_EC_RECHECK_INTERVAL_MS)) >= PH_EC_RECHECK_INTERVAL_MS;
-
-        if(!inCheckWindow)
+        if(!systemState.ecFirstCheckpointPublished)
         {
-            return;
+            systemState.ecPublishPending = true;
+            systemState.ecFirstCheckpointPublished = true;
         }
 
-        // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
-        // value sensors.ec is still (correctly) retaining for
-        // Firebase/display - wait here until the live EC signal has
-        // reconfirmed a fresh stable reading. Bounded by the existing
-        // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDoseEC()/
-        // canDiluteEC() path already re-checked every tick above, so a probe
-        // that never restabilizes still aborts via the existing safety
-        // model rather than waiting forever. A miss here simply falls
-        // through to the next 30s circulate/check cycle rather than
-        // retrying immediately.
-        if(!canStartNewECCorrection())
+        const bool budgetExpired =
+            millis() - systemState.correctionCycleStartAt >=
+            PH_EC_CORRECTION_STALL_TIMEOUT_MS;
+
+        // Stable-hold-for-publish bookkeeping - see handleStabilizingPH()'s
+        // matching comment.
+        if(sensorManager.isEcCurrentlyStable())
         {
-            return;
-        }
-
-        const bool targetReached =
-            systemState.ecDirection == EC_RAISE
-                ? sensors.ec >= systemState.ecTargetMin
-                : sensors.ec <= systemState.ecTargetMax;
-
-        if(!targetReached)
-        {
-            systemState.ecAttempts++;
-
-            if(systemState.ecAttempts >=
-            MAX_EC_ATTEMPTS)
+            if(systemState.ecStableSince == 0)
             {
-                failCurrentSubsystem("Maximum EC correction attempts reached; manual attention required.");
-
-                return;
+                systemState.ecStableSince = millis();
             }
-
-            systemState.firstCorrectionCycle = false;
-
-            systemState.ecDoseTime = EC_DOSING_TIME;
-
-            changeState(
-                DOSING_EC);
-
-            return;
+        }
+        else
+        {
+            systemState.ecStableSince = 0;
+            systemState.ecStableCheckpointPublished = false;
         }
 
-        systemState.ecAttempts = 0;
+        if(systemState.ecStableSince != 0 &&
+           !systemState.ecStableCheckpointPublished &&
+           millis() - systemState.ecStableSince >=
+           PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
+        {
+            systemState.ecPublishPending = true;
+            systemState.ecStableCheckpointPublished = true;
 
-        systemState.ecDirection = EC_NONE;
+            // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
+            // value sensors.ec is still (correctly) retaining for
+            // Firebase/display - wait here until the live EC signal has
+            // reconfirmed a fresh stable reading. Bounded by the existing
+            // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDoseEC()/
+            // canDiluteEC() path already re-checked every tick above, so a
+            // probe that never restabilizes still aborts via the existing
+            // safety model rather than waiting forever.
+            if(canStartNewECCorrection())
+            {
+                const bool targetReached =
+                    systemState.ecDirection == EC_RAISE
+                        ? sensors.ec >= systemState.ecTargetMin
+                        : sensors.ec <= systemState.ecTargetMax;
 
-        systemState.reservoirLocked = false;
+                if(targetReached)
+                {
+                    systemState.ecAttempts = 0;
+                    systemState.ecDirection = EC_NONE;
+                    systemState.reservoirLocked = false;
+                    systemState.correctionCycleStartAt = 0;
 
-        completeCurrentOperation();
+                    completeCurrentOperation();
 
-        Serial.println("[EC] correction completed");
+                    Serial.println("[EC] correction completed");
 
-        changeState(
-            NORMAL);
+                    changeState(
+                        NORMAL);
+
+                    return;
+                }
+
+                if(!budgetExpired)
+                {
+                    // A confirmed stable-but-out-of-range plateau - see
+                    // handleStabilizingPH()'s matching comment.
+                    systemState.ecAttempts++;
+
+                    systemState.firstCorrectionCycle = false;
+
+                    systemState.ecDoseTime = EC_DOSING_TIME;
+
+                    changeState(
+                        DOSING_EC);
+
+                    return;
+                }
+            }
+        }
+
+        // Trend re-sample - see handleStabilizingPH()'s matching comment.
+        if(millis() - systemState.ecLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
+        {
+            systemState.ecLastTrendCheckAt = millis();
+
+            if(isnan(systemState.ecTrendReferenceValue))
+            {
+                systemState.ecTrendReferenceValue = sensors.ec;
+            }
+            else
+            {
+                auto distanceToTarget = [](float ec, float targetMin, float targetMax) -> float
+                {
+                    if(ec < targetMin) return targetMin - ec;
+                    if(ec > targetMax) return ec - targetMax;
+                    return 0.0f;
+                };
+
+                const float previousDistance = distanceToTarget(
+                    systemState.ecTrendReferenceValue, systemState.ecTargetMin, systemState.ecTargetMax);
+                const float currentDistance = distanceToTarget(
+                    sensors.ec, systemState.ecTargetMin, systemState.ecTargetMax);
+
+                if(previousDistance - currentDistance > EC_TREND_NOISE_FLOOR)
+                {
+                    systemState.ecLastTrendImproving = true;
+                }
+                else if(currentDistance - previousDistance > EC_TREND_NOISE_FLOOR)
+                {
+                    // Reversal - dose again right away rather than waiting
+                    // for the reading to settle into a stable plateau.
+                    systemState.ecLastTrendImproving = false;
+
+                    if(!budgetExpired && canStartNewECCorrection())
+                    {
+                        systemState.ecAttempts++;
+
+                        systemState.firstCorrectionCycle = false;
+
+                        systemState.ecDoseTime = EC_DOSING_TIME;
+
+                        systemState.ecTrendReferenceValue = sensors.ec;
+
+                        changeState(
+                            DOSING_EC);
+
+                        return;
+                    }
+                }
+                else
+                {
+                    systemState.ecLastTrendImproving = false;
+                }
+
+                systemState.ecTrendReferenceValue = sensors.ec;
+            }
+        }
+
+        // Budget-expiry verdict - see handleStabilizingPH()'s matching
+        // comment.
+        if(budgetExpired && !systemState.ecLastTrendImproving)
+        {
+            failCurrentSubsystem("Maximum EC correction time reached; EC is not responding to dosing.");
+        }
     }
 }
 
@@ -3585,6 +4334,10 @@ void AutomationManager::failCurrentSubsystem(const String& reason)
         actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis(), 100, "", reason);
         systemState.phSubsystemLocked = true;
         systemState.phDirection = PH_NONE;
+        // Quiet-monitoring/4-minute-budget redesign: this episode is over
+        // (locked, pending Reset Safety) - the next independent out-of-range
+        // episode gets its own fresh budget.
+        systemState.correctionCycleStartAt = 0;
     }
     else if(operation == OperationType::EC_CORRECTION ||
             systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC)
@@ -3597,6 +4350,8 @@ void AutomationManager::failCurrentSubsystem(const String& reason)
         systemState.ecSubsystemLocked = true;
         systemState.ecDirection = EC_NONE;
         systemState.ecDoseTime = 0;
+        // See the pH branch's matching comment above.
+        systemState.correctionCycleStartAt = 0;
         Serial.print("[EC-LOCK] set reason=");
         Serial.println(reason);
     }

@@ -174,7 +174,7 @@ void DebugManager::printSensors()
         2);
 
     printInteger(
-        "EC ADC",
+        "EC mV",
         sensors.ecRaw,
         nullptr);
 

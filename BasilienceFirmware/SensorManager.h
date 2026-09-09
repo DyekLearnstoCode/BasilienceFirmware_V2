@@ -73,6 +73,11 @@ private:
     // PH_ADC_DIAGNOSTIC_INTERVAL_MS's own comment.
     unsigned long lastPhAdcDiagnosticAt = 0;
 
+    // Throttle for readEC()'s [EC-CAL] diagnostic - same reasoning as
+    // lastPhAdcDiagnosticAt above, see EC_ADC_DIAGNOSTIC_INTERVAL_MS's own
+    // comment in Config.h.
+    unsigned long lastEcAdcDiagnosticAt = 0;
+
     bool sensorSourceReported = false;
     bool lastReportedMockSource = false;
     bool sensorSourceWaitingLogged = false;

@@ -30,6 +30,18 @@ public:
         RETRY_WAIT
     };
 
+    // Tracks a credential submission from the /setup page (POST /setup),
+    // separate from WifiState above. See beginManualReconnectAttempt() /
+    // updateManualReconnectAttempt() - this is what let the reboot-based
+    // "just restart and hope" flow be replaced with a real, pollable answer.
+    enum class ManualAttemptState
+    {
+        NONE,
+        CONNECTING,
+        CONNECTED_GRACE,
+        FAILED
+    };
+
     void begin();
 
     bool connect();
@@ -75,6 +87,26 @@ private:
     // The single saved-credential STA initiation path. Nothing else in the
     // normal retry loop may call WiFi.begin()/WiFi.mode().
     void startConnectionAttempt();
+
+    // Starts a non-blocking attempt to join newly submitted /setup
+    // credentials while Basilience-Setup stays up (WIFI_AP_STA), so a phone
+    // still connected to it can poll /status for the real outcome instead
+    // of only finding out once this device reconnects to Firebase on the
+    // new network. Called from the /setup handler in place of the previous
+    // ESP.restart().
+    void beginManualReconnectAttempt(const String& newSsid, const String& newPassword);
+
+    // Polled every update() while manualAttemptState is not NONE. Resolves
+    // into CONNECTED_GRACE (briefly keeps the AP up so /status can actually
+    // be seen reporting success before Basilience-Setup disappears) or
+    // FAILED (restores the previous credentials and holds that answer for
+    // MANUAL_STATUS_HOLD_MS before handing back to the normal retry logic).
+    void updateManualReconnectAttempt();
+
+    // Builds the JSON body GET /status returns, reflecting manualAttemptState
+    // - "setup_mode" outside of any submission, matching the original,
+    // always-static response.
+    String manualProvisioningStatusJson() const;
 
     // Shared CONNECTED transition: clears the cumulative recovery window and
     // logs the connection once.
@@ -123,6 +155,22 @@ private:
     bool initialConnectionAttempt = true;
     WebServer server{80};
     DNSServer dnsServer;
+
+    ManualAttemptState manualAttemptState = ManualAttemptState::NONE;
+    unsigned long manualAttemptStartedAt = 0;
+    unsigned long manualAttemptConnectedAt = 0;
+    unsigned long manualAttemptFailedAt = 0;
+    String manualAttemptSsid;
+    // Whatever was configured immediately before a /setup submission -
+    // restored if the newly submitted credentials fail to connect. Captured
+    // in the /setup handler before saveCredentials() overwrites ssid/password.
+    String preManualSsid;
+    String preManualPassword;
+    // How long CONNECTED_GRACE/FAILED hold their answer before the AP comes
+    // down (success) or the normal retry logic resumes (failure) - long
+    // enough for the app's ~1s /status poll to see it at least a couple of
+    // times.
+    static constexpr unsigned long MANUAL_STATUS_HOLD_MS = 3000;
 };
 
 #endif

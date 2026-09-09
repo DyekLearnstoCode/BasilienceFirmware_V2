@@ -135,6 +135,37 @@ enum SystemMode
     SAFETY_LOCK
 };
 
+// Pulse-cooling state machine (replaces continuous-circulation cooling -
+// see AutomationManager::updateCoolingPulseStateMachine()). Deliberately NOT
+// a SystemMode value: cooling has always run independently of the reservoir-
+// wide FSM above (coolingDemandActive/manualCoolingDemandActive), and staying
+// that way keeps this entirely out of pH/EC/refill's currentMode-based mutual
+// exclusion instead of risking new interactions with it. Read directly from
+// systemState (not just AutomationManager-private) because
+// ActuatorManager::validateCommand()'s PELTIER case and the automatic
+// independent-deadline tables both need to know the current state too.
+enum class CoolingPulseState : uint8_t
+{
+    IDLE,
+    FILL,
+    COOL_SOAK,
+    FLUSH
+};
+
+// Internal FILL/FLUSH sequencing sub-phase - never read outside
+// AutomationManager, purely local bookkeeping for the confirm-then-time-
+// then-confirm sequence each of those two states runs through. Declared
+// here (not nested in AutomationManager) only so it can sit next to
+// CoolingPulseState; nothing outside AutomationManager.cpp touches it.
+enum class CoolingPulsePhase : uint8_t
+{
+    NONE,
+    WAIT_CIRCULATION_ON,
+    TIMED_RUN,
+    WAIT_CIRCULATION_OFF,
+    WAIT_PELTIER_OFF
+};
+
 // Temporary developer-only controller isolation. NONE is the existing full
 // system; every other value permits exactly one automatic controller plus
 // its explicit support dependencies. Sensor acquisition/publication and
@@ -315,6 +346,18 @@ struct ActuatorStatus
     // overrideRequested, so the continuous RUNNING-state re-check sees it
     // for as long as this command's purge window lasts.
     bool bypassAutoFoggerGate = false;
+    // True for exactly one tick after ActuatorManager's independent esp_timer
+    // deadline (not AutomationManager's own dose/refill-duration timer)
+    // force-stopped this actuator - distinct from a normal on-time stop, so
+    // AutomationManager can tell "I stopped this myself" apart from
+    // "something already forced this off, possibly while loop() was
+    // stalled" and reconcile its own state machine (DOSING->STABILIZING,
+    // REFILLING RUNNING->SETTLING) instead of re-issuing a now-physically-
+    // meaningless command or silently believing the operation is still in
+    // progress. Set only by ActuatorManager::update()'s existing deadline-
+    // expiry reconciliation block; cleared automatically the next time a
+    // fresh command is accepted for this actuator.
+    bool forcedOffByDeadline = false;
 };
 
 //==================================================
@@ -451,6 +494,12 @@ struct SystemState
     bool refillSubsystemLocked = false;
     bool coolingSubsystemLocked = false;
 
+    // Pulse-cooling task: current phase of the FILL/COOL_SOAK/FLUSH cycle.
+    // Owned/advanced by AutomationManager::updateCoolingPulseStateMachine();
+    // read (never written) by ActuatorManager for the one narrow COOL_SOAK
+    // Peltier-without-circulation exception and its independent deadline.
+    CoolingPulseState coolingPulseState = CoolingPulseState::IDLE;
+
     bool reservoirLocked = false;
 
     bool forceRefill = false;
@@ -545,6 +594,33 @@ struct SystemState
     bool firstCorrectionCycle = true;
 
     //==================================================
+    // pH/EC correction redesign - quiet monitoring + 4-minute budget
+    //==================================================
+
+    // Whole-correction time-budget anchor, shared by pH and EC since
+    // currentMode only ever runs one of DOSING_PH/STABILIZING_PH/DOSING_EC/
+    // STABILIZING_EC at a time - the two can never be active concurrently.
+    // 0 = no correction currently running (same sentinel convention as
+    // lastPhDoseEndedAt below). Set once when a correction first triggers
+    // (processPHCorrection()/processECCorrection()), left untouched by an
+    // internal redose, cleared on completion or failure. See
+    // PH_EC_CORRECTION_STALL_TIMEOUT_MS (Config.h).
+    unsigned long correctionCycleStartAt = 0;
+
+    // True only while handleStabilizingPH()/handleStabilizingEC() are past
+    // their initial silent settle window (PH_STABILIZATION_TIME/
+    // EC_STABILIZATION_TIME) and purely watching, not actively dosing and
+    // not waiting for a fresh dose to mix in yet. Lets
+    // SafetyManager::canFog() allow fogging to resume during that window -
+    // canFog()'s own pH/EC range checks already confirm the reading is
+    // actually safe; this only says "and it is current enough to trust."
+    // Set fresh every tick (true inside the watch block, false via
+    // changeState() on entering DOSING_PH/STABILIZING_PH) rather than
+    // relying on scattered resets, so it can never linger stale.
+    bool phWatchPhaseActive = false;
+    bool ecWatchPhaseActive = false;
+
+    //==================================================
     // pH
     //==================================================
 
@@ -554,6 +630,33 @@ struct SystemState
     unsigned long phDoseTime = 0;
 
     uint8_t phAttempts = 0;
+
+    // Trend tracking for handleStabilizingPH() - lets it tell "still
+    // improving on its own," "stalled," and "reversing" apart instead of
+    // blindly redosing on a timer. phLastTrendImproving is what the
+    // PH_EC_CORRECTION_STALL_TIMEOUT_MS deadline verdict is judged by.
+    float phTrendReferenceValue = NAN;
+    unsigned long phLastTrendCheckAt = 0;
+    bool phLastTrendImproving = true;
+
+    // First-checkpoint / stable-hold-for-publish bookkeeping - see
+    // PH_EC_STABLE_HOLD_FOR_PUBLISH_MS (Config.h).
+    bool phFirstCheckpointPublished = false;
+    unsigned long phStableSince = 0;
+    bool phStableCheckpointPublished = false;
+
+    // One-shot: AutomationManager sets this true for exactly the tick a
+    // checkpoint should be published; FirebaseManager consumes and clears
+    // it in the same write that includes the value.
+    bool phPublishPending = false;
+
+    // FirebaseManager::writeSensors() writes the /sensors node with a full
+    // setJSON() overwrite, not a merge - omitting "ph" from that JSON would
+    // DELETE the field from the database, not freeze it. This holds the
+    // last value actually published (either normal unheld publishing, or
+    // one of the two correction checkpoints) so a held write can keep
+    // republishing something instead of wiping the field.
+    float phLastPublishedValue = NAN;
 
     // millis() a pH-Up/pH-Down pump last actually finished running, from
     // EITHER source (manual or automatic) - see
@@ -583,6 +686,24 @@ struct SystemState
     unsigned long ecDoseTime = 0;
 
     uint8_t ecAttempts = 0;
+
+    // Mirrors the phTrendReferenceValue/phLastTrendCheckAt/
+    // phLastTrendImproving trio above, for handleStabilizingEC().
+    float ecTrendReferenceValue = NAN;
+    unsigned long ecLastTrendCheckAt = 0;
+    bool ecLastTrendImproving = true;
+
+    // Mirrors the ph* checkpoint/publish bookkeeping above, for EC.
+    bool ecFirstCheckpointPublished = false;
+    unsigned long ecStableSince = 0;
+    bool ecStableCheckpointPublished = false;
+    bool ecPublishPending = false;
+
+    // See phLastPublishedValue's own comment above. ecLastPublishedTds
+    // mirrors ecLastPublishedValue for the derived tds field, held/
+    // published in lockstep with ec rather than tracked independently.
+    float ecLastPublishedValue = NAN;
+    float ecLastPublishedTds = NAN;
 
     // Same purpose/sentinel convention as lastPhDoseEndedAt above, for the
     // Grow/Bloom pumps - EC_DOSE_COOLDOWN is enforced from this in

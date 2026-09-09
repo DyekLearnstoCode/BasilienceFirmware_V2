@@ -114,7 +114,20 @@ private:
     SyncSource syncSource = SyncSource::INVALID;
     unsigned long lastNtpAttemptAt = 0;
 
-    void attemptNetworkTimeSync();
+    // Non-blocking NTP polling state (critical verification report,
+    // Priority 2). attemptNetworkTimeSync() used to call the ESP32 core's
+    // getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS), which internally loops
+    // on time()/delay(10) for up to NTP_SYNC_TIMEOUT_MS itself - i.e. it
+    // blocked the calling loop() iteration for that entire duration. These
+    // two fields let update() poll the exact same success condition
+    // (see pollNetworkTimeSync() in the .cpp) once per call instead, so the
+    // same bounded wait is spread across many fast loop() iterations rather
+    // than consumed inside one blocking call.
+    bool ntpSyncInProgress = false;
+    unsigned long ntpSyncStartedAt = 0;
+
+    void startNetworkTimeSync();
+    void pollNetworkTimeSync();
 
     // Bounded wait for getLocalTime() - never blocks indefinitely.
     static constexpr uint32_t NTP_SYNC_TIMEOUT_MS = 8000UL;

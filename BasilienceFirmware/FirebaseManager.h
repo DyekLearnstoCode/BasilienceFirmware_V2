@@ -4,6 +4,9 @@
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #include "Types.h"
 
@@ -241,23 +244,136 @@ private:
     // Secure Device Auth (bootstrap + refresh-token identity)
     //==================================================
 
-    // Orchestrates the boot-time auth flow: refresh-token restore, then
-    // secret-based bootstrap, in that order. Returns false if neither
-    // credential is present/works - callers must not treat that as fatal,
-    // only as "secure identity unavailable this boot."
+    // Non-blocking auth state machine (critical verification report,
+    // Priority 1). Both begin() (boot) and beginFirebaseRecovery()/
+    // pollFirebaseRecovery() (runtime, reachable at any time - including
+    // mid-dose) drive the SAME
+    // underlying credential order (refresh token -> device-secret bootstrap
+    // -> legacy anonymous fallback) through this one implementation, so
+    // there is exactly one place that decides how a device authenticates.
+    // See the .cpp for the full per-state rationale and the one remaining
+    // bounded exception (the device-secret bootstrap's HTTPS POST).
+    enum class FirebaseAuthPhase : uint8_t
+    {
+        IDLE,
+        TRY_REFRESH_TOKEN,
+        WAIT_REFRESH_READY,
+        TRY_DEVICE_SECRET,
+        // Waiting on the background bootstrap-HTTP task (see
+        // bootstrapHttpTaskFn()) - distinct from WAIT_BOOTSTRAP_READY below,
+        // which waits on Firebase.ready() itself once the token has already
+        // been handed to the library.
+        WAIT_BOOTSTRAP_HTTP,
+        WAIT_BOOTSTRAP_READY,
+        TRY_LEGACY_SIGNUP,
+        WAIT_LEGACY_READY,
+        SUCCESS,
+        FAILED
+    };
+
+    FirebaseAuthPhase authPhase = FirebaseAuthPhase::IDLE;
+    unsigned long authPhaseStartedAt = 0;
+    // True only while the phase currently in SUCCESS/FAILED was reached via
+    // TRY_LEGACY_SIGNUP - lets callers log "legacy" vs. "secure device
+    // identity" accurately without re-deriving it from authPhase after it
+    // may already have been reset to IDLE for the next attempt.
+    bool authSucceededViaLegacy = false;
+
+    // Resets the state machine to the first reachable phase for a fresh
+    // attempt, based on which credentials are currently persisted. Does not
+    // block and does not itself perform any network call.
+    void startAuthAttempt();
+
+    // Advances the state machine by exactly one bounded step and returns
+    // immediately once that step is done - never loops, never delays. The
+    // one exception is the TRY_DEVICE_SECRET step's HTTPS POST, a single
+    // bounded (shortened-timeout) blocking call - see its own comment in the
+    // .cpp for why a full non-blocking HTTP client is out of scope for this
+    // pass. Returns true once the attempt has concluded (authPhase is
+    // SUCCESS or FAILED this call); false while still in flight.
+    bool pollAuthStateMachine();
+
+    // Orchestrates the boot-time auth flow synchronously: at this point in
+    // the boot sequence (called only from begin(), before any growth cycle
+    // or dosing can possibly be in progress - AutomationManager always
+    // starts in SENSOR_STABILIZATION) a bounded local poll loop is
+    // acceptable, so this is the one place this class still blocks its
+    // caller - every RUNTIME recovery attempt (beginFirebaseRecovery()/
+    // pollFirebaseRecovery(), reachable at any time, including mid-dose)
+    // drives the identical underlying state machine non-blockingly instead,
+    // one step per FirebaseManager::update() call. Returns false if no
+    // credential worked.
     bool trySecureAuthentication();
 
     // Restores a previously-established identity from a persisted refresh
     // token (Firebase.setCustomToken() auto-detects a non-JWT-shaped string
     // as a refresh token and performs a refresh-grant sign-in directly - see
-    // FirebaseCore.cpp's own signer logic - no bootstrap call needed).
+    // FirebaseCore.cpp's own signer logic - no bootstrap call needed). Kicks
+    // off Firebase.begin() and returns immediately; WAIT_REFRESH_READY polls
+    // Firebase.ready() non-blockingly for the actual result.
     bool restoreFromRefreshToken(const String& refreshToken);
 
-    // Calls the HTTPS bootstrap endpoint with {mac, deviceSecret}, exchanges
-    // the returned custom token for a full Firebase identity, and persists
-    // the resulting refresh token. The secret is never logged and is only
-    // ever held in local variables that go out of scope when this returns.
+    // Resolves the device MAC (fast, synchronous, no network) and hands the
+    // {mac, secret} pair off to a dedicated background FreeRTOS task (see
+    // bootstrapHttpTaskFn()) that performs the actual HTTPS POST - this
+    // function itself returns immediately, never blocking the caller.
+    // Returns false only if the MAC isn't resolvable yet or the background
+    // task could not be created (e.g. out of heap); WAIT_BOOTSTRAP_HTTP polls
+    // for the task's result non-blockingly. The secret is copied into
+    // bootstrapHttpSecret for the task's own use and cleared the moment the
+    // task is done with it; never logged, never echoed anywhere.
     bool bootstrapSecureAuth(const String& secret);
+
+    // Background bootstrap-HTTP task infrastructure. The ONLY genuinely
+    // blocking primitive left in the auth path (HTTPClient::POST() - the
+    // stock Arduino HTTPClient has no non-blocking POST) now runs on this
+    // dedicated, short-lived task instead of inline in
+    // FirebaseManager::update(), so the main loop task is never blocked by
+    // it, even for the shortened 5s timeout. Thread-safety boundary,
+    // deliberately narrow: the task touches ONLY its own local
+    // NetworkClientSecure/HTTPClient/FirebaseJson objects and the plain
+    // result fields below - it NEVER calls into the Firebase library (no
+    // Firebase.*, no fbdo, no config/auth access) and never touches any
+    // AutomationManager/ActuatorManager/SystemState field. Every actual
+    // Firebase library call (Firebase.setCustomToken()/Firebase.begin()/
+    // Firebase.ready()) still happens only in the main loop task, exactly as
+    // before - so no Firebase library call is ever made from more than one
+    // task. The task is pinned to the same core the main loop task is
+    // running on (captured at kickoff via xPortGetCoreID(), not assumed) so
+    // the two are always time-sliced, never truly concurrent, which removes
+    // any cross-core cache-visibility question for the plain bool/String
+    // handoff below - xSemaphoreGive()/xSemaphoreTake() still provide the
+    // actual synchronization guarantee regardless.
+    SemaphoreHandle_t bootstrapHttpDoneSemaphore = nullptr;
+    // Set true (main task) the instant the task is created; set false (main
+    // task only, never by the task itself) once WAIT_BOOTSTRAP_HTTP has
+    // consumed its result - guards against ever starting a second task while
+    // one is still in flight. Not touched by the task.
+    bool bootstrapHttpTaskActive = false;
+    // Written only by the main task before creating the background task;
+    // read only by the task itself (which makes its own local copies before
+    // any Firebase/library call could plausibly reenter this class).
+    String bootstrapHttpMac;
+    String bootstrapHttpSecret;
+    // Written only by the task, only before it calls xSemaphoreGive(); read
+    // only by the main task, only after xSemaphoreTake() succeeds - a strict
+    // single-writer-then-signal, single-reader-after-signal handoff.
+    bool bootstrapHttpResultSuccess = false;
+    String bootstrapHttpResultToken;
+    String bootstrapHttpResultDeviceId;
+
+    // Task entry point. Static (FreeRTOS task functions cannot be non-static
+    // member functions); `arg` is the owning FirebaseManager instance,
+    // passed explicitly at creation. Self-deletes (vTaskDelete(nullptr)) as
+    // its last action after giving bootstrapHttpDoneSemaphore.
+    static void bootstrapHttpTaskFn(void* arg);
+
+    // Persists a rotated/new refresh token once WAIT_REFRESH_READY/
+    // WAIT_BOOTSTRAP_READY confirms Firebase.ready() - split out of
+    // restoreFromRefreshToken()/bootstrapSecureAuth() themselves since that
+    // confirmation no longer happens synchronously inside either of them.
+    void onRefreshTokenAuthSucceeded();
+    void onBootstrapAuthSucceeded();
 
     void loadDeviceAuthCredentials();
     void saveRefreshToken(const String& token);
@@ -287,14 +403,17 @@ private:
     // at 15s, doubles on each subsequent cooldown entry, capped at 60s.
     void enterFirebaseCooldown();
 
-    // One bounded, controlled reconnect attempt: re-runs the same
-    // trySecureAuthentication()/legacy-fallback flow begin() already uses
-    // (auth state and NVS credentials are untouched - only the transport
-    // session is torn down and re-established), then polls Firebase.ready()
-    // with the same 10s bound used everywhere else in this class. Returns
-    // true and moves to HEALTHY on success; returns false and re-enters
-    // COOLDOWN with escalated backoff on failure.
-    bool attemptFirebaseRecovery();
+    // Non-blocking recovery (critical verification report, Priority 1).
+    // beginFirebaseRecovery() tears down the possibly-stuck transport
+    // session and kicks off the SAME auth state machine begin() uses (auth
+    // state and NVS credentials are untouched), then returns immediately -
+    // called once, from update(), the instant COOLDOWN's backoff window
+    // elapses. pollFirebaseRecovery() advances that attempt by one bounded
+    // step per subsequent update() call while firebaseHealth stays
+    // RECOVERING, and moves to HEALTHY on success or back to COOLDOWN with
+    // escalated backoff on failure once the state machine concludes.
+    void beginFirebaseRecovery();
+    void pollFirebaseRecovery();
 
     //==================================================
     // Operation Protocol

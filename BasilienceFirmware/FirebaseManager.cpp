@@ -22,7 +22,21 @@ constexpr unsigned long UPLOAD_INTERVAL        = 10000;
 // diagnostic's own "is the main heartbeat current" check) now uses this
 // constant instead, so both track the same real cadence; every other
 // UPLOAD_INTERVAL use is untouched.
-constexpr unsigned long SENSOR_UPLOAD_INTERVAL_MS = 1000;
+//
+// Uniform sensor snapshot task: this is now specifically the APP/CLOUD live
+// snapshot interval, set to 5s per that task's explicit requirement -
+// superseding the earlier as-fast-as-possible quick-response goal for this
+// one cadence. Every value writeSensors() publishes already lands in one
+// FirebaseJson object under one atomic writeJson() call with one shared
+// "timestamp" field (see writeSensors() below), so widening this interval is
+// the only change needed to turn that into a real 5-second grouped snapshot.
+// Deliberately NOT touching: each physical sensor's own read timer (DHT/
+// DS18B20/water-level stay on their existing 5000ms cadence, EC/pH keep
+// their continuous ADC sampling - Config.h), writeActuators() (fully
+// independent, event-driven on isStatusDirty(), never gated by this
+// constant), or anything AutomationManager reads directly from sensors/
+// physicalSensors every loop() tick - none of those go through this path.
+constexpr unsigned long SENSOR_UPLOAD_INTERVAL_MS = 5000;
 constexpr unsigned long DEVICE_INFO_INTERVAL   = 15000;
 constexpr unsigned long REALTIME_FALLBACK_INTERVAL = 60000;
 constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
@@ -332,14 +346,24 @@ void FirebaseManager::begin()
     // this fall back to legacy anonymous auth - and only while
     // SECURE_DEVICE_AUTH_REQUIRED is false, so already-fielded devices
     // (including the current test unit, pending its one-time secret
-    // injection) are never locked out by this change alone.
+    // injection) are never locked out by this change alone. Critical
+    // verification report, Priority 1: trySecureAuthentication() now
+    // internally cascades through the legacy fallback too (see
+    // pollAuthStateMachine()'s TRY_LEGACY_SIGNUP state) when applicable, so
+    // this is the ONLY place that fallback is attempted - see
+    // authSucceededViaLegacy below for how this function tells which method
+    // actually succeeded without duplicating the attempt.
     bool authenticated = trySecureAuthentication();
 
-    if (authenticated)
+    if (authenticated && !authSucceededViaLegacy)
     {
         Serial.println("[FIREBASE-AUTH] Secure device identity active");
         Serial.print("[FIREBASE-AUTH] uid=");
         Serial.println(deviceId);
+    }
+    else if (authenticated && authSucceededViaLegacy)
+    {
+        Serial.println("[SECURITY] Legacy Firebase auth compatibility mode active");
     }
     else if (SECURE_DEVICE_AUTH_REQUIRED)
     {
@@ -353,24 +377,9 @@ void FirebaseManager::begin()
     }
     else
     {
-        Serial.println("[SECURITY] Legacy Firebase auth compatibility mode active");
-        if (Firebase.signUp(
-                &config,
-                &auth,
-                "",
-                ""))
-        {
-            Serial.println("Firebase SignUp OK");
-        }
-        else
-        {
-            Serial.print("Firebase SignUp Failed: ");
-            Serial.println(config.signer.signupError.message.c_str());
-        }
-
-        Firebase.begin(
-            &config,
-            &auth);
+        // trySecureAuthentication() already attempted the legacy anonymous
+        // fallback internally and it also failed - nothing further to try.
+        Serial.println("[FIREBASE-AUTH] All available authentication methods failed this boot");
     }
 
     // ROOT CAUSE of the observed reconnect loop (see task report): true here
@@ -390,7 +399,7 @@ void FirebaseManager::begin()
     // (failing/degrading Firebase operations when Wi-Fi is actually down)
     // instead of acting on it. reconnectWiFi() is deprecated in this
     // library version in favor of reconnectNetwork(), used here instead.
-    // Same fix applied at the other call site in attemptFirebaseRecovery().
+    // Same fix applied at the other call site in beginFirebaseRecovery().
     Firebase.reconnectNetwork(false);
 
 Serial.print("Loaded Device ID: [");
@@ -791,12 +800,26 @@ void FirebaseManager::update()
     // safety, actuators, GSM, and the NVS notification queue are entirely
     // unaffected - they already ran before this function was ever called
     // (see loop(), and Part 12 of the report this task produces).
+    //
+    // Critical verification report, Priority 1: recovery itself is now
+    // non-blocking. beginFirebaseRecovery() only kicks off the auth state
+    // machine and returns immediately; RECOVERING is a real, possibly
+    // multi-tick state now (it used to be set and resolved within one
+    // synchronous call), polled one bounded step at a time by
+    // pollFirebaseRecovery() below on every subsequent update() call until
+    // it concludes into HEALTHY or back into COOLDOWN.
     if (firebaseHealth == FirebaseHealthState::COOLDOWN)
     {
         if (millis() - cooldownStartedAt >= cooldownDurationMs)
         {
-            attemptFirebaseRecovery();
+            beginFirebaseRecovery();
         }
+        return;
+    }
+
+    if (firebaseHealth == FirebaseHealthState::RECOVERING)
+    {
+        pollFirebaseRecovery();
         return;
     }
 
@@ -1847,72 +1870,290 @@ void FirebaseManager::provisionDevice()
 // Secure Device Auth
 //==================================================
 
+// Critical verification report, Priority 1: begin() is the one place this
+// class still blocks its own caller - see the header comment on this
+// declaration for why that is acceptable here (boot-time only, before any
+// growth cycle or dosing can possibly be running) and why every RUNTIME
+// recovery attempt instead drives pollAuthStateMachine() non-blockingly.
 bool FirebaseManager::trySecureAuthentication()
 {
+    startAuthAttempt();
+    while (!pollAuthStateMachine())
+    {
+        delay(50);
+    }
+    return authPhase == FirebaseAuthPhase::SUCCESS;
+}
+
+// Decides the first reachable phase from whichever credentials are
+// currently persisted. Performs no network call itself.
+void FirebaseManager::startAuthAttempt()
+{
     loadDeviceAuthCredentials();
+    authSucceededViaLegacy = false;
 
     if (deviceAuthRefreshToken.length() > 0)
     {
-        Serial.println("[SECURITY] Stored refresh token found");
-        if (restoreFromRefreshToken(deviceAuthRefreshToken))
-        {
-            Serial.println("[SECURITY] Refresh-token authentication succeeded");
-            return true;
-        }
-        Serial.println("[SECURITY] Refresh-token authentication failed");
+        authPhase = FirebaseAuthPhase::TRY_REFRESH_TOKEN;
     }
-
-    if (deviceAuthSecret.length() > 0)
+    else if (deviceAuthSecret.length() > 0)
     {
-        Serial.println("[SECURITY] Stored device secret found");
-        if (bootstrapSecureAuth(deviceAuthSecret))
-        {
-            return true;
-        }
-        Serial.println("[FIREBASE-AUTH] Bootstrap failed");
+        authPhase = FirebaseAuthPhase::TRY_DEVICE_SECRET;
     }
-
-    return false;
+    else if (!SECURE_DEVICE_AUTH_REQUIRED)
+    {
+        authPhase = FirebaseAuthPhase::TRY_LEGACY_SIGNUP;
+    }
+    else
+    {
+        authPhase = FirebaseAuthPhase::FAILED;
+    }
 }
 
-bool FirebaseManager::restoreFromRefreshToken(const String& refreshToken)
+// Advances the auth state machine by exactly one bounded step. Every WAIT_*
+// state does a single, immediate Firebase.ready() check against a millis()
+// deadline - never a loop, never a delay - so the 10-second bound each one
+// enforces is spread across many FirebaseManager::update() calls instead of
+// being spent inside one blocking call.
+bool FirebaseManager::pollAuthStateMachine()
 {
-    // A string that is not shaped like a JWT (header.payload.signature) is
-    // auto-detected by this library as a bare refresh token and triggers a
-    // refresh-grant sign-in directly against Google's securetoken endpoint -
-    // confirmed against FirebaseCore.cpp's own signer logic, not assumed
-    // from documentation alone. No bootstrap call is made on this path.
-    Firebase.setCustomToken(&config, refreshToken);
-    Firebase.begin(&config, &auth);
-
-    // Bounded wait, consistent with this same begin() sequence's existing
-    // tolerance for a one-time blocking network step at Wi-Fi-connect time
-    // (the anonymous signUp() this replaces already blocked synchronously
-    // here) - not a new blocking pattern, and not part of the per-iteration
-    // main loop this firmware keeps non-blocking elsewhere.
-    unsigned long startedAt = millis();
-    while (!Firebase.ready() && millis() - startedAt < 10000UL)
+    // Opportunistic drain, every call, regardless of phase: reclaims a
+    // bootstrap-HTTP task's completion signal even after WAIT_BOOTSTRAP_HTTP
+    // has already given up on it (its own defensive timeout below). This is
+    // the ONLY place bootstrapHttpTaskActive is cleared outside that state's
+    // own normal success path, and it is what makes a later
+    // bootstrapSecureAuth() call safe: it refuses to start a second task
+    // (see its own bootstrapHttpTaskActive guard) until the OLD task is
+    // CONFIRMED finished - via this drain actually observing its semaphore
+    // give - never merely "we stopped waiting for it." Without this, a
+    // still-running abandoned task and a freshly-started one could both
+    // write bootstrapHttpResult*/bootstrapHttpMac/bootstrapHttpSecret at the
+    // same time, which is exactly the shared-state race this design must
+    // not introduce.
+    if (bootstrapHttpTaskActive && authPhase != FirebaseAuthPhase::WAIT_BOOTSTRAP_HTTP &&
+        bootstrapHttpDoneSemaphore != nullptr &&
+        xSemaphoreTake(bootstrapHttpDoneSemaphore, 0) == pdTRUE)
     {
-        delay(100);
+        bootstrapHttpTaskActive = false;
+        bootstrapHttpResultToken = "";
+        bootstrapHttpResultSuccess = false;
+        bootstrapHttpResultDeviceId = "";
     }
 
-    if (!Firebase.ready())
+    switch (authPhase)
     {
-        return false;
-    }
+        case FirebaseAuthPhase::IDLE:
+        case FirebaseAuthPhase::SUCCESS:
+        case FirebaseAuthPhase::FAILED:
+            return true;
 
+        case FirebaseAuthPhase::TRY_REFRESH_TOKEN:
+        {
+            Serial.println("[SECURITY] Stored refresh token found");
+            // A string that is not shaped like a JWT (header.payload.
+            // signature) is auto-detected by this library as a bare refresh
+            // token and triggers a refresh-grant sign-in directly against
+            // Google's securetoken endpoint - confirmed against
+            // FirebaseCore.cpp's own signer logic, not assumed from
+            // documentation alone. No bootstrap call is made on this path.
+            // restoreFromRefreshToken() only kicks this off now - it no
+            // longer waits for the result itself.
+            restoreFromRefreshToken(deviceAuthRefreshToken);
+            authPhaseStartedAt = millis();
+            authPhase = FirebaseAuthPhase::WAIT_REFRESH_READY;
+            return false;
+        }
+
+        case FirebaseAuthPhase::WAIT_REFRESH_READY:
+            if (Firebase.ready())
+            {
+                Serial.println("[SECURITY] Refresh-token authentication succeeded");
+                onRefreshTokenAuthSucceeded();
+                authPhase = FirebaseAuthPhase::SUCCESS;
+                return true;
+            }
+            if (millis() - authPhaseStartedAt >= 10000UL)
+            {
+                Serial.println("[SECURITY] Refresh-token authentication failed");
+                if (deviceAuthSecret.length() > 0)
+                {
+                    authPhase = FirebaseAuthPhase::TRY_DEVICE_SECRET;
+                }
+                else if (!SECURE_DEVICE_AUTH_REQUIRED)
+                {
+                    authPhase = FirebaseAuthPhase::TRY_LEGACY_SIGNUP;
+                }
+                else
+                {
+                    authPhase = FirebaseAuthPhase::FAILED;
+                    return true;
+                }
+            }
+            return false;
+
+        case FirebaseAuthPhase::TRY_DEVICE_SECRET:
+        {
+            Serial.println("[SECURITY] Stored device secret found");
+            // bootstrapSecureAuth() only resolves the MAC and starts the
+            // background HTTP task now (see its own comment) - it does not
+            // block. WAIT_BOOTSTRAP_HTTP below polls for that task's result.
+            const bool kickedOff = bootstrapSecureAuth(deviceAuthSecret);
+            if (!kickedOff)
+            {
+                Serial.println("[FIREBASE-AUTH] Bootstrap failed");
+                authPhase = (!SECURE_DEVICE_AUTH_REQUIRED)
+                    ? FirebaseAuthPhase::TRY_LEGACY_SIGNUP
+                    : FirebaseAuthPhase::FAILED;
+                return authPhase == FirebaseAuthPhase::FAILED;
+            }
+            authPhaseStartedAt = millis();
+            authPhase = FirebaseAuthPhase::WAIT_BOOTSTRAP_HTTP;
+            return false;
+        }
+
+        case FirebaseAuthPhase::WAIT_BOOTSTRAP_HTTP:
+        {
+            // Non-blocking check (0 tick timeout - a pure poll, never a
+            // wait): true only once bootstrapHttpTaskFn() has already
+            // called xSemaphoreGive() and is on its way to self-deleting.
+            if (xSemaphoreTake(bootstrapHttpDoneSemaphore, 0) == pdTRUE)
+            {
+                bootstrapHttpTaskActive = false;
+
+                if (!bootstrapHttpResultSuccess || bootstrapHttpResultToken.isEmpty())
+                {
+                    bootstrapHttpResultToken = "";
+                    authPhase = (!SECURE_DEVICE_AUTH_REQUIRED)
+                        ? FirebaseAuthPhase::TRY_LEGACY_SIGNUP
+                        : FirebaseAuthPhase::FAILED;
+                    return authPhase == FirebaseAuthPhase::FAILED;
+                }
+
+                if (deviceId.isEmpty() && !bootstrapHttpResultDeviceId.isEmpty())
+                {
+                    saveDeviceId(bootstrapHttpResultDeviceId);
+                }
+
+                // Kick-off only from here - Firebase.ready() confirmation is
+                // WAIT_BOOTSTRAP_READY below, polled non-blockingly. This is
+                // the only place the minted token is used, and only in the
+                // main loop task.
+                Firebase.setCustomToken(&config, bootstrapHttpResultToken);
+                bootstrapHttpResultToken = "";
+                Firebase.begin(&config, &auth);
+
+                authPhaseStartedAt = millis();
+                authPhase = FirebaseAuthPhase::WAIT_BOOTSTRAP_READY;
+                return false;
+            }
+
+            // Defensive outer bound only - the task's own 5s HTTPClient
+            // timeout should always resolve first. Guards against a
+            // genuinely stuck task (e.g. a lower-level lwIP/mbedTLS hang
+            // outside HTTPClient's own timeout) rather than waiting forever.
+            // Deliberately does NOT clear bootstrapHttpTaskActive here - the
+            // task may still be genuinely running, and clearing it now would
+            // let a later bootstrapSecureAuth() call start a second task
+            // while this one could still be mid-write to the shared result
+            // fields. It is abandoned (this auth attempt moves on without
+            // it) but not forgotten: the top-of-function drain above is what
+            // safely reclaims bootstrapHttpTaskActive, and only once this
+            // task is CONFIRMED finished.
+            if (millis() - authPhaseStartedAt >= 8000UL)
+            {
+                Serial.println("[FIREBASE-AUTH] Bootstrap task did not complete in time; abandoning it");
+                authPhase = (!SECURE_DEVICE_AUTH_REQUIRED)
+                    ? FirebaseAuthPhase::TRY_LEGACY_SIGNUP
+                    : FirebaseAuthPhase::FAILED;
+                return authPhase == FirebaseAuthPhase::FAILED;
+            }
+            return false;
+        }
+
+        case FirebaseAuthPhase::WAIT_BOOTSTRAP_READY:
+            if (Firebase.ready())
+            {
+                Serial.println("[SECURITY] Firebase custom-token authentication succeeded");
+                onBootstrapAuthSucceeded();
+                authPhase = FirebaseAuthPhase::SUCCESS;
+                return true;
+            }
+            if (millis() - authPhaseStartedAt >= 10000UL)
+            {
+                Serial.println("[FIREBASE-AUTH] Sign-in with minted token did not complete");
+                authPhase = (!SECURE_DEVICE_AUTH_REQUIRED)
+                    ? FirebaseAuthPhase::TRY_LEGACY_SIGNUP
+                    : FirebaseAuthPhase::FAILED;
+                return authPhase == FirebaseAuthPhase::FAILED;
+            }
+            return false;
+
+        case FirebaseAuthPhase::TRY_LEGACY_SIGNUP:
+            Serial.println("[SECURITY] Legacy Firebase auth compatibility mode active");
+            if (Firebase.signUp(&config, &auth, "", ""))
+            {
+                Serial.println("Firebase SignUp OK");
+            }
+            else
+            {
+                Serial.print("Firebase SignUp Failed: ");
+                Serial.println(config.signer.signupError.message.c_str());
+            }
+            Firebase.begin(&config, &auth);
+            authPhaseStartedAt = millis();
+            authPhase = FirebaseAuthPhase::WAIT_LEGACY_READY;
+            return false;
+
+        case FirebaseAuthPhase::WAIT_LEGACY_READY:
+            if (Firebase.ready())
+            {
+                authSucceededViaLegacy = true;
+                authPhase = FirebaseAuthPhase::SUCCESS;
+                return true;
+            }
+            if (millis() - authPhaseStartedAt >= 10000UL)
+            {
+                authPhase = FirebaseAuthPhase::FAILED;
+                return true;
+            }
+            return false;
+    }
+    return true;
+}
+
+void FirebaseManager::onRefreshTokenAuthSucceeded()
+{
     // The refresh-grant response can rotate the refresh token, not just the
     // short-lived ID token. Re-persisting here (in addition to the bootstrap
     // path) ensures NVS always holds whatever token the library is currently
     // using, instead of a possibly-superseded one from a prior boot.
     const char* rotatedRefreshToken = Firebase.getRefreshToken();
     if (rotatedRefreshToken != nullptr && strlen(rotatedRefreshToken) > 0
-        && refreshToken != rotatedRefreshToken)
+        && deviceAuthRefreshToken != rotatedRefreshToken)
     {
         saveRefreshToken(String(rotatedRefreshToken));
         Serial.println("[SECURITY] Refresh token persisted");
     }
+}
 
+void FirebaseManager::onBootstrapAuthSucceeded()
+{
+    const char* newRefreshToken = Firebase.getRefreshToken();
+    if (newRefreshToken != nullptr && strlen(newRefreshToken) > 0)
+    {
+        saveRefreshToken(String(newRefreshToken));
+        Serial.println("[SECURITY] Refresh token persisted");
+    }
+}
+
+bool FirebaseManager::restoreFromRefreshToken(const String& refreshToken)
+{
+    // Kick-off only (critical verification report, Priority 1) - this used
+    // to also block here waiting for Firebase.ready(); that wait is now
+    // pollAuthStateMachine()'s WAIT_REFRESH_READY state, polled non-
+    // blockingly once per FirebaseManager::update() call instead.
+    Firebase.setCustomToken(&config, refreshToken);
+    Firebase.begin(&config, &auth);
     return true;
 }
 
@@ -1920,7 +2161,8 @@ bool FirebaseManager::bootstrapSecureAuth(const String& secret)
 {
     // Wire format sent to BOOTSTRAP_ENDPOINT_URL below is unchanged
     // (colon-separated, e.g. "AA:BB:CC:DD:EE:FF") - only the underlying
-    // source is now the hardware-level read, not WiFi.macAddress().
+    // source is now the hardware-level read, not WiFi.macAddress(). Fast,
+    // synchronous, no network - safe to resolve here in the main task.
     String mac = getFormattedMacAddress();
     if (mac.isEmpty())
     {
@@ -1931,95 +2173,170 @@ bool FirebaseManager::bootstrapSecureAuth(const String& secret)
         return false;
     }
 
+    if (bootstrapHttpTaskActive)
+    {
+        // Defensive only - the auth state machine never re-enters
+        // TRY_DEVICE_SECRET while a previous attempt's task could still be
+        // in flight, but refuse to double-launch rather than assume that.
+        Serial.println("[FIREBASE-AUTH] Bootstrap task already in flight; not starting another");
+        return false;
+    }
+
+    if (bootstrapHttpDoneSemaphore == nullptr)
+    {
+        bootstrapHttpDoneSemaphore = xSemaphoreCreateBinary();
+        if (bootstrapHttpDoneSemaphore == nullptr)
+        {
+            Serial.println("[FIREBASE-AUTH] Unable to allocate bootstrap semaphore");
+            return false;
+        }
+    }
+    // Binary semaphore starts "empty" after creation, but clear defensively
+    // in case a previous attempt's give was never consumed (there should
+    // never be one outstanding here, since bootstrapHttpTaskActive already
+    // guards re-entry - this is a zero-cost safety net, not a workaround).
+    xSemaphoreTake(bootstrapHttpDoneSemaphore, 0);
+
+    bootstrapHttpMac = mac;
+    bootstrapHttpSecret = secret;
+    bootstrapHttpResultSuccess = false;
+    bootstrapHttpResultToken = "";
+    bootstrapHttpResultDeviceId = "";
+
+    // Pin to whichever core is calling this (the main loop task) rather than
+    // assuming ARDUINO_RUNNING_CORE, so the two are always time-sliced on
+    // the same core and never truly concurrent - see the header comment on
+    // bootstrapHttpDoneSemaphore for why that matters here.
+    const BaseType_t targetCore = xPortGetCoreID();
+    TaskHandle_t createdHandle = nullptr;
+    // 12KB: mbedTLS's TLS handshake buffers need more than the default 4KB
+    // Arduino loop-task-sized stack would give a new task; 12KB is the
+    // commonly-recommended floor for an HTTPS-over-TLS task on this
+    // platform, with margin above the deepest call chain here (HTTPClient ->
+    // NetworkClientSecure -> mbedTLS, plus FirebaseJson parsing).
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        &FirebaseManager::bootstrapHttpTaskFn,
+        "fbBootstrapHttp",
+        12288,
+        this,
+        1,
+        &createdHandle,
+        targetCore);
+
+    if (created != pdPASS || createdHandle == nullptr)
+    {
+        Serial.println("[FIREBASE-AUTH] Unable to start bootstrap HTTP task");
+        bootstrapHttpSecret = "";
+        return false;
+    }
+
+    bootstrapHttpTaskActive = true;
+    Serial.println("[SECURITY] Requesting device bootstrap token (background task)");
+    return true;
+}
+
+// Runs entirely off the main loop task - see the header comment on
+// bootstrapHttpDoneSemaphore for the exact thread-safety boundary this
+// function must never cross (no Firebase.*, no fbdo, no config/auth, no
+// AutomationManager/ActuatorManager/SystemState access). Logic here is
+// otherwise unchanged from the original inline implementation.
+void FirebaseManager::bootstrapHttpTaskFn(void* arg)
+{
+    FirebaseManager* self = static_cast<FirebaseManager*>(arg);
+
+    // Local copies only - never touches any field other than the
+    // designated bootstrapHttp*/bootstrapHttpResult* handoff fields below,
+    // and only writes those once, right before signaling done.
+    const String mac = self->bootstrapHttpMac;
+    const String secret = self->bootstrapHttpSecret;
+
+    bool success = false;
+    String resultToken;
+    String resultDeviceId;
+
     NetworkClientSecure secureClient;
     secureClient.setCACert(BOOTSTRAP_CA_CERT);
 
     HTTPClient http;
-    http.setTimeout(15000);
+    // Still a single bounded blocking call - the stock Arduino HTTPClient
+    // has no non-blocking POST - but it now blocks only THIS task, never the
+    // main loop task, so 5s here no longer has any bearing on
+    // FirebaseManager::update()'s own timing.
+    http.setTimeout(5000);
     if (!http.begin(secureClient, BOOTSTRAP_ENDPOINT_URL))
     {
         Serial.println("[FIREBASE-AUTH] Unable to open bootstrap connection");
-        return false;
     }
-    http.addHeader("Content-Type", "application/json");
-
-    FirebaseJson payload;
-    payload.set("mac", mac);
-    payload.set("deviceSecret", secret);
-    String body;
-    payload.toString(body);
-
-    Serial.println("[SECURITY] Requesting device bootstrap token");
-    int httpCode = http.POST(body);
-    // The secret existed only in `payload`/`body`, local to this function -
-    // cleared immediately after send; never logged, never echoed anywhere.
-    body = "";
-    payload.clear();
-
-    if (httpCode != 200)
+    else
     {
-        Serial.print("[FIREBASE-AUTH] Bootstrap rejected, HTTP ");
-        Serial.println(httpCode);
-        http.end();
-        return false;
+        http.addHeader("Content-Type", "application/json");
+
+        FirebaseJson payload;
+        payload.set("mac", mac);
+        payload.set("deviceSecret", secret);
+        String body;
+        payload.toString(body);
+
+        int httpCode = http.POST(body);
+        // The secret existed only in `payload`/`body`/the local `secret`
+        // copy above, all local to this task - cleared immediately after
+        // send; never logged, never echoed anywhere.
+        body = "";
+        payload.clear();
+
+        if (httpCode != 200)
+        {
+            Serial.print("[FIREBASE-AUTH] Bootstrap rejected, HTTP ");
+            Serial.println(httpCode);
+            http.end();
+        }
+        else
+        {
+            String response = http.getString();
+            http.end();
+
+            FirebaseJson responseJson;
+            responseJson.setJsonData(response);
+            FirebaseJsonData field;
+
+            String customToken;
+            if (responseJson.get(field, "customToken")) customToken = field.stringValue;
+
+            // deviceId is not secret (it is already the Firestore claim code
+            // shown to Admins during claiming) - returned alongside the
+            // token purely so a first-time device that has not yet
+            // persisted a deviceId can learn the server-resolved one
+            // without a separate /provisioning read.
+            String resolvedDeviceId;
+            if (responseJson.get(field, "deviceId")) resolvedDeviceId = field.stringValue;
+
+            response = "";
+
+            if (customToken.isEmpty())
+            {
+                Serial.println("[FIREBASE-AUTH] Bootstrap response missing token");
+            }
+            else
+            {
+                Serial.println("[SECURITY] Bootstrap succeeded");
+                success = true;
+                resultToken = customToken;
+                resultDeviceId = resolvedDeviceId;
+                customToken = "";
+            }
+        }
     }
 
-    String response = http.getString();
-    http.end();
+    // Single-writer handoff: this task writes these fields exactly once,
+    // here, before signaling - the main task must not read them until it
+    // has observed the semaphore.
+    self->bootstrapHttpResultSuccess = success;
+    self->bootstrapHttpResultToken = resultToken;
+    self->bootstrapHttpResultDeviceId = resultDeviceId;
+    self->bootstrapHttpSecret = "";
 
-    FirebaseJson responseJson;
-    responseJson.setJsonData(response);
-    FirebaseJsonData field;
-
-    String customToken;
-    if (responseJson.get(field, "customToken")) customToken = field.stringValue;
-
-    // deviceId is not secret (it is already the Firestore claim code shown
-    // to Admins during claiming) - returned alongside the token purely so a
-    // first-time device that has not yet persisted a deviceId can learn the
-    // server-resolved one without a separate /provisioning read.
-    String resolvedDeviceId;
-    if (responseJson.get(field, "deviceId")) resolvedDeviceId = field.stringValue;
-
-    response = "";
-
-    if (customToken.isEmpty())
-    {
-        Serial.println("[FIREBASE-AUTH] Bootstrap response missing token");
-        return false;
-    }
-    Serial.println("[SECURITY] Bootstrap succeeded");
-
-    if (deviceId.isEmpty() && !resolvedDeviceId.isEmpty())
-    {
-        saveDeviceId(resolvedDeviceId);
-    }
-
-    Firebase.setCustomToken(&config, customToken);
-    customToken = "";
-    Firebase.begin(&config, &auth);
-
-    unsigned long startedAt = millis();
-    while (!Firebase.ready() && millis() - startedAt < 10000UL)
-    {
-        delay(100);
-    }
-
-    if (!Firebase.ready())
-    {
-        Serial.println("[FIREBASE-AUTH] Sign-in with minted token did not complete");
-        return false;
-    }
-    Serial.println("[SECURITY] Firebase custom-token authentication succeeded");
-
-    const char* newRefreshToken = Firebase.getRefreshToken();
-    if (newRefreshToken != nullptr && strlen(newRefreshToken) > 0)
-    {
-        saveRefreshToken(String(newRefreshToken));
-        Serial.println("[SECURITY] Refresh token persisted");
-    }
-
-    return true;
+    xSemaphoreGive(self->bootstrapHttpDoneSemaphore);
+    vTaskDelete(nullptr);
 }
 
 void FirebaseManager::loadDeviceAuthCredentials()
@@ -2182,7 +2499,13 @@ void FirebaseManager::enterFirebaseCooldown()
     Serial.println("[FIREBASE-HEALTH] Skipping low-priority sync during cooldown");
 }
 
-bool FirebaseManager::attemptFirebaseRecovery()
+// Critical verification report, Priority 1. Called exactly once, from
+// update(), the instant COOLDOWN's backoff window elapses. Tears down the
+// possibly-stuck transport session and kicks off the auth state machine,
+// then returns immediately - no network wait happens here. firebaseHealth
+// is set to RECOVERING immediately so update()'s dispatch starts polling it
+// on the very next call.
+void FirebaseManager::beginFirebaseRecovery()
 {
     firebaseHealth = FirebaseHealthState::RECOVERING;
     Serial.println("[FIREBASE-HEALTH] Recovery attempt");
@@ -2196,42 +2519,45 @@ bool FirebaseManager::attemptFirebaseRecovery()
     fbdo.stopWiFiClient();
     fbdo.clear();
 
-    // Re-run exactly the same auth flow begin() uses at boot: secure
+    // Same reasoning as FirebaseManager::begin(): WiFiManager, not this
+    // library, owns Wi-Fi reconnection - this only permits the library to
+    // resume its own RTDB/auth transport once Wi-Fi is already back.
+    Firebase.reconnectNetwork(false);
+
+    // Re-runs exactly the same auth flow begin() uses at boot: secure
     // identity first (refresh token, then secret bootstrap - both read the
     // same persisted NVS credentials, untouched by recovery), falling back
     // to legacy anonymous auth only in migration compatibility mode. No
-    // credentials are cleared or regenerated by this path.
-    bool authenticated = trySecureAuthentication();
-    if (!authenticated && !SECURE_DEVICE_AUTH_REQUIRED)
+    // credentials are cleared or regenerated by this path. Non-blocking:
+    // this only decides the first phase, it performs no network call itself.
+    startAuthAttempt();
+}
+
+// Called from update() every tick while firebaseHealth stays RECOVERING.
+// Advances the same state machine begin() drives, one bounded step per
+// call - see pollAuthStateMachine()'s own comment for exactly how small
+// each step is.
+void FirebaseManager::pollFirebaseRecovery()
+{
+    if (!pollAuthStateMachine())
     {
-        if (Firebase.signUp(&config, &auth, "", ""))
-        {
-            Firebase.begin(&config, &auth);
-        }
+        return;
     }
 
-    // Same reasoning as FirebaseManager::begin() above: WiFiManager, not
-    // this library, owns Wi-Fi reconnection.
-    Firebase.reconnectNetwork(false);
-
-    unsigned long startedAt = millis();
-    while (!Firebase.ready() && millis() - startedAt < 10000UL)
-    {
-        delay(100);
-    }
-
-    if (Firebase.ready())
+    if (authPhase == FirebaseAuthPhase::SUCCESS)
     {
         Serial.println("[FIREBASE-HEALTH] Recovery succeeded");
         firebaseHealth = FirebaseHealthState::HEALTHY;
         transportFailureStreak = 0;
         cooldownDurationMs = 0;
-        return true;
+    }
+    else
+    {
+        Serial.println("[FIREBASE-HEALTH] Recovery failed");
+        enterFirebaseCooldown();
     }
 
-    Serial.println("[FIREBASE-HEALTH] Recovery failed");
-    enterFirebaseCooldown();
-    return false;
+    authPhase = FirebaseAuthPhase::IDLE;
 }
 
 //==================================================
@@ -3278,9 +3604,40 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     // Nutrient
     //--------------------------------------------------
 
-    if (!isnan(publishedSensors.ec)) json.set("ec", publishedSensors.ec);
-    if (!isnan(publishedSensors.tds)) json.set("tds", publishedSensors.tds);
-    if (!isnan(publishedSensors.ph)) json.set("ph", publishedSensors.ph);
+    // Quiet-monitoring/4-minute-budget correction redesign: while a pH/EC
+    // correction is actively dosing/circulating/silently settling, hold the
+    // published value at whatever was last actually published instead of
+    // tracking the live in-flight candidate every tick - only the two
+    // checkpoints (systemState.phPublishPending/ecPublishPending, set for
+    // exactly one tick by AutomationManager::handleStabilizingPH()/
+    // handleStabilizingEC()) push a fresh value. writeSensors() overwrites
+    // the whole /sensors node via setJSON() (not a merge), so simply
+    // omitting "ph"/"ec" here would DELETE the field rather than freeze it -
+    // phLastPublishedValue/ecLastPublishedValue (Types.h) is what actually
+    // gets republished during a hold.
+    const bool phCorrectionActive =
+        systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH;
+    const bool phShouldPublishFresh = !phCorrectionActive || systemState.phPublishPending;
+    systemState.phPublishPending = false;
+    if (phShouldPublishFresh && !isnan(publishedSensors.ph))
+    {
+        systemState.phLastPublishedValue = publishedSensors.ph;
+    }
+    if (!isnan(systemState.phLastPublishedValue)) json.set("ph", systemState.phLastPublishedValue);
+
+    // tds is derived from the same EC reading, so it is held/published in
+    // lockstep with ec below rather than tracked independently.
+    const bool ecCorrectionActive =
+        systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC;
+    const bool ecShouldPublishFresh = !ecCorrectionActive || systemState.ecPublishPending;
+    systemState.ecPublishPending = false;
+    if (ecShouldPublishFresh)
+    {
+        if (!isnan(publishedSensors.ec)) systemState.ecLastPublishedValue = publishedSensors.ec;
+        if (!isnan(publishedSensors.tds)) systemState.ecLastPublishedTds = publishedSensors.tds;
+    }
+    if (!isnan(systemState.ecLastPublishedValue)) json.set("ec", systemState.ecLastPublishedValue);
+    if (!isnan(systemState.ecLastPublishedTds)) json.set("tds", systemState.ecLastPublishedTds);
     // Quick-response refinement task: ph above is now the FAST TELEMETRY
     // value (the pH temporal step filter's own trusted candidate), not the
     // slower 10-sample automation-trust window's output - see
@@ -3396,9 +3753,13 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
             Serial.print("[SENSOR-SYNC] waterLevel=");
             Serial.print(publishedSensors.waterLevel, 2);
             Serial.print(" ph=");
-            Serial.print(publishedSensors.ph, 2);
+            // Reflects what was actually written to Firebase this call
+            // (systemState.phLastPublishedValue/ecLastPublishedValue), not
+            // the live in-flight candidate - the two differ while a
+            // correction is holding telemetry between checkpoints.
+            Serial.print(systemState.phLastPublishedValue, 2);
             Serial.print(" ec=");
-            Serial.print(publishedSensors.ec, 2);
+            Serial.print(systemState.ecLastPublishedValue, 2);
             Serial.print(" t=");
             Serial.println(millis());
         }
@@ -4731,10 +5092,16 @@ void FirebaseManager::writeDiagnosticSensors()
         Serial.println("[DEV TEST] EC=INVALID");
     }
 
-    // Raw ADC/voltage behind the EC reading above - diagnostic only, useful
-    // for a developer inspecting the probe's actual analog signal from the
-    // app without a serial cable. EC calibration itself is not adjustable
-    // here - the accepted calibration (Calibration.h) is unchanged.
+    // Voltage behind the EC reading above - diagnostic only, useful for a
+    // developer inspecting the probe's actual analog signal from the app
+    // without a serial cable. EC calibration itself is not adjustable here -
+    // the accepted calibration (Calibration.h) is unchanged.
+    //
+    // "ecRaw" keeps its pre-existing field/key name, but as of the EC
+    // calibration redesign it holds the same calibrated millivolt reading as
+    // ecVoltage (in mV rather than V) - no longer a raw 0-4095 ADC count.
+    // No current app code reads this field (checked at the time of this
+    // note), so nothing consumes the old meaning today.
     if (isfinite(physicalSensors.ecVoltage))
     {
         json.set("ecVoltage", physicalSensors.ecVoltage);

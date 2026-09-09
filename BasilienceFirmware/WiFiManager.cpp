@@ -1,6 +1,7 @@
 #include "WiFiManager.h"
 
 #include "Globals.h"
+#include <nvs.h>
 
 // Forward declaration: defined below, registered from begin() before any
 // connection attempt so every STA event - including the very first - is
@@ -380,7 +381,34 @@ bool WiFiManager::saveCredentials(
     const String& ssid,
     const String& password)
 {
-    preferences.begin("wifi", false);
+    // begin()'s own return value was never checked - if opening the "wifi"
+    // namespace itself fails (corrupt/stale NVS state, not necessarily out
+    // of space), every putString() below silently fails too and looks
+    // identical to a normal write failure, with no way to tell the two
+    // apart from this log. FirebaseManager.cpp already checks this same
+    // call for its own namespaces (e.g. "device_auth", "manual_cmd") - this
+    // brings saveCredentials() in line with that.
+    bool opened = preferences.begin("wifi", false);
+    if (!opened)
+    {
+        Serial.println("[WIFI] saveCredentials FAILED: could not open \"wifi\" NVS namespace for writing");
+    }
+
+    // NVS is log-structured: putString() never overwrites a key's old
+    // record in place, it appends a new one and marks the old one stale,
+    // only reclaimed once a page is later garbage-collected. Confirmed on
+    // this device via the raw ESP-IDF diagnostic below: nvs_set_str()
+    // returning ESP_ERR_NVS_NOT_ENOUGH_SPACE for both "ssid" and "password"
+    // despite freeEntries() reporting 126 free overall - that combination is
+    // NVS's classic single-page-fragmentation failure (free space exists,
+    // just not contiguous in one page), which repeated /setup submissions
+    // for the same two keys make worse over time by leaving another stale
+    // copy behind on every attempt. Erasing them first reclaims that space
+    // immediately instead of appending yet another copy - scoped to only
+    // these two keys in the "wifi" namespace, so it cannot touch
+    // "device_auth" (the Firebase bootstrap secret) or any other namespace.
+    preferences.remove("ssid");
+    preferences.remove("password");
 
     size_t ssidBytes = preferences.putString("ssid", ssid);
     size_t passwordBytes = preferences.putString("password", password);
@@ -416,6 +444,40 @@ bool WiFiManager::saveCredentials(
     if (ssidBytes == 0 || (password.length() > 0 && passwordBytes == 0))
     {
         Serial.println("[WIFI] saveCredentials FAILED: NVS write did not persist - keeping previous in-memory credentials");
+
+        // Preferences::putString() only ever returns 0-or-not, swallowing
+        // the real esp_err_t (e.g. ESP_ERR_NVS_TYPE_MISMATCH if "ssid"/
+        // "password" were ever stored as a different type by older firmware,
+        // vs. ESP_ERR_NVS_NOT_ENOUGH_SPACE, vs. a flash-level error) - opened
+        // is already known true here (freeEntries() above required a
+        // successful begin()), so this repeats the same writes through the
+        // raw ESP-IDF API purely to name the actual failure. This is a
+        // second, real write attempt (not a dry run) - if it happens to
+        // succeed where the wrapper reported failure, the credentials are
+        // now genuinely saved despite this function still returning false
+        // for this attempt; that would itself be a useful, informative
+        // outcome, not a problem to guard against.
+        nvs_handle_t rawHandle;
+        esp_err_t openErr = nvs_open("wifi", NVS_READWRITE, &rawHandle);
+        Serial.print("[WIFI] NVS raw diagnostic: nvs_open=");
+        Serial.println(esp_err_to_name(openErr));
+        if (openErr == ESP_OK)
+        {
+            esp_err_t ssidErr = nvs_set_str(rawHandle, "ssid", ssid.c_str());
+            Serial.print("[WIFI] NVS raw diagnostic: nvs_set_str(ssid)=");
+            Serial.println(esp_err_to_name(ssidErr));
+
+            esp_err_t passwordErr = nvs_set_str(rawHandle, "password", password.c_str());
+            Serial.print("[WIFI] NVS raw diagnostic: nvs_set_str(password)=");
+            Serial.println(esp_err_to_name(passwordErr));
+
+            esp_err_t commitErr = nvs_commit(rawHandle);
+            Serial.print("[WIFI] NVS raw diagnostic: nvs_commit=");
+            Serial.println(esp_err_to_name(commitErr));
+
+            nvs_close(rawHandle);
+        }
+
         return false;
     }
 
@@ -524,6 +586,18 @@ void WiFiManager::update()
     {
         dnsServer.processNextRequest();
         server.handleClient();
+
+        // A /setup submission (in either MANUAL or FALLBACK provisioning) is
+        // being tried - see beginManualReconnectAttempt(). Exclusive of the
+        // self-heal retry below for the same reason as the MANUAL guard that
+        // used to live here: ESP32's AP and STA share one radio, and this
+        // and the self-heal loop must never both call WiFi.begin() while the
+        // other's attempt is still in flight.
+        if (manualAttemptState != ManualAttemptState::NONE)
+        {
+            updateManualReconnectAttempt();
+            return;
+        }
 
         // MANUAL provisioning is a user actively submitting NEW credentials
         // through this same setup AP (WifiConfigFragment's POST /setup) - the
@@ -783,11 +857,104 @@ void WiFiManager::stopAP()
     apReconnectInProgress = false;
 }
 
+void WiFiManager::beginManualReconnectAttempt(const String& newSsid, const String& newPassword)
+{
+    manualAttemptSsid = newSsid;
+    manualAttemptState = ManualAttemptState::CONNECTING;
+    manualAttemptStartedAt = millis();
+
+    Serial.print("[WIFI] Manual provisioning: attempting ");
+    Serial.println(newSsid);
+
+    // AP+STA keeps Basilience-Setup reachable while this attempt is tried, so
+    // a phone still connected to it can poll /status for a real answer
+    // instead of only finding out once Firebase hears from this device again
+    // on the new network.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(newSsid.c_str(), newPassword.c_str());
+}
+
+void WiFiManager::updateManualReconnectAttempt()
+{
+    const unsigned long now = millis();
+
+    if (manualAttemptState == ManualAttemptState::CONNECTING)
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            Serial.println("[WIFI] Manual provisioning: new network connected");
+            manualAttemptState = ManualAttemptState::CONNECTED_GRACE;
+            manualAttemptConnectedAt = now;
+            systemState.wifiConnected = true;
+            wifiState = WifiState::CONNECTED;
+            connectionStartedAt = 0;
+            recoveryStartedAt = 0;
+            return;
+        }
+
+        if (now - manualAttemptStartedAt >= RECOVERY_TIMEOUT)
+        {
+            Serial.println("[WIFI] Manual provisioning: new network unreachable, restoring previous credentials");
+            manualAttemptState = ManualAttemptState::FAILED;
+            manualAttemptFailedAt = now;
+            saveCredentials(preManualSsid, preManualPassword);
+            disconnectRadio(false, false);
+        }
+        return;
+    }
+
+    if (manualAttemptState == ManualAttemptState::CONNECTED_GRACE)
+    {
+        // Briefly holds both the AP and the "connected" answer so a phone
+        // polling /status roughly once a second gets a real chance to see
+        // success before Basilience-Setup disappears - tearing the AP down
+        // the instant WL_CONNECTED was observed left a race where the app
+        // could only ever see "setup_mode" before the network vanished.
+        if (now - manualAttemptConnectedAt >= MANUAL_STATUS_HOLD_MS)
+        {
+            manualAttemptState = ManualAttemptState::NONE;
+            Serial.println("[WIFI] Manual provisioning complete, returning to normal operation");
+            stopAP();
+            WiFi.mode(WIFI_STA);
+        }
+        return;
+    }
+
+    if (manualAttemptState == ManualAttemptState::FAILED)
+    {
+        // Same hold-then-release idea as CONNECTED_GRACE, so a poll in
+        // flight can see "connection_failed" before this state clears and
+        // (in FALLBACK provisioning) hands control back to the self-heal
+        // retry loop above.
+        if (now - manualAttemptFailedAt >= MANUAL_STATUS_HOLD_MS)
+        {
+            manualAttemptState = ManualAttemptState::NONE;
+        }
+        return;
+    }
+}
+
+String WiFiManager::manualProvisioningStatusJson() const
+{
+    switch (manualAttemptState)
+    {
+        case ManualAttemptState::CONNECTING:
+            return String("{\"status\":\"connecting\",\"connected\":false,\"ssid\":\"") + manualAttemptSsid + "\"}";
+        case ManualAttemptState::CONNECTED_GRACE:
+            return String("{\"status\":\"connected\",\"connected\":true,\"ssid\":\"") + manualAttemptSsid + "\"}";
+        case ManualAttemptState::FAILED:
+            return String("{\"status\":\"connection_failed\",\"connected\":false,\"ssid\":\"") + manualAttemptSsid + "\"}";
+        case ManualAttemptState::NONE:
+        default:
+            return "{\"status\":\"setup_mode\"}";
+    }
+}
+
 void WiFiManager::setupAPServer()
 {
     server.on("/status", HTTP_GET, [this]() {
         Serial.println("[AP HTTP] GET /status");
-        server.send(200, "application/json", "{\"status\":\"setup_mode\"}");
+        server.send(200, "application/json", manualProvisioningStatusJson());
         Serial.println("[AP HTTP] Response: 200");
     });
 
@@ -811,6 +978,13 @@ void WiFiManager::setupAPServer()
             Serial.println("[AP HTTP] Response: 400");
             return;
         }
+
+        // Captured before saveCredentials() overwrites ssid/password below -
+        // restored by updateManualReconnectAttempt() if newSsid/newPass
+        // fail to connect.
+        preManualSsid = ssid;
+        preManualPassword = password;
+
         if (!saveCredentials(newSsid, newPass)) {
             server.send(500, "text/plain", "Unable to save credentials");
             Serial.println("[AP HTTP] Response: 500");
@@ -832,10 +1006,6 @@ void WiFiManager::setupAPServer()
         Serial.print(verifySsid);
         Serial.println(verifySsid == newSsid ? " (matches submitted value)" : " (MISMATCH vs submitted value)");
 
-        preferences.begin("wifi", false);
-        preferences.putBool("resumeFirebase", true);
-        preferences.end();
-
         server.send(200, "text/plain", "Credentials saved. Connecting device...");
         Serial.println("[AP HTTP] Response: 200");
 
@@ -844,9 +1014,12 @@ void WiFiManager::setupAPServer()
             Serial.println("[WIFI] Manual provisioning completed");
         }
 
-        Serial.println("[WIFI] Reconnecting...");
-        delay(1000);
-        ESP.restart();
+        // No reboot: Basilience-Setup stays up and /status now reports the
+        // real outcome (connecting/connected/connection_failed), so a phone
+        // still on that network can confirm success or failure directly
+        // instead of only finding out once this device reconnects to
+        // Firebase on the new network. See beginManualReconnectAttempt().
+        beginManualReconnectAttempt(newSsid, newPass);
     });
 
     // Secure Device Auth: one-time migration/provisioning delivery of this

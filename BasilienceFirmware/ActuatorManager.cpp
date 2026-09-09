@@ -171,6 +171,89 @@ namespace
         }
     }
 
+    // Automatic-source counterpart to isDeadlineProtected() above (critical
+    // verification report, Priority 3/4). Deliberately a NARROWER list than
+    // isDeadlineProtected(): only the actuators whose automatic runtime
+    // AutomationManager itself bounds to a short, fixed duration (a dosing
+    // pulse or a bounded refill/dilution run) get an automatic-source
+    // independent deadline. FOGGER and PELTIER stay manual-only here even
+    // though they ARE in isDeadlineProtected() - their automatic runtime is
+    // an open-ended cadence/hysteresis decision, not a fixed pulse, so
+    // extending this to them is out of scope for this pass (see the task's
+    // own "DO NOT MODIFY YET" list). CANOPY_FAN/BLOWER/CIRCULATION_PUMP/
+    // GROW_LIGHT are latched-until-explicit-OFF by design and get no
+    // deadline of either kind, unchanged.
+    bool isAutomaticDeadlineProtected(Actuator actuator)
+    {
+        switch (actuator)
+        {
+            case PH_UP_PUMP:
+            case PH_DOWN_PUMP:
+            case GROW_PUMP:
+            case BLOOM_PUMP:
+            case SOLENOID:
+                return true;
+            case PELTIER:
+                // Pulse-cooling task: automatic Peltier during COOL_SOAK now
+                // has a genuinely bounded runtime
+                // (COOLING_PULSE_SOAK_DURATION_MS_TEMP + margin), unlike the
+                // open-ended continuous-cooling hysteresis this function's
+                // own comment above originally excluded it for. Outside
+                // COOL_SOAK, automatic Peltier is never requested ON at all
+                // (see AutomationManager::updateCooling()'s Peltier command
+                // tail), so this stays false the rest of the time - not a
+                // general bypass of the exclusion above, just as narrow as
+                // the validateCommand() exception that permits COOL_SOAK's
+                // Peltier-without-circulation run in the first place.
+                return systemState.coolingPulseState == CoolingPulseState::COOL_SOAK;
+            default:
+                return false;
+        }
+    }
+
+    // Independent-deadline duration for an AUTOMATIC run of one of the
+    // actuators above - always the actuator's own intended automatic
+    // duration (the same Config.h constant AutomationManager itself uses to
+    // decide when to stop it normally) plus AUTOMATIC_DOSE_DEADLINE_MARGIN_MS,
+    // so this deadline only ever fires as a backstop for a loop() that could
+    // not return in time to apply AutomationManager's own on-time stop - see
+    // AUTOMATIC_DOSE_DEADLINE_MARGIN_MS's own comment in Config.h. SOLENOID
+    // is shared by two different automatic durations (a refill run vs. an EC
+    // dilution run - see AutomationManager::handleDosingEC()'s EC_DILUTE
+    // branch); `strategy` (already mirrored onto ActuatorStatus before this
+    // is ever called - see update()'s cmd.isPending handling) is what tells
+    // them apart, exactly as validateCommand()'s own BLOWER case already
+    // uses status fields to distinguish contexts.
+    unsigned long automaticDeadlineMs(Actuator actuator, const String& strategy)
+    {
+        switch (actuator)
+        {
+            case PH_UP_PUMP:
+            case PH_DOWN_PUMP:
+                return PH_DOSING_TIME + AUTOMATIC_DOSE_DEADLINE_MARGIN_MS;
+            case GROW_PUMP:
+            case BLOOM_PUMP:
+                return EC_DOSING_TIME + AUTOMATIC_DOSE_DEADLINE_MARGIN_MS;
+            case SOLENOID:
+                return (strategy == "dilution")
+                    ? EC_DILUTION_TIME + AUTOMATIC_DOSE_DEADLINE_MARGIN_MS
+                    : AUTOMATIC_REFILL_RUN_TIME + AUTOMATIC_DOSE_DEADLINE_MARGIN_MS;
+            case PELTIER:
+                // COOL_SOAK's own intended duration plus its own margin -
+                // deliberately not AUTOMATIC_DOSE_DEADLINE_MARGIN_MS, which
+                // is sized for a few-second dosing pulse, not a multi-minute
+                // soak; see COOLING_PULSE_SOAK_DEADLINE_MARGIN_MS's own
+                // comment in Config.h. Only ever armed while
+                // isAutomaticDeadlineProtected(PELTIER) is true, i.e. only
+                // during COOL_SOAK.
+                return COOLING_PULSE_SOAK_DURATION_MS_TEMP + COOLING_PULSE_SOAK_DEADLINE_MARGIN_MS;
+            default:
+                // Unreachable while isAutomaticDeadlineProtected() gates
+                // every call site - defensive fallback only.
+                return OPERATION_TIMEOUT_MS;
+        }
+    }
+
     // Mirrors the exact constant the loop-polled watchdog in update() already
     // uses for the same actuator, so the independent deadline and the normal
     // watchdog always agree on the cap - this is a second enforcement path
@@ -770,27 +853,53 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
                 // ownership already works.
                 automationManager.setManualCoolingDemand(true);
             }
-            if (!manual)
             {
-                // HARD safety check, AUTOMATIC only: running the Peltier
-                // without active circulation risks localized freezing/
-                // overheating right at the plate instead of the whole
-                // reservoir settling toward the target evenly. For MANUAL,
-                // this previously blocked the Peltier from ever running on
-                // its own - by explicit choice, manual actuators are meant
-                // to be independently controllable rather than one gating
-                // another (same reasoning already applied to the SOFT
-                // temperature-target rule just above), so this interlock
-                // now only applies to automatic commands. An operator who
-                // manually commands only the Peltier is trusted to know
-                // circulation isn't running.
-                const ActuatorStatus& circulation = statuses[CIRCULATION_PUMP];
-                if (!isOn(CIRCULATION_PUMP) ||
-                    !circulation.running ||
-                    circulation.state != ActuatorCommandState::RUNNING)
+                // HARD safety check, AUTOMATIC AND MANUAL: running the
+                // Peltier without active circulation risks localized
+                // freezing/overheating right at the plate instead of the
+                // whole reservoir settling toward the target evenly. This
+                // was previously waived for manual commands on the
+                // reasoning that "an operator commanding only the Peltier
+                // is trusted to know circulation isn't running" - the
+                // critical verification report found that bypass is
+                // reachable through ordinary Android/Firebase Manual Mode,
+                // not a gated maintenance/test path, so a normal app user
+                // could unknowingly run the Peltier dry. No maintenance/test
+                // bypass exists for this rule for MANUAL - none is
+                // introduced here for it.
+                //
+                // Pulse-cooling task: exactly one narrow, AUTOMATIC-ONLY
+                // exception now exists - COOL_SOAK deliberately runs the
+                // Peltier with circulation OFF by design (see
+                // AutomationManager::updateCoolingPulseStateMachine()).
+                // `!manual` makes this structurally unreachable from Manual
+                // Mode: a manual Peltier command is never evaluated with
+                // manual==false, so this branch can never fire for it
+                // regardless of what coolingPulseState happens to be. FILL
+                // and FLUSH are NOT covered by this exception - they still
+                // need circulation confirmed running, same as always; only
+                // COOL_SOAK's automatic Peltier-ON bypasses this check.
+                const bool coolSoakException =
+                    !manual && systemState.coolingPulseState == CoolingPulseState::COOL_SOAK;
+                if (!coolSoakException)
                 {
-                    outReason = WAITING_FOR_CIRCULATION;
-                    return false;
+                    // A manual command that arrives before circulation is
+                    // running does not get rejected outright: the `a ==
+                    // PELTIER && reason == WAITING_FOR_CIRCULATION` case
+                    // below keeps it in VALIDATING (retried every tick,
+                    // exactly like automatic already behaves) until
+                    // circulation catches up - and
+                    // setManualCoolingDemand(true) just above already asks
+                    // updateCooling() to start the circulation pump for it,
+                    // so it does not wait forever.
+                    const ActuatorStatus& circulation = statuses[CIRCULATION_PUMP];
+                    if (!isOn(CIRCULATION_PUMP) ||
+                        !circulation.running ||
+                        circulation.state != ActuatorCommandState::RUNNING)
+                    {
+                        outReason = WAITING_FOR_CIRCULATION;
+                        return false;
+                    }
                 }
             }
             break;
@@ -902,6 +1011,20 @@ void ActuatorManager::update()
                 status.running = false;
                 status.state = ActuatorCommandState::OFF;
                 status.reason = "Safety limit: independent deadline expired";
+                // Automatic-source dosing/refill commands need this
+                // distinguished from every other reconciliation path so
+                // AutomationManager (handleDosingPH()/handleDosingEC()/
+                // handleBoundedAutomaticRefill()) can tell "the independent
+                // deadline already forced this off" apart from "I stopped it
+                // myself on schedule" and reconcile its own state machine
+                // instead of re-issuing a now-physically-meaningless command
+                // - see forcedOffByDeadline's own comment in Types.h. Set
+                // unconditionally (manual or automatic source): a manual run
+                // hitting its own deadline is already fully handled by the
+                // existing manual-hold-expiry log below and needs no
+                // AutomationManager reconciliation, so it is simply never
+                // read for a manual-source status.
+                status.forcedOffByDeadline = true;
                 if (manuallyOverridden[i])
                 {
                     manuallyOverridden[i] = false;
@@ -927,6 +1050,11 @@ void ActuatorManager::update()
             // as this actuator keeps running under this command.
             status.overrideActive = cmd.overrideRequested;
             status.bypassAutoFoggerGate = cmd.bypassAutoFoggerGate;
+            // A fresh command supersedes any stale forced-off-by-deadline
+            // signal from a previous run of this actuator, so it is never
+            // read again once AutomationManager has already reconciled it
+            // (or once any other command, manual or automatic, takes over).
+            status.forcedOffByDeadline = false;
 
             if (cmd.targetState)
             {
@@ -1057,6 +1185,25 @@ void ActuatorManager::update()
                         {
                             timeoutExceeded = true;
                             status.reason = "Safety limit: manual actuator running too long";
+                            // This loop-polled check races the independent
+                            // esp_timer deadline armed for this same manual
+                            // run (both use OPERATION_TIMEOUT_MS from the
+                            // same start time) - loop() typically detects it
+                            // first, which would otherwise send PELTIER/
+                            // FOGGER straight to STOPPING without ever going
+                            // through the esp_timer's "manual hold expired"
+                            // handoff, leaving manuallyOverridden stuck true
+                            // since both are held across an ordinary manual
+                            // OFF. Release ownership here too so whichever
+                            // mechanism wins, the actuator returns to
+                            // automation.
+                            if (manuallyOverridden[i])
+                            {
+                                manuallyOverridden[i] = false;
+                                Serial.print("[MANUAL] ");
+                                Serial.print(actuatorLogName(a));
+                                Serial.println(" manual hold expired; automation ownership restored");
+                            }
                         }
                     }
                     
@@ -1169,18 +1316,45 @@ void ActuatorManager::update()
 
                     if (isManualSource(status.source))
                     {
-                        // An explicit manual OFF now always hands the
-                        // actuator straight back to automation, the same
-                        // tick, rather than holding it until manual mode is
-                        // toggled off entirely or a deadline timer elsewhere
-                        // expires. Automation still has to independently
-                        // decide the actuator needs to change - it re-reads
-                        // current sensor conditions from scratch next tick,
-                        // it does not resume anything - and every existing
-                        // safety gate (stability windows, dose cooldown
-                        // above, reservoir/subsystem locks, target-reached
-                        // soft rules) still applies in full before it acts.
-                        if (manuallyOverridden[i])
+                        // An explicit manual OFF hands the actuator straight
+                        // back to automation the same tick for threshold/
+                        // cooldown-gated actuators (pH/EC pumps, Solenoid,
+                        // Peltier) - automation re-reads sensor conditions
+                        // from scratch next tick, it does not resume
+                        // anything, and every existing safety gate (stability
+                        // windows, dose cooldown, reservoir/subsystem locks,
+                        // target-reached soft rules) still has to clear
+                        // before it acts again, so releasing immediately is
+                        // safe there.
+                        //
+                        // Canopy Fan, Blower, Fogger and Grow Light are not
+                        // threshold-gated: their automation unconditionally
+                        // re-requests ON for the entire duration of whatever
+                        // phase is currently active (climate demand / fog
+                        // cycle / light schedule), with no gap. Releasing
+                        // ownership immediately there meant a manual OFF was
+                        // overridden back ON on the very next tick - this was
+                        // root-caused as "can't turn off the fan" (Canopy
+                        // Fan stuck on because handleCanopyClimate() requests
+                        // it ON unconditionally every tick). These four
+                        // instead hold the manual OFF exactly like a manual
+                        // ON already does, released only by Manual Mode
+                        // being turned off, the manual-runtime deadline
+                        // expiring, a rejected command, or another manual
+                        // command.
+                        //
+                        // Peltier has this same unconditional-reassertion
+                        // shape specifically during COOL_SOAK (see
+                        // AutomationManager::updateCooling()'s COOL_SOAK
+                        // tail) - outside of a soak it is still
+                        // threshold/cooldown-gated and safe to release
+                        // immediately, so the hold only applies while
+                        // COOL_SOAK is active.
+                        const bool continuouslyDrivenByAutomation =
+                            (a == CANOPY_FAN || a == BLOWER || a == FOGGER || a == GROW_LIGHT) ||
+                            (a == PELTIER && systemState.coolingPulseState == CoolingPulseState::COOL_SOAK);
+
+                        if (manuallyOverridden[i] && !continuouslyDrivenByAutomation)
                         {
                             manuallyOverridden[i] = false;
                             Serial.print("[MANUAL] ");
@@ -1211,9 +1385,16 @@ void ActuatorManager::update()
         // within PELTIER's own iteration.
         if (!previousStatus.running && status.running)
         {
-            if (isDeadlineProtected(a) && isManualSource(status.source))
+            if (isManualSource(status.source))
             {
-                armDeadline(a, manualDeadlineMs(a));
+                if (isDeadlineProtected(a))
+                {
+                    armDeadline(a, manualDeadlineMs(a));
+                }
+            }
+            else if (isAutomaticDeadlineProtected(a))
+            {
+                armDeadline(a, automaticDeadlineMs(a, status.strategy));
             }
         }
         else if (previousStatus.running && !status.running)

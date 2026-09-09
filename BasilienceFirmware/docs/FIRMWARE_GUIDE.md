@@ -156,12 +156,12 @@ A message looks like: `Basilience: <title> - <message>`, for example `Basilience
 
 ## 10. Wi-Fi setup and provisioning mode
 
-The first time a device is powered on (or any time it loses its saved network and cannot get back on it), it broadcasts its own temporary Wi-Fi network named `Basilience-Setup`. Connecting a phone to that network and then sending the new home network's name and password to the device (the Android app does this over `POST /setup`) tells the device what to connect to. The device saves the new credentials to flash, then restarts itself to try them.
+The first time a device is powered on (or any time it loses its saved network and cannot get back on it), it broadcasts its own temporary Wi-Fi network named `Basilience-Setup`. Connecting a phone to that network and then sending the new home network's name and password to the device (the Android app does this over `POST /setup`) tells the device what to connect to. The device saves the new credentials to flash and tries them right away, while keeping `Basilience-Setup` running the whole time, so a phone still connected to it can ask `GET /status` for the real outcome ("connecting", "connected", or "connection_failed") instead of guessing. There is no reboot involved. If the new network fails to connect, the device automatically goes back to whatever credentials were working before, so a typo never strands the device on a broken network.
 
 There are two flavors of this, both handled by `WiFiManager`:
 
 - **Fallback provisioning** happens automatically and unattended, when the saved network stops working (for example the device is moved to a new location, or the router's password changed) and cannot be recovered within the recovery window. While in fallback mode, the device also keeps quietly retrying the old saved network in the background every 30 seconds, so if the outage was temporary it can silently reconnect and drop the setup network again without anyone having to do anything.
-- **Manual provisioning** happens when a person deliberately asks the app to reconfigure Wi-Fi. In this mode the background retry described above is intentionally turned off, since it was found to destabilize the radio while someone was actively in the middle of submitting new credentials.
+- **Manual provisioning** happens when a person deliberately asks the app to reconfigure Wi-Fi. The background retry described above is intentionally turned off for as long as a submitted set of credentials is still being tried, since both would otherwise fight over the same radio at once.
 
 The setup network also has a `/secure-provision` endpoint used once, during initial device setup, to inject the device's one-time secret used for the secure Firebase authentication described in section 8.
 

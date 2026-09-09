@@ -278,12 +278,22 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::INVALID_EC;
     }
 
-    if(systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH)
+    // Quiet-monitoring/4-minute-budget redesign: still block fogging
+    // unconditionally while actively dosing or during the initial silent
+    // settle window (the reading is not yet current enough to trust), but
+    // once handleStabilizingPH() marks itself purely watching
+    // (phWatchPhaseActive), pH is already confirmed within [minPH, maxPH]
+    // above, so fogging is allowed to resume - re-checked fresh every tick,
+    // so it stops again immediately if pH drifts back out of range or a
+    // redose starts.
+    if(systemState.currentMode == DOSING_PH ||
+       (systemState.currentMode == STABILIZING_PH && !systemState.phWatchPhaseActive))
     {
         return SafetyResult::INVALID_PH;
     }
 
-    if(systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC)
+    if(systemState.currentMode == DOSING_EC ||
+       (systemState.currentMode == STABILIZING_EC && !systemState.ecWatchPhaseActive))
     {
         return SafetyResult::INVALID_EC;
     }
@@ -353,10 +363,11 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
     reason = "";
 
     // Requiring the reading to already be back in range here made the lock a
-    // deadlock: the subsystem trips after MAX_PH_ATTEMPTS/MAX_EC_ATTEMPTS
-    // failed automatic corrections specifically because automation could not
-    // get the reading into range, so a reset that demanded that same
-    // condition could never actually succeed while the real problem
+    // deadlock: the subsystem trips after the PH_EC_CORRECTION_STALL_TIMEOUT_MS
+    // budget expires on a genuinely stalled correction specifically because
+    // automation could not get the reading into range, so a reset that
+    // demanded that same condition could never actually succeed while the
+    // real problem
     // persisted - only a human manually dosing the reservoir by hand could
     // clear it. Reset Safety is the admin's explicit request for a fresh
     // attempt, not a claim that the problem is already fixed; it still

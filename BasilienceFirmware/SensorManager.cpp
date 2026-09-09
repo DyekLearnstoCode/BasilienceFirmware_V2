@@ -14,11 +14,18 @@ SensorManager::SensorManager()
 
       waterSensor(&oneWire),
 
+      // EC calibration redesign task: switched from RAW_ADC (a raw 0-4095
+      // count run through a manual *3.3/4095 linear conversion in readEC(),
+      // which never corrected for the ESP32 ADC's known nonlinearity) to
+      // MILLIVOLTS (analogReadMilliVolts(), the SoC's own factory-calibrated
+      // reading) - the same real-hardware fix phSampler below already has.
+      // Sample count/interval/median filtering are unchanged; only the
+      // per-sample read mode differs.
       ecSampler(
           EC_PIN,
           EC_SAMPLE_COUNT,
           EC_SAMPLE_INTERVAL,
-          AnalogSampler::RAW_ADC),
+          AnalogSampler::MILLIVOLTS),
 
       phSampler(
           PH_SENSOR_PIN,
@@ -681,6 +688,23 @@ void SensorManager::applyEffectiveSensors()
                         // was drifting toward is no longer worth confirming.
                         phStepCandidate = NAN;
                         phStepCandidateCount = 0;
+
+                        // CONFIRMED BUG FIX: lastAcceptedPhCandidateAt (the
+                        // telemetry freshness clock) was only ever touched
+                        // when the anchor's VALUE changed, never when it was
+                        // simply reconfirmed by a fresh in-range candidate
+                        // landing back inside the deadband. A probe reading
+                        // a rock-steady, perfectly good value therefore went
+                        // "telemetry stale" (see phTelemetryStale below)
+                        // exactly PH_EC_STABLE_TIMEOUT_MS after the anchor
+                        // was first established, and sensors.ph then stuck
+                        // at NaN forever after - reproduced on real hardware
+                        // with a stable ~3.98 candidatePH for 3+ minutes
+                        // while sensors.ph stayed NaN the whole time. This
+                        // still only updates the timestamp, never the
+                        // anchor's value, so it does not reintroduce the
+                        // ratcheting drift the comment above describes.
+                        lastAcceptedPhCandidateAt = nowForPhStep;
                     }
                     else
                     {
@@ -725,6 +749,30 @@ void SensorManager::applyEffectiveSensors()
                             }
                         }
                     }
+                }
+
+                // CONFIRMED BUG FIX: phCandidateForWindow was only ever set
+                // on the one-off tick a NEW baseline/level got accepted -
+                // every subsequent tick where the reading just quietly
+                // reconfirmed the SAME trusted anchor left it NaN, and
+                // updateStabilityWindow() discards a NaN candidate outright
+                // (isfinite() check) without touching window.lastSampleAt/
+                // lastStableAt. A steady, healthy pH reading therefore fed
+                // the automation-trust window only once (at establishment)
+                // and then never again, so it went "stale" after
+                // PH_EC_STABLE_TIMEOUT_MS and stayed that way - blocking
+                // canStartNewPHCorrection() even though the reading was
+                // fine the whole time. Falls back to re-offering the
+                // current trusted anchor on every phStepDue tick so the
+                // window keeps receiving live evidence the reading is
+                // still good, matching the class comment's stated intent
+                // ("that window is otherwise completely untouched and
+                // still independently decides whether the trusted stream
+                // itself is stable"). Same root cause as the telemetry-side
+                // fix above.
+                if (isnan(phCandidateForWindow) && !isnan(lastAcceptedPhCandidate))
+                {
+                    phCandidateForWindow = lastAcceptedPhCandidate;
                 }
 
                 updateStabilityWindow(phStabilityWindow, phCandidateForWindow, PH_STABILITY_TOLERANCE, "[PH-STABLE]", DebugCategory::PH);
@@ -1640,15 +1688,43 @@ void SensorManager::readEC()
     if (!ecSampler.ready())
         return;
 
-    float adc = ecSampler.median();
+    // ecSampler now runs in MILLIVOLTS mode (see its construction above) -
+    // median() is already an ESP32-calibrated millivolts reading, not a raw
+    // 0-4095 count. ecRaw keeps its existing field name/Firebase key (app
+    // compatibility) but now holds millivolts, matching what it actually is.
+    const int medianMv = ecSampler.median();
+    physicalSensors.ecRaw = medianMv;
 
-    physicalSensors.ecRaw = (int)adc;
-
-    float voltage =
-        (adc * ADC_REFERENCE) /
-        ADC_RESOLUTION;
-
+    const float voltage = medianMv / 1000.0f;
     physicalSensors.ecVoltage = voltage;
+
+    // === EC calibration (EC_CAL_* constants, Calibration.h) ===
+    // Replaces the previous borrowed DFRobot TDS-sensor polynomial + fixed
+    // EC_FACTOR multiplier (real-hardware audit + calibration redesign task:
+    // that curve was fit to a different probe/front-end and never matched
+    // this hardware - a confirmed 12.88 mS/cm solution read only ~1.69
+    // mS/cm through it, an error not uniform enough across the range for a
+    // single output multiplier to safely correct). See Calibration.h's own
+    // "EC Calibration" section for the full reasoning; this only implements
+    // it: two-point linear once a genuine second point is confirmed,
+    // gracefully degrading to a one-point proportional (through-origin) fit
+    // using only the confirmed 12.88 mS/cm anchor until then - never
+    // fabricating a second point that hasn't actually been measured.
+    float uncompensatedEc;
+    const char* calibrationModel;
+    if (isfinite(EC_CAL_2_VOLTAGE) && isfinite(EC_CAL_2_EC) &&
+        EC_CAL_2_VOLTAGE != EC_CAL_1_VOLTAGE)
+    {
+        const float slope =
+            (EC_CAL_2_EC - EC_CAL_1_EC) / (EC_CAL_2_VOLTAGE - EC_CAL_1_VOLTAGE);
+        uncompensatedEc = EC_CAL_1_EC + (voltage - EC_CAL_1_VOLTAGE) * slope;
+        calibrationModel = "two-point linear";
+    }
+    else
+    {
+        uncompensatedEc = EC_CAL_1_EC * (voltage / EC_CAL_1_VOLTAGE);
+        calibrationModel = "one-point proportional (unvalidated near 0 / cultivation range)";
+    }
 
     // A NaN water temperature must never reach the compensation formula - it
     // would make EC itself go NaN even though the EC sensor is fine. Fall
@@ -1689,49 +1765,51 @@ void SensorManager::readEC()
         lastEcCompensationSource = compensationSource;
     }
 
-    float compensationCoefficient =
-        1.0f +
-        0.02f *
-            (compensationTemp - 25.0f);
+    // === Temperature compensation - applied to the calibrated EC value,
+    // not the raw voltage (calibration redesign task: physically, this
+    // normalizes the MEASURED conductivity to a 25C reference, the standard
+    // water-quality convention - it is not a correction to the sensor's
+    // electrical signal, so it belongs after conversion, not before it. The
+    // old polynomial compensated voltage first only because that particular
+    // nonlinear curve made the two orders genuinely different; with this
+    // linear calibration model they are mathematically identical either
+    // way, so this reordering changes clarity, not behavior). ===
+    const float compensationCoefficient =
+        1.0f + 0.02f * (compensationTemp - 25.0f);
+    const float compensatedEc = uncompensatedEc / compensationCoefficient;
 
-    float compensationVoltage =
-        voltage /
-        compensationCoefficient;
-
-    // Feeds physicalSensors.ec (candidate input to the stability filter -
-    // see applyEffectiveSensors()) - temperature-compensated exactly as
-    // before. Deliberately untouched by the TDS-only requirement below: EC
-    // keeps its existing compensation, only TDS loses its own. Calibration
-    // (EC_FACTOR, Calibration.h) is unchanged - already accepted, not
-    // touched by this pass.
-    float compensatedTdsPoly =
-        (133.42f * compensationVoltage * compensationVoltage * compensationVoltage -
-         255.86f * compensationVoltage * compensationVoltage +
-         857.39f * compensationVoltage) *
-        0.5f;
-
-    float ec =
-        (compensatedTdsPoly / 500.0f) *
-        EC_FACTOR;
-
-    physicalSensors.ec = ec;
+    // Feeds the stability filter (applyEffectiveSensors()) exactly as
+    // before - same field, same downstream consumers, only the value
+    // upstream of it is now correctly scaled.
+    physicalSensors.ec = compensatedEc;
 
     // TDS must NOT depend on Water Temperature (explicit requirement, kept
-    // from the prior pass) - runs the exact same polynomial against the raw
-    // (uncompensated) voltage instead of compensationVoltage, so it no
-    // longer inherits the temperature adjustment ec above still applies.
-    // physicalSensors.tds was always algebraically (poly-result * EC_FACTOR)
-    // here - the /500 that built `ec` and the *500 that used to rebuild
-    // `tds` from it cancelled exactly - so this reuses that same existing
-    // conversion factor (no new one invented), just computed straight from
-    // raw voltage.
-    float rawTdsPoly =
-        (133.42f * voltage * voltage * voltage -
-         255.86f * voltage * voltage +
-         857.39f * voltage) *
-        0.5f;
+    // from the prior pass) - derived from the calibrated but uncompensated
+    // EC using the standard 0.5 ppm/(uS/cm) convention already implicit in
+    // the old polynomial's own /500 step (TDS(ppm) = EC(mS/cm) * 500), so
+    // this is the same conversion convention as before, just no longer
+    // riding on the retired polynomial/EC_FACTOR to get there.
+    physicalSensors.tds = uncompensatedEc * 500.0f;
 
-    physicalSensors.tds = rawTdsPoly * EC_FACTOR;
+    const unsigned long now = millis();
+    if (debugManager.shouldPrintDebug(DebugCategory::EC) &&
+        (lastEcAdcDiagnosticAt == 0 ||
+         now - lastEcAdcDiagnosticAt >= EC_ADC_DIAGNOSTIC_INTERVAL_MS))
+    {
+        lastEcAdcDiagnosticAt = now;
+        Serial.print("[EC-CAL] model=");
+        Serial.print(calibrationModel);
+        Serial.print(" mV=");
+        Serial.print(medianMv);
+        Serial.print(" V=");
+        Serial.print(voltage, 4);
+        Serial.print(" uncompensatedEC=");
+        Serial.print(uncompensatedEc, 3);
+        Serial.print(" compensatedEC=");
+        Serial.print(compensatedEc, 3);
+        Serial.print(" waterTempC=");
+        Serial.println(compensationTemp, 1);
+    }
 }
 
 void SensorManager::readPH()

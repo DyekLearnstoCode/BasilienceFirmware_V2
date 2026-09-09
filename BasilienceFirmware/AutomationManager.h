@@ -122,6 +122,24 @@ private:
     int8_t lastWaterTemperatureBand = -2;
     bool coolingDemandActive = false;
     bool manualCoolingDemandActive = false;
+
+    // Pulse-cooling task: FILL/FLUSH-internal sub-phase and when it started.
+    // systemState.coolingPulseState (the externally-visible IDLE/FILL/
+    // COOL_SOAK/FLUSH state) lives in Types.h since ActuatorManager needs to
+    // read it too; this finer-grained phase is purely local sequencing detail
+    // nothing outside this class needs.
+    CoolingPulsePhase coolingPulsePhase = CoolingPulsePhase::NONE;
+    unsigned long coolingPulsePhaseStartedAt = 0;
+    // Debounces updateCoolingPulseStateMachine()'s own water-temp validity
+    // check by the same SENSOR_TRANSIENT_FAILURE_THRESHOLD used by
+    // SafetyManager::validWaterTemperature() (a private, per-call static
+    // there, not reachable from here) - without this, a single transient
+    // reading could fail this raw check on the same tick canCool() still
+    // reports SAFE via its own debounce, hard-locking the cooling subsystem
+    // off a glitch the rest of the system was built to tolerate.
+    uint8_t coolingPulseWaterTempInvalidStreak = 0;
+    void updateCoolingPulseStateMachine(bool automaticCoolingAllowed, SafetyResult coolingSafety, bool chemistryNeedsCirculation);
+
     bool circulationDiagnosticsInitialized = false;
     uint8_t lastCirculationDemandMask = 0;
 
