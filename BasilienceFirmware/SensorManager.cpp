@@ -509,6 +509,21 @@ void SensorManager::applyEffectiveSensors()
         // a mock pH value is never mid-confirmation, it is simply present
         // or absent (NaN), same as every other mock field.
         sensors.phConfirming = false;
+        // pH/EC hardware-fault detection only ever inspects the REAL analog
+        // signal (readPH()/readEC() keep sampling physical hardware in the
+        // background regardless of mock mode, same as every other sensor -
+        // see the class comment on "Developer Sensor Test reads it
+        // directly"). A developer feeding a mock value must never have the
+        // effective/published dataset suddenly report "Check pH/EC sensor"
+        // because the disconnected bench probe sitting in a drawer happens
+        // to be rail-stuck while mock testing is in progress - mask the
+        // background physical fault state from the EFFECTIVE dataset while
+        // mock is authoritative, without resetting or otherwise disturbing
+        // physicalSensors.phFault/ecFault's own tracking of real hardware.
+        sensors.phFault = false;
+        sensors.ecFault = false;
+        sensors.phAvailable = isfinite(sensors.ph);
+        sensors.ecAvailable = isfinite(sensors.ec);
 
         if (systemState.mockApplyPending)
         {
@@ -571,6 +586,15 @@ void SensorManager::applyEffectiveSensors()
             sensors.ph = NAN;
             sensors.ec = NAN;
             sensors.tds = NAN;
+            // Explicit rather than relying on the SensorData default (both
+            // already false pre-settle) - a fault possibly confirmed before
+            // this settle window began (e.g. still-broken hardware across a
+            // mock->physical transition) still deserves to be shown, but
+            // "available" must never read true while ph/ec above are NaN.
+            sensors.phFault = physicalSensors.phFault;
+            sensors.ecFault = physicalSensors.ecFault;
+            sensors.phAvailable = false;
+            sensors.ecAvailable = false;
         }
         else
         {
@@ -896,6 +920,48 @@ void SensorManager::applyEffectiveSensors()
             // water-temperature dependency (kept from the prior pass) and is
             // published from physicalSensors.tds via the `sensors =
             // physicalSensors` copy above; stabilizing it was not requested.
+
+            // pH/EC hardware-fault override (Config.h's PH_FAULT_*/EC_FAULT_*
+            // - see readPH()/readEC()'s own comments for how
+            // physicalSensors.phFault/ecFault get set). Applied AFTER the
+            // stability-window logic above so a confirmed fault always wins,
+            // even if the window happened to be reporting a (now
+            // untrustworthy) stable value the instant the fault confirmed.
+            // Forcing NaN here is what makes every EXISTING NaN-based
+            // consumer (SafetyManager's validPH()/validEC(), AlertManager's
+            // sensorFault) correctly treat a confirmed fault as invalid with
+            // zero changes to that logic - the fault flag is the single
+            // source of truth, sensors.ph/ec merely reflect it. Also resets
+            // the step filter/stability window so recovery cannot simply
+            // resume from a value trusted before the fault - it must fully
+            // re-earn a fresh baseline AND fresh stability once the fault
+            // itself clears (PH_FAULT_RECOVERY_COUNT), matching the required
+            // recovery sequence: electrical signal plausible -> fault
+            // recovery confirmed -> normal stability criteria satisfied ->
+            // automation eligible again. Idempotent - safe to run every tick
+            // for as long as the fault persists.
+            if (physicalSensors.phFault)
+            {
+                sensors.ph = NAN;
+                sensors.phConfirming = false;
+                resetStabilityWindow(phStabilityWindow);
+                lastAcceptedPhCandidate = NAN;
+                lastAcceptedPhCandidateAt = 0;
+                phTelemetryStaleLogged = false;
+                phStepCandidate = NAN;
+                phStepCandidateCount = 0;
+                lastPhStepEvalAt = 0;
+            }
+            if (physicalSensors.ecFault)
+            {
+                sensors.ec = NAN;
+                resetStabilityWindow(ecStabilityWindow);
+            }
+
+            sensors.phFault = physicalSensors.phFault;
+            sensors.ecFault = physicalSensors.ecFault;
+            sensors.phAvailable = isfinite(sensors.ph);
+            sensors.ecAvailable = isfinite(sensors.ec);
         }
 
         if (systemState.mockApplyPending)
@@ -1465,7 +1531,10 @@ void SensorManager::readWaterLevel()
     // WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM - only then does the new level
     // become authoritative. A lone false echo never accumulates enough
     // agreeing candidates and is permanently rejected; a genuine drain/fill
-    // still confirms within a few ~300ms read cycles.
+    // still confirms within a few WATER_LEVEL_READ_INTERVAL_MS (5s) read
+    // cycles - up to ~10s worst case for 3 agreeing candidates, not the
+    // ~300ms figure an earlier version of this comment incorrectly used
+    // (that cadence belongs to pH's own, separate PH_STEP_SAMPLE_INTERVAL_MS).
     if (isnan(lastAcceptedWaterDepthCm))
     {
         // Reacquisition after boot or a confirmed sensor outage (resilience
@@ -1598,9 +1667,11 @@ void SensorManager::readWaterLevel()
     // transient within WATER_LEVEL_STEP_ACCEPT_CM (e.g. one bad reading
     // 0.20cm off) still becomes the accepted value immediately and can, on
     // its own, momentarily cross REFILL_START_CM/REFILL_STOP_CM. Counted
-    // once per ACCEPTED reading here (~300ms cadence), not once per loop()
-    // tick, so 3 consecutive counts genuinely means 3 distinct HC-SR04
-    // reads agreeing, not 3 fast re-evaluations of one unchanged value.
+    // once per ACCEPTED reading here (WATER_LEVEL_READ_INTERVAL_MS = 5s
+    // cadence, not the ~300ms an earlier version of this comment incorrectly
+    // stated), not once per loop() tick, so 3 consecutive counts genuinely
+    // means 3 distinct HC-SR04 reads agreeing (up to ~10s worst case), not 3
+    // fast re-evaluations of one unchanged value.
     if (acceptedDepthCm <= systemState.refillStartLevelCm)
     {
         if (refillStartConfirmCount < WATER_LEVEL_STEP_CONFIRM_COUNT) refillStartConfirmCount++;
@@ -1660,8 +1731,9 @@ void SensorManager::readWaterLevel()
         }
     }
 
-    // Throttled diagnostic - readWaterLevel() itself runs every 300ms
-    // (WATER_LEVEL_READ_INTERVAL_MS), far more often than this needs to
+    // Throttled diagnostic - readWaterLevel() itself runs every 5s
+    // (WATER_LEVEL_READ_INTERVAL_MS; an earlier version of this comment
+    // incorrectly said 300ms), far more often than this needs to
     // print. See DHT_RAW_DIAGNOSTIC_INTERVAL_MS for the same pattern. Only
     // the accepted-value summary is throttled - the [WATER-FILTER] reject/
     // accept lines above already only print on a large-jump candidate tick,
@@ -1694,6 +1766,81 @@ void SensorManager::readEC()
     // compatibility) but now holds millivolts, matching what it actually is.
     const int medianMv = ecSampler.median();
     physicalSensors.ecRaw = medianMv;
+
+    // Rail-proximity hardware-fault detection - see Config.h's "pH/EC
+    // Hardware-Fault Detection" section (EC_FAULT_*/ADC_FAULT_RAW_*) for the
+    // full design. Combines the calibrated millivolt signal with the raw
+    // 12-bit ADC count (chip-independent - see ADC_FAULT_RAW_*'s own comment
+    // for why the millivolt ceiling alone cannot be trusted across chips).
+    // Evaluated on its own EC_FAULT_CHECK_INTERVAL_MS cadence, independent of
+    // how often readEC() itself is called (every loop() tick once
+    // ecSampler.ready()), so "N consecutive evaluations" means N genuinely
+    // distinct, time-separated observations of the rolling median, not N
+    // re-checks of one barely-changed value within milliseconds. Suppressed
+    // entirely during the post-(re)connect analog settle window
+    // (isPhEcAnalogSettling()) - a probe/module that just became the active
+    // source is EXPECTED to still be electrically settling, and treating
+    // that as fault evidence would be exactly the false-positive this
+    // detector must avoid; applyEffectiveSensors() already treats that
+    // window as a known "not yet available" state for the same reason.
+    if (!isPhEcAnalogSettling())
+    {
+        const unsigned long nowForEcFault = millis();
+        if (nowForEcFault - lastEcFaultCheckAt >= EC_FAULT_CHECK_INTERVAL_MS)
+        {
+            lastEcFaultCheckAt = nowForEcFault;
+
+            // Chip-independent corroboration (Config.h's ADC_FAULT_RAW_*
+            // comment) - preferred over the calibrated millivolt reading
+            // where they'd disagree, since raw saturation is an ADC
+            // architectural constant, not a per-chip calibration curve.
+            // Combined with OR: either signal alone is sufficient evidence.
+            const int rawMedianCount = ecSampler.rawMedian();
+            const bool ecRawRailFault =
+                rawMedianCount <= ADC_FAULT_RAW_LOW ||
+                rawMedianCount >= ADC_FAULT_RAW_HIGH;
+
+            const bool ecRailFault = !isfinite((float)medianMv) ||
+                medianMv <= EC_FAULT_RAIL_LOW_MV ||
+                medianMv >= EC_FAULT_RAIL_HIGH_MV ||
+                ecRawRailFault;
+
+            if (ecRailFault)
+            {
+                ecFaultRecoveryStreak = 0;
+                if (ecFaultStreak < EC_FAULT_CONFIRM_COUNT) ecFaultStreak++;
+
+                if (ecFaultStreak >= EC_FAULT_CONFIRM_COUNT && !physicalSensors.ecFault)
+                {
+                    physicalSensors.ecFault = true;
+                    if (debugManager.shouldPrintDebug(DebugCategory::EC))
+                    {
+                        Serial.print("[EC-FAULT] confirmed - median=");
+                        Serial.print(medianMv);
+                        Serial.println("mV persistently at/beyond rail");
+                    }
+                }
+            }
+            else
+            {
+                ecFaultStreak = 0;
+                if (physicalSensors.ecFault)
+                {
+                    if (ecFaultRecoveryStreak < EC_FAULT_RECOVERY_COUNT) ecFaultRecoveryStreak++;
+
+                    if (ecFaultRecoveryStreak >= EC_FAULT_RECOVERY_COUNT)
+                    {
+                        physicalSensors.ecFault = false;
+                        ecFaultRecoveryStreak = 0;
+                        if (debugManager.shouldPrintDebug(DebugCategory::EC))
+                        {
+                            Serial.println("[EC-FAULT] recovered - electrical signal plausible again; stability window must still re-establish trust");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     const float voltage = medianMv / 1000.0f;
     physicalSensors.ecVoltage = voltage;
@@ -1843,6 +1990,81 @@ void SensorManager::readPH()
         phSampler.median();
 
     physicalSensors.phMilliVolts = medianMv;
+
+    // Rail-proximity hardware-fault detection - see Config.h's "pH/EC
+    // Hardware-Fault Detection" section (PH_FAULT_*/ADC_FAULT_RAW_*) for the
+    // full design. Combines the calibrated millivolt signal with the raw
+    // 12-bit ADC count (chip-independent - see ADC_FAULT_RAW_*'s own
+    // comment for why the millivolt ceiling alone cannot be trusted across
+    // chips), never the calculated pH below - a rail-stuck raw value always
+    // produces a domain-impossible
+    // pH too, but reasoning from the electrical signal directly keeps this
+    // detector's thresholds anchored to the ADC/transmitter's own physical
+    // limits rather than to PH_SLOPE/PH_OFFSET or the 0-14 pH domain, so it
+    // can never be confused by a calibration change. Evaluated on its own
+    // PH_FAULT_CHECK_INTERVAL_MS cadence (readPH() itself runs every loop()
+    // tick once phSampler.ready(), far faster than the underlying rolling
+    // median actually refreshes - see PH_STEP_SAMPLE_INTERVAL_MS's own
+    // comment for the identical reasoning already applied to the step
+    // filter). Suppressed during the post-(re)connect analog settle window
+    // (isPhEcAnalogSettling()) for the same reason readEC()'s own fault
+    // detector is: a probe that just became the active source is EXPECTED
+    // to still be electrically settling.
+    if (!isPhEcAnalogSettling())
+    {
+        const unsigned long nowForPhFault = millis();
+        if (nowForPhFault - lastPhFaultCheckAt >= PH_FAULT_CHECK_INTERVAL_MS)
+        {
+            lastPhFaultCheckAt = nowForPhFault;
+
+            // Chip-independent corroboration - see readEC()'s matching
+            // comment and Config.h's ADC_FAULT_RAW_* comment.
+            const int rawMedianCount = phSampler.rawMedian();
+            const bool phRawRailFault =
+                rawMedianCount <= ADC_FAULT_RAW_LOW ||
+                rawMedianCount >= ADC_FAULT_RAW_HIGH;
+
+            const bool phRailFault = !isfinite((float)medianMv) ||
+                medianMv <= PH_FAULT_RAIL_LOW_MV ||
+                medianMv >= PH_FAULT_RAIL_HIGH_MV ||
+                phRawRailFault;
+
+            if (phRailFault)
+            {
+                phFaultRecoveryStreak = 0;
+                if (phFaultStreak < PH_FAULT_CONFIRM_COUNT) phFaultStreak++;
+
+                if (phFaultStreak >= PH_FAULT_CONFIRM_COUNT && !physicalSensors.phFault)
+                {
+                    physicalSensors.phFault = true;
+                    if (debugManager.shouldPrintDebug(DebugCategory::PH))
+                    {
+                        Serial.print("[PH-FAULT] confirmed - median=");
+                        Serial.print(medianMv);
+                        Serial.println("mV persistently at/beyond rail");
+                    }
+                }
+            }
+            else
+            {
+                phFaultStreak = 0;
+                if (physicalSensors.phFault)
+                {
+                    if (phFaultRecoveryStreak < PH_FAULT_RECOVERY_COUNT) phFaultRecoveryStreak++;
+
+                    if (phFaultRecoveryStreak >= PH_FAULT_RECOVERY_COUNT)
+                    {
+                        physicalSensors.phFault = false;
+                        phFaultRecoveryStreak = 0;
+                        if (debugManager.shouldPrintDebug(DebugCategory::PH))
+                        {
+                            Serial.println("[PH-FAULT] recovered - electrical signal plausible again; stability/step filter must still re-establish trust");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     physicalSensors.ph =
         PH_SLOPE *

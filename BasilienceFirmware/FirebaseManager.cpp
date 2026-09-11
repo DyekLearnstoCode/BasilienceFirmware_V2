@@ -286,6 +286,34 @@ void FirebaseManager::loadPersistedSettings()
         systemState.blowerSpeedPercent = preferences.getUChar("blowerSpeed", systemState.blowerSpeedPercent);
         Serial.println("[SETTINGS] Restored persisted automation settings");
     }
+
+    // Config/settings schema migration (see CONFIG_SCHEMA_VERSION in
+    // Config.h) - runs regardless of the "valid" guard above, since even a
+    // device that has never persisted anything else still needs its own
+    // cfgVersion baseline established. An already-deployed device may have
+    // just restored (or, for maxAirTemp, may be about to pull from Firebase
+    // in readSettings() - it has no NVS entry of its own, see that
+    // function's own migration comment) the OLD stale compiled default
+    // (maxAirTemp=28, blowerSpeedPercent=30) from before this schema
+    // version - a stored value is indistinguishable at the value level
+    // alone from a genuine admin choice, which is exactly why this is
+    // gated by a persisted one-time version rather than a "does it equal
+    // the old default" heuristic: once migrated, a future admin setting
+    // either field back to today's old numbers is never touched again.
+    // Corrected LOCALLY here unconditionally (cheap, safe, works fully
+    // offline) - the Firebase side of this migration (pushing the
+    // correction so it survives the next settings pull, and persisting
+    // cfgVersion only once that push actually succeeds) happens in
+    // readSettings() via systemState.configMigrationPending, since it
+    // needs connectivity and this function must stay offline-safe.
+    if (preferences.getUChar("cfgVersion", 0) < CONFIG_SCHEMA_VERSION)
+    {
+        systemState.maxAirTemp = TARGET_MAX_AIR_TEMP;
+        systemState.blowerSpeedPercent = BLOWER_SPEED_DEFAULT_PERCENT;
+        systemState.configMigrationPending = true;
+        Serial.println("[SETTINGS] Config migration pending: maxAirTemp->32C, blowerSpeedPercent->65% (corrected locally; Firebase reconciliation pending connectivity)");
+    }
+
     preferences.end();
 }
 
@@ -1783,6 +1811,53 @@ void FirebaseManager::readSettings()
         lastRejectedBlowerSpeed = incomingBlowerSpeed;
     }
 
+    // Config/settings schema migration, Firebase side (see
+    // CONFIG_SCHEMA_VERSION in Config.h and loadPersistedSettings()'s
+    // matching comment for the local/offline side of this same migration).
+    // The ordinary pull logic above (minAirTemp/maxAirTemp via
+    // applyTargetRange(), blowerSpeedPercent just above) may have just
+    // re-applied whatever STALE value an already-deployed device's Firebase
+    // /settings node still holds from before this schema version
+    // (maxAirTemp=28, blowerSpeedPercent=30) - deliberately overridden
+    // here, AFTER that pull, so the correction always wins over a stale
+    // pulled value this tick. Pushed to Firebase (not merely corrected
+    // in-memory) so the NEXT sync pulls the corrected value instead of
+    // reverting back to the stale one - this is a genuine PUSH, the one
+    // exception to this function's otherwise pull-only behavior, and it
+    // only ever runs while configMigrationPending is true. cfgVersion is
+    // persisted to NVS ONLY once this push actually succeeds - if Firebase
+    // is unreachable, configMigrationPending simply stays true and this
+    // block retries on the next successful sync; a device that never
+    // regains connectivity keeps running correctly on the values
+    // loadPersistedSettings() already corrected locally, indefinitely, it
+    // just never marks the migration formally complete.
+    if (systemState.configMigrationPending)
+    {
+        systemState.maxAirTemp = TARGET_MAX_AIR_TEMP;
+        systemState.blowerSpeedPercent = BLOWER_SPEED_DEFAULT_PERCENT;
+
+        FirebaseJson migrationJson;
+        migrationJson.set("maxAirTemp", systemState.maxAirTemp);
+        migrationJson.set("blowerSpeedPercent", systemState.blowerSpeedPercent);
+
+        if (updateJson(deviceRoot() + "/settings", migrationJson))
+        {
+            systemState.configMigrationPending = false;
+
+            if (preferences.begin("automation", false))
+            {
+                preferences.putUChar("cfgVersion", CONFIG_SCHEMA_VERSION);
+                preferences.end();
+            }
+
+            Serial.println("[SETTINGS] Config migration complete: maxAirTemp=32C, blowerSpeedPercent=65% pushed to Firebase");
+        }
+        else
+        {
+            Serial.println("[SETTINGS] Config migration Firebase push failed - local values already corrected, will retry next sync");
+        }
+    }
+
     // Only validated/accepted runtime values are persisted.
     persistSettings();
 }
@@ -2817,6 +2892,14 @@ void FirebaseManager::readActuatorCommands()
         if (newManualMode != systemState.manualMode)
         {
             Serial.println(newManualMode ? "[MANUAL] Manual Mode enabled" : "[MANUAL] Manual Mode disabled");
+            // Enabling Manual Mode is itself a legitimate manual interaction
+            // and starts the 15-minute inactivity lease even if no actuator
+            // command follows immediately - see
+            // ActuatorManager::update()'s expiry check and
+            // MANUAL_MODE_INACTIVITY_TIMEOUT_MS in Config.h. Refreshing on
+            // the disable edge too is harmless (the expiry check only runs
+            // while manualMode is true).
+            lastManualCommandActivityAt = millis();
         }
         systemState.manualMode = newManualMode;
     }
@@ -3624,6 +3707,17 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
         systemState.phLastPublishedValue = publishedSensors.ph;
     }
     if (!isnan(systemState.phLastPublishedValue)) json.set("ph", systemState.phLastPublishedValue);
+    // pH hardware-fault state (real-hardware pH/EC fault-detection task) -
+    // same shape as dhtAvailable/dhtStale above: always published (booleans,
+    // no NaN state), so Android can distinguish "no reading has confirmed
+    // yet" from "a rail-proximity hardware fault is confirmed" instead of
+    // both collapsing to the same bare "--". See SensorManager::readPH()'s
+    // and Types.h's own comments for the full detection design. Deliberately
+    // distinct from phOutOfRange (AlertManager) - a fault is a hardware
+    // problem, an out-of-range pH is a normal, dosing-correctable chemistry
+    // state.
+    json.set("phFault", publishedSensors.phFault);
+    json.set("phAvailable", publishedSensors.phAvailable);
 
     // tds is derived from the same EC reading, so it is held/published in
     // lockstep with ec below rather than tracked independently.
@@ -3638,6 +3732,10 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     }
     if (!isnan(systemState.ecLastPublishedValue)) json.set("ec", systemState.ecLastPublishedValue);
     if (!isnan(systemState.ecLastPublishedTds)) json.set("tds", systemState.ecLastPublishedTds);
+    // EC hardware-fault state - same shape/reasoning as phFault/phAvailable
+    // above.
+    json.set("ecFault", publishedSensors.ecFault);
+    json.set("ecAvailable", publishedSensors.ecAvailable);
     // Quick-response refinement task: ph above is now the FAST TELEMETRY
     // value (the pH temporal step filter's own trusted candidate), not the
     // slower 10-sample automation-trust window's output - see

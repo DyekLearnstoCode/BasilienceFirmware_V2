@@ -916,7 +916,15 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             }
             break;
         case FOGGER:
-            if (statuses[actuator].source == "automatic")
+            // CONFIRMED FIX (manual root-fogging redesign): canFog() used to
+            // gate only automatic-source Fogger commands. A normal Admin
+            // manual Fogger request now represents the complete root-fogging
+            // operation (paired with the Blower - see
+            // AutomationManager::processManualFogPairing()), not raw
+            // hardware-only testing, so it must clear the same hard gates as
+            // automatic fogging: safety lock, water level, the >maxWaterTemp
+            // nutrient-solution suspension, and valid/in-range pH and EC -
+            // see SafetyManager::canFog()'s own comment for the full list.
             {
                 SafetyResult fogSafety = safetyManager.canFog();
                 if (fogSafety != SafetyResult::SAFE)
@@ -937,9 +945,9 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             }
             // DHT/environment validity deliberately NOT checked here - see
             // the automation resilience pass report and
-            // SafetyManager::canFog()'s matching comment. This used to be an
-            // unconditional block (even for manual commands); root fogging's
-            // hard requirements are water/pH/EC/ownership only.
+            // SafetyManager::canFog()'s matching comment. Root fogging's
+            // hard requirements (now shared by automatic and manual) are
+            // water/temperature/pH/EC/ownership only.
             break;
         case BLOWER:
             // Automatic blower demand is the delivery half of an automatic fog
@@ -977,6 +985,47 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
 void ActuatorManager::update()
 {
     unsigned long currentMillis = millis();
+
+    // Manual Mode inactivity expiry: 15 minutes since the last legitimate
+    // manual interaction (enabling Manual Mode, a fresh actuator command, or
+    // a fresh REFILL/RESET_SAFETY operation request - see
+    // FirebaseManager::lastManualCommandActivityAt). Runs every tick,
+    // unconditional on Firebase/Wi-Fi connectivity - see
+    // lastManualActivityMillis()'s own comment for why it must not live
+    // inside FirebaseManager::update(). Only actuators actually
+    // manually-held (manuallyOverridden[]) are explicitly stopped here, not
+    // Android's own wider disable-time list, so an unrelated in-progress
+    // AUTOMATIC operation (e.g. an automatic refill) is never touched by an
+    // expiring manual session. Latched actuators with no independent
+    // deadline (GROW_LIGHT, CANOPY_FAN, BLOWER, CIRCULATION_PUMP) are
+    // deliberately left alone here - only their hold is released, by the
+    // existing "if (!systemState.manualMode)" cleanup immediately below, so
+    // normal automatic/no-cycle logic decides their resulting state.
+    if (systemState.manualMode &&
+        currentMillis - firebaseManager.lastManualActivityMillis() >= MANUAL_MODE_INACTIVITY_TIMEOUT_MS)
+    {
+        Serial.println("[MANUAL] Manual Mode expired after 15 minutes of inactivity");
+
+        static const Actuator explicitStopOnExpiry[] =
+            { FOGGER, SOLENOID, GROW_PUMP, BLOOM_PUMP, PH_UP_PUMP, PH_DOWN_PUMP, PELTIER };
+
+        // Stopped BEFORE manualMode flips false: a manual FOGGER OFF here
+        // still needs manualMode==true to be honored the same way an
+        // Admin-initiated stop is (see processManualFogPairing()'s purge,
+        // which itself commands the Blower ON for BLOWER_PURGE_MS - an ON
+        // request is rejected by validateCommand() when manualMode is
+        // already false). The OFF requests below are unaffected either way:
+        // validateCommand() never gates an OFF on manualMode.
+        for (Actuator a : explicitStopOnExpiry)
+        {
+            if (manuallyOverridden[a])
+            {
+                requestCommand(a, false, "manual", (double)currentMillis);
+            }
+        }
+
+        systemState.manualMode = false;
+    }
 
     if (!systemState.manualMode)
     {

@@ -105,6 +105,18 @@ private:
     bool devWaterOverrideExitLogged = false;
     bool shouldAutoRefill() const;
 
+    // Shared automatic-refill eligibility condition (reservoir/refill
+    // lifecycle audit fix) - the single source of truth every production
+    // automatic-refill trigger site must use, so "eligible to auto-refill"
+    // can never be judged differently in two places. Requires the TRUSTED
+    // HC-SR04 confirmation (sensors.refillStartConfirmed - 3 consecutive
+    // ACCEPTED readings, see SensorManager::readWaterLevel()), not merely
+    // the debounced alertState.lowWater flag alone: a low-water ALERT can
+    // legitimately stay true across many main-loop ticks off a single
+    // accepted reading, which is sufficient evidence to notify a user but
+    // was never intended to be sufficient evidence to open the solenoid.
+    bool autoRefillEligible() const;
+
     enum class AutomaticRefillPhase : uint8_t
     {
         RUNNING,
@@ -156,12 +168,28 @@ private:
     bool highHumidityDemandActive = false;
     bool lowAirDemandActive = false;
 
+    // Manual root-fogging pairing state (processManualFogPairing()). Tracks
+    // FOGGER's manually-running status across ticks purely to edge-detect
+    // when a manual root-fogging request stops, so the BLOWER_PURGE_MS
+    // clearing purge starts exactly once per stop, and whether that purge is
+    // currently in its 30-second window.
+    bool wasManualFoggerRunning = false;
+    bool manualFogPurgeActive = false;
+    unsigned long manualFogPurgeStart = 0;
+
     // Last AUTOMATIC canopy fan speed actually commanded from a fresh DHT
     // reading (handleCanopyClimate()) - see the automation resilience pass
     // report. Retained (not reset to 100%) whenever DHT becomes unavailable,
-    // so canopy ownership does not abruptly jump; both handleCanopyClimate()
-    // and the idle handleCultivationPaused() fallback consume this. 70% is
-    // the deliberate boot-time default (no valid DHT reading has ever
+    // so canopy ownership does not abruptly jump. CANOPY_FAN-only again as
+    // of two confirmed fixes: no longer consumed by handleCultivationPaused()
+    // (no-active-cultivation-cycle fix - automatic canopy fan is commanded
+    // OFF outright while no cultivation cycle is active, not held at this or
+    // any other baseline speed), and no longer borrowed by the root-zone
+    // Blower in processFogCycle() (root-blower/canopy-fan speed separation
+    // fix - the Blower now uses its own independent
+    // systemState.blowerSpeedPercent while fogging is actively ON). Read
+    // solely within handleCanopyClimate()'s own DHT-unavailable branch now.
+    // 70% is the deliberate boot-time default (no valid DHT reading has ever
     // existed yet) - PWM COMMAND only, never measured RPM. Matches the
     // NORMAL-demand speed in handleCanopyClimate(), itself set to the
     // middle of the 65-75% band real-hardware bench testing found both fans
@@ -260,8 +288,6 @@ private:
 
     void handleCanopyClimate();
 
-    bool processRefillRequest();
-
     bool processPHCorrection();
 
     bool processECCorrection();
@@ -286,6 +312,13 @@ private:
     void logAutomationTestBlockReason();
 
     void processFogCycle();
+
+    // Manual root-fogging redesign: coordinates the root-zone Blower with a
+    // manually-requested Fogger (Fogger + Blower together represent one
+    // manual root-fogging operation, not raw Fogger-only testing), including
+    // the fan-assisted-demand blower speed and the stop/purge sequence. See
+    // AutomationManager.cpp for the full design note.
+    void processManualFogPairing();
 
     //==================================================
     // Scheduling

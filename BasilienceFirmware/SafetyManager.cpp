@@ -255,6 +255,33 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SENSOR_FAULT;
     }
 
+    // Cooling/fogging architecture update: nutrient-solution temperature
+    // above the maximum acceptable ceiling (systemState.maxWaterTemp, 28.0C
+    // default) suspends root fogging as a safety response, independent of
+    // cooling's own automatic-Peltier gate below - this is the single
+    // authoritative fogging gate the task calls for, not a check scattered
+    // into AutomationManager::processFogCycle()'s own state machine.
+    // Deliberately no separate validWaterTemperature()/SENSOR_FAULT check
+    // here: an invalid (NaN) reading makes this comparison false by IEEE-754
+    // definition, so an untrustworthy DS18B20 does not itself suspend
+    // fogging through this gate - DS18B20 validity continues to affect only
+    // cooling (SafetyManager::canCool()), matching the confirmed scope of
+    // this change. Strict > (not >=): exactly 28.0C is still the normal
+    // "allowed" side, matching the existing waterTempOutOfRange alert's own
+    // > comparison (AlertManager::updateWaterTemperatureAlert()) - only a
+    // genuine excursion ABOVE the ceiling suspends fogging. No separate
+    // release hysteresis is added for the resume condition (waterTemp <=
+    // maxWaterTemp) - canFog() is already re-evaluated fresh every tick with
+    // a plain threshold for every other condition here (pH/EC/water level
+    // all use plain thresholds, no decision-layer hysteresis - see the pH
+    // comment below), so a second, different pattern for this one check
+    // would be inconsistent with the existing architecture, not a missing
+    // safety margin.
+    if(sensors.waterTemp > systemState.maxWaterTemp)
+    {
+        return SafetyResult::HIGH_WATER_TEMP;
+    }
+
     if(!validPH())
     {
         return SafetyResult::SENSOR_FAULT;

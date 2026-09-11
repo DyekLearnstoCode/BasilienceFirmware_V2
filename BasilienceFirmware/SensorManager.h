@@ -147,6 +147,28 @@ private:
     void updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, const char* logTag, DebugCategory category);
     void resetStabilityWindow(StabilityWindow& window);
 
+    // pH/EC rail-proximity hardware-fault detection - see Config.h's
+    // "pH/EC Hardware-Fault Detection" section (PH_FAULT_*/EC_FAULT_*) for
+    // the full design. Evaluated on its own PH_FAULT_CHECK_INTERVAL_MS/
+    // EC_FAULT_CHECK_INTERVAL_MS cadence inside readPH()/readEC() -
+    // deliberately NOT once per loop() tick, since phSampler/ecSampler's
+    // rolling median only genuinely refreshes every 20ms and readPH()/
+    // readEC() are otherwise called far more often than that (same class of
+    // bug already avoided for the pH step filter's own evaluation cadence).
+    // The confirmed/recovering flags this state produces
+    // (physicalSensors.phFault/ecFault, Types.h) are read and acted on in
+    // applyEffectiveSensors(), never here directly - readPH()/readEC() only
+    // ever populate physicalSensors, matching every other sensor's existing
+    // split between acquisition (read*()) and effective-dataset assembly
+    // (applyEffectiveSensors()).
+    unsigned long lastPhFaultCheckAt = 0;
+    uint8_t phFaultStreak = 0;
+    uint8_t phFaultRecoveryStreak = 0;
+
+    unsigned long lastEcFaultCheckAt = 0;
+    uint8_t ecFaultStreak = 0;
+    uint8_t ecFaultRecoveryStreak = 0;
+
     // pH temporal step filter - see Config.h's PH_STEP_ACCEPT_DELTA/
     // PH_STEP_CONFIRM_TOLERANCE/PH_STEP_CONFIRM_COUNT and
     // applyEffectiveSensors()'s own comment. Mirrors the HC-SR04 water-depth
@@ -250,7 +272,8 @@ private:
 
     // Throttle for readWaterLevel()'s [WATER] depth/percent/volume
     // diagnostic - readWaterLevel() itself runs every
-    // WATER_LEVEL_READ_INTERVAL_MS (300ms), far more often than this log
+    // WATER_LEVEL_READ_INTERVAL_MS (5s; an earlier version of this comment
+    // incorrectly said 300ms), far more often than this log
     // line needs to print.
     unsigned long lastWaterLevelDiagnosticAt = 0;
 

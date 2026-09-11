@@ -105,6 +105,16 @@ private:
     // tighter, event-driven half of the manual-interaction defer signal: see
     // update()'s deferLowPriorityForManualInteraction.
     unsigned long lastManualCommandActivityAt = 0;
+
+public:
+    // Read-only accessor for ActuatorManager::update()'s Manual Mode
+    // inactivity-expiry check, which must run every loop() tick regardless
+    // of Firebase connectivity - see that check's own comment for why it
+    // cannot live inside FirebaseManager::update() (skipped during
+    // provisioning / before Wi-Fi connects).
+    unsigned long lastManualActivityMillis() const { return lastManualCommandActivityAt; }
+
+private:
     uint16_t lastProtectedAutomaticRequestId = 0;
     uint8_t automaticControlPassesRemaining = 0;
 

@@ -6,6 +6,24 @@
 
 #define OPERATION_TIMEOUT_MS 300000UL
 
+// ======================================================
+// Config/Settings Schema Migration
+// ======================================================
+// Bumped whenever a compiled default changes in a way that could disagree
+// with a value an already-deployed device has already persisted (NVS and/or
+// Firebase) from a previous firmware version - a stored value is
+// indistinguishable at the value level alone from a genuine admin choice,
+// so reconciling it must be a one-time, explicitly-versioned migration, not
+// a "does it equal the old default" heuristic that could later clobber a
+// deliberate admin setting that happens to match. See
+// FirebaseManager::loadPersistedSettings()/readSettings() for the actual
+// migration steps this version gates (NVS key "cfgVersion").
+//   v1 (this version): air-temperature monitored maximum corrected 28C ->
+//     32C (systemState.maxAirTemp/TARGET_MAX_AIR_TEMP), automatic
+//     root-blower fogging speed corrected 30% -> 65%
+//     (systemState.blowerSpeedPercent/BLOWER_SPEED_DEFAULT_PERCENT).
+constexpr uint8_t CONFIG_SCHEMA_VERSION = 1;
+
 // Bounded local fallback: how long Fogger/Blower resume waits after a local
 // pH/EC correction completes for RTDB COMPLETED publication before releasing
 // from local safe state anyway, so plant control never depends on cloud
@@ -367,6 +385,115 @@ constexpr uint8_t PH_STEP_CONFIRM_COUNT = 3;
 // the median).
 constexpr unsigned long PH_STEP_SAMPLE_INTERVAL_MS = 300UL;
 
+// ======================================================
+// pH/EC Hardware-Fault Detection (rail-proximity, conservative)
+// ======================================================
+// Distinct from the domain/step/stability validation above, which already
+// catches an implausible-but-mid-range candidate (e.g. pH 24.1 from a
+// floating-but-not-rail-stuck input) - this layer instead inspects the RAW
+// millivolt signal (physicalSensors.phMilliVolts/ecRaw) for evidence of a
+// genuine electrical fault: a signal pinned at/near the ADC's own physical
+// rail, which no chemistry reading through this transmitter/module can ever
+// legitimately produce. Deliberately NOT a "normal cultivation voltage
+// range" - see this task's own design principle: a chemically unusual
+// solution (e.g. a very high or very low but real EC/pH) must never be
+// mistaken for a disconnected probe. These margins are anchored to the
+// hardware's own physical/documented limits, not to any agronomic range.
+//
+// Precedent this margin is chosen against: the pH module's own prior
+// documented failure (see basilience_ph_calibration.md, 2026-09-05..08) was
+// a dead amplifier board found - via multimeter, directly on the module's
+// signal pin - pinned at a stable 5V regardless of the probe. On this
+// 3.3V-max ESP32 ADC input, a fault like that reads as pinned at/near the
+// ADC's own high rail, exactly what PH_FAULT_RAIL_HIGH_MV/EC_FAULT_RAIL_HIGH_MV
+// below are built to catch. A low-rail fault (grounded/shorted/unpowered
+// signal line) is the symmetric case at the bottom of the range.
+//
+// pH: the DFRobot Gravity Analog pH Meter V2 (SEN0161-V2) transmitter's own
+// documented output spec is 0-3.0V, so PH_FAULT_RAIL_HIGH_MV sits just under
+// that spec's own ceiling - a reading AT or ABOVE the transmitter's own
+// stated maximum is not a value it should ever produce from a probe, on any
+// solution, within its designed operating range. Cross-checked against this
+// unit's own calibration (Calibration.h: pH 7.00 ~= 1500mV, pH 4.00 ~=
+// 2038mV): even the full 0-14 pH domain extrapolates to roughly 245-2755mV,
+// comfortably inside both rail margins with real margin to spare.
+constexpr int PH_FAULT_RAIL_LOW_MV = 50;
+constexpr int PH_FAULT_RAIL_HIGH_MV = 2950;
+
+// EC: the module's exact model/transmitter spec is NOT known (see the
+// sensor-inventory audit - it is only known to be an analog TDS-style probe,
+// 5V-powered, read via GPIO34's analogReadMilliVolts()). Without a documented
+// transmitter ceiling to anchor against the way pH's 0-3.0V spec allows,
+// this instead uses the ESP32 ADC_11db input's own practical ceiling as the
+// conservative bound - not an assumption about what the module itself should
+// output. EC's own calibration anchor (Calibration.h: 1.799V for a 12.88
+// mS/cm reference solution, far above the real 1.2-2.0 mS/cm cultivation
+// range) sits well clear of this margin on the low side already.
+constexpr int EC_FAULT_RAIL_LOW_MV = 50;
+constexpr int EC_FAULT_RAIL_HIGH_MV = 3200;
+
+// Raw 12-bit ADC count corroboration (AnalogSampler::rawMedian(), 0-4095) -
+// the CHIP-INDEPENDENT rail signal, preferred over the millivolt thresholds
+// above where the two disagree. analogReadMilliVolts()'s calibrated ceiling
+// at raw=4095 depends on this specific chip's own eFuse calibration data
+// (Two Point / Vref / Default), which is not read out or logged anywhere in
+// this firmware and is known to vary unit-to-unit - commonly landing
+// somewhere in the ~2900-3300mV band, but not a guaranteed fixed number. A
+// millivolt-only high-rail check therefore risks a false NEGATIVE on a chip
+// whose calibration curve maps raw=4095 to a value below PH_FAULT_RAIL_HIGH_MV/
+// EC_FAULT_RAIL_HIGH_MV - a genuinely saturated input that never gets
+// flagged. Raw count has no such risk: 4095 at 12-bit resolution is the
+// ADC's own physical ceiling on every ESP32 unit, true by construction, not
+// by calibration. Shared between pH and EC (both use the same 12-bit
+// resolution/ADC_11db attenuation, set once in SensorManager::begin() -
+// this is an ADC/attenuation-level property, not a per-sensor one, unlike
+// the millivolt margins above which are legitimately sensor-specific).
+//
+// Margins: 5 counts (~0.12% of full scale) off each hard rail, wide enough
+// to absorb residual ADC dither at true saturation even after the existing
+// 51/61-sample median, narrow enough that no plausible mid-range signal
+// (pH or EC alike) can ever wander into it. Combined with the millivolt
+// checks via OR - either signal alone is sufficient evidence of a fault,
+// see SensorManager::readPH()/readEC().
+constexpr int ADC_FAULT_RAW_LOW = 5;
+constexpr int ADC_FAULT_RAW_HIGH = 4090;
+
+// How often the fault detector re-evaluates the rolling median, deliberately
+// independent of the 20ms raw sample rate feeding phSampler/ecSampler and of
+// STABILITY_SAMPLE_INTERVAL_MS/PH_STEP_SAMPLE_INTERVAL_MS above (different
+// purposes, different cadences). Evaluating any faster would let "N
+// consecutive evaluations" be satisfied by re-checking one still-settling
+// median within milliseconds - the same class of bug already fixed
+// elsewhere for the pH step filter and the HC-SR04 step filter (both
+// require genuinely distinct, time-separated observations).
+constexpr unsigned long PH_FAULT_CHECK_INTERVAL_MS = 1000UL;
+constexpr unsigned long EC_FAULT_CHECK_INTERVAL_MS = 1000UL;
+
+// Consecutive rail-condition evaluations (at the interval above) required
+// before a probable hardware fault is CONFIRMED. Deliberately conservative:
+// actuator switching (peristaltic pumps, solenoid, Peltier) can transiently
+// disturb the analog front end, and a fault call blocks dosing/fogging until
+// manually reset - a false positive here is costly, so this trades speed for
+// certainty. 8 x 1000ms = 8 seconds minimum of sustained rail-pinned signal
+// before a fault is ever raised.
+constexpr uint8_t PH_FAULT_CONFIRM_COUNT = 8;
+constexpr uint8_t EC_FAULT_CONFIRM_COUNT = 8;
+
+// Consecutive PLAUSIBLE (non-rail) evaluations required before a CONFIRMED
+// fault clears. Symmetric with the confirmation count above, same reasoning
+// SensorManager::readDHT() already established for its own dhtRecoveryStreak:
+// a marginal/flickering fault recovering on one isolated good sample and
+// immediately failing again must not thrash phFault/ecFault (and the alert/
+// notification it feeds). Clearing this flag only stops forcing sensors.ph/
+// ec to NaN - it does NOT itself restore automation trust; the existing
+// step filter/stability window (reset at fault onset) must still
+// independently re-earn a confirmed, stable reading before
+// canDosePH()/canDoseEC()/canFog() report SAFE again. See this task's
+// required recovery sequence: electrical signal plausible -> fault recovery
+// confirmed -> normal stability criteria satisfied -> automation eligible.
+constexpr uint8_t PH_FAULT_RECOVERY_COUNT = 8;
+constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
+
 // Throttle for updateStabilityWindow()'s periodic diagnostic dump (real-
 // hardware pre-integration follow-up, Part A) - independent of
 // STABILITY_SAMPLE_INTERVAL_MS (how often the window itself re-evaluates).
@@ -409,24 +536,34 @@ constexpr unsigned long PH_EC_STABLE_TIMEOUT_MS = 180000UL;
 
 constexpr float LOW_WATER_LEVEL = 20.0f;
 
-// Compiled-default fallback for systemState.highWaterTemp/coolerOffTemp -
-// used only before the first AutomationManager::updateCooling() tick derives
-// them from systemState.maxWaterTemp, and as the NVS-restore default. Not
-// the authoritative cooling threshold; see WATER_COOLING_HYSTERESIS.
-// Water-temperature limit update (18-25C -> 18-28C task): kept consistent
-// with TARGET_MAX_WATER_TEMP below and the existing 2.5C hysteresis, fixing
-// the prior 25.0/23.0 fallback pair's 0.5C drift from its own documented
-// 2.5C gap in the process.
-constexpr float HIGH_WATER_TEMP = 28.0f;
+// Compiled defaults for systemState.highWaterTemp/coolerOffTemp - the NVS-
+// restore default and what a never-before-configured device boots with.
+// Cooling/fogging architecture update: these are INDEPENDENTLY authoritative
+// again (AutomationManager::updateCooling() no longer overwrites either from
+// systemState.maxWaterTemp every tick - that overwrite was silently
+// defeating their existing Firebase/NVS read-write wiring, making them look
+// configurable while never actually taking effect; removed as part of this
+// change). HIGH_WATER_TEMP is the PREVENTIVE automatic-cooling trigger
+// (despite its name, kept unchanged deliberately - see updateCooling()'s own
+// comment on why a full field/key rename was judged too risky for an
+// un-compiled change), not the maximum - that role now belongs solely to
+// systemState.maxWaterTemp/TARGET_MAX_WATER_TEMP (28.0C), which is also the
+// separate upper safety ceiling SafetyManager::canFog() suspends fogging
+// above. COOLER_OFF_TEMP is the cooling release threshold, independently
+// set rather than derived - the resulting gap (26.5 - 25.5 = 1.0C) is
+// smaller than the previous derived 2.5C, an intentional consequence of
+// moving the trigger down while preserving the already-confirmed 25.5C
+// release point; see WATER_COOLING_HYSTERESIS's own comment below for why
+// that constant is no longer used to compute it.
+constexpr float HIGH_WATER_TEMP = 26.5f;
 constexpr float COOLER_OFF_TEMP = 25.5f;
 
-// Effective cooling hysteresis: the app-configured maxWaterTemp is now the
-// single authoritative cooling-ON ceiling (updateCooling() applies
-// waterTemp > maxWaterTemp), and this is subtracted from it for the
-// cooling-OFF release threshold (waterTemp < maxWaterTemp -
-// WATER_COOLING_HYSTERESIS) - preserving the 28.0/25.5 = 2.5C gap as a
-// single named constant rather than two independently configurable
-// thresholds.
+// RETIRED - superseded by architecture update (cooling trigger/release are
+// now independently-set HIGH_WATER_TEMP/COOLER_OFF_TEMP above, not one
+// derived from systemState.maxWaterTemp minus this gap). Left in place,
+// unmodified, only so it remains available as a documented historical
+// reference for the resulting 1.0C gap's own prior value (2.5C) - not read
+// by any live code path any more.
 constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 
 // ======================================================
@@ -442,6 +579,22 @@ constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 // DevOptionsFragment's existing manual actuator controls) before treating
 // any of these as final. Kept as their own named constants specifically so
 // they are easy to find and change once that calibration is done.
+//
+// DEFERRED - ineffective-cooling detection: deliberately NOT implemented.
+// The pulse mechanism can currently repeat FILL->COOL_SOAK->FLUSH
+// indefinitely for as long as waterTemp stays above coolerOffTemp, with no
+// concept of "cooling is running but not actually working" - only a genuine
+// hardware confirm-timeout (COOLING_PULSE_CONFIRM_TIMEOUT_MS below) or an
+// invalid DS18B20 reading currently locks the subsystem. Adding a required
+// per-cycle degrees-C drop or a maximum-cycles ceiling would be arbitrary
+// without first physically characterizing this specific reservoir/Peltier
+// pair - do not add one without first measuring, on real hardware:
+// temperature immediately before a pulse; temperature after FILL/SOAK/FLUSH
+// completes; the resulting cooling rate; how many cycles this reservoir
+// typically needs to recover from a real excursion; behavior under hotter
+// ambient conditions than bench-tested; and whether one Peltier module can
+// hold this ~10.6L working volume below 28C at all under worst-case ambient.
+// Flagged here, not solved, until that data exists.
 constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 60UL * 1000UL;
 constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 120UL * 1000UL;
 constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 60UL * 1000UL;
@@ -467,8 +620,16 @@ constexpr unsigned long COOLING_PULSE_CONFIRM_TIMEOUT_MS = 30UL * 1000UL;
 // REFILL_START_LEVEL/REFILL_STOP_LEVEL), which answer a different question:
 // "when should a fan/cooler/valve switch state?" A release/off threshold is
 // hysteresis, never a target minimum.
+// CONFIRMED BUG FIX (air-temperature range correction): TARGET_MAX_AIR_TEMP
+// was 28.0C, stale - that number belongs to nutrient-solution temperature
+// (TARGET_MAX_WATER_TEMP below, a completely separate constant/concept) and
+// had been mistakenly carried into air temperature's own target range. The
+// confirmed official Basilience monitored air-temperature range is 20-32C,
+// matching the existing fan-control ceiling (HIGH_AIR_TEMP) and fog-strategy
+// ceiling (HOT_FOG_TEMPERATURE) that were already 32.0C - those two were
+// correct all along; only this target/alert range was out of step with them.
 constexpr float TARGET_MIN_AIR_TEMP = 20.0f;
-constexpr float TARGET_MAX_AIR_TEMP = 28.0f;
+constexpr float TARGET_MAX_AIR_TEMP = 32.0f;
 
 constexpr float TARGET_MIN_HUMIDITY = 60.0f;
 constexpr float TARGET_MAX_HUMIDITY = 75.0f;
@@ -501,6 +662,15 @@ constexpr float HUMIDITY_RELEASE = 70.0f;
 constexpr float LOW_AIR_TEMP = 20.0f;
 constexpr float COLD_AIR_RELEASE = 22.0f;
 
+// Fog-strategy cadence selector thresholds (DHT22 air temperature only -
+// never nutrient-solution temperature, never humidity). Sole consumer is
+// AutomationManager::processFogCycle(), via systemState.hotFogTemperature/
+// coldFogTemperature in Types.h, which default to these constants. Unlike
+// highAirTemp/highHumidity above, this pair has no Firebase sync, no NVS
+// persistence, and no app UI yet - changing the compiled default here is
+// currently the only way to change it. Boundary is inclusive on both ends:
+// temp >= HOT_FOG_TEMPERATURE -> hot cadence, temp <= COLD_FOG_TEMPERATURE
+// -> cold cadence, otherwise normal.
 constexpr float HOT_FOG_TEMPERATURE = 32.0f;
 constexpr float COLD_FOG_TEMPERATURE = 20.0f;
 
@@ -596,16 +766,27 @@ constexpr unsigned long COLD_FOG_OFF_TIME =
 constexpr unsigned long BLOWER_PURGE_MS =
     30UL * 1000UL; // 30 seconds
 
-// Configurable automatic Blower speed (real-hardware Canopy/Blower PWM
-// follow-up). Replaces the previous hard-coded 100% used while the
-// Fogger/Blower pair is automatically ON - see AutomationManager::
-// processFogCycle(). 50% is a FALLBACK ONLY (used when no valid Firebase
-// value has ever been accepted, or the device is offline at boot before
-// settings load) - it is never written back to Firebase on its own; see
-// FirebaseManager::readSettings()'s own comment for the accept/reject
-// rule. Range mirrors validPercentage()-style bounds but narrower, since a
-// fogging airflow test below 30% is not a realistic operating point.
-constexpr uint8_t BLOWER_SPEED_DEFAULT_PERCENT = 30;
+// Configurable automatic root-zone Blower speed while the Fogger/Blower
+// pair is actively ON (NORMAL/COLD/HOT fogging cadence - see
+// AutomationManager::processFogCycle()). CONFIRMED BUG FIX (root-blower/
+// canopy-fan speed separation): this constant and systemState.
+// blowerSpeedPercent already existed, fully wired to Firebase/NVS, but were
+// never actually read by processFogCycle() - it used lastAutomaticCanopySpeed
+// (the CANOPY_FAN's own temp/humidity-derived speed) instead, despite this
+// comment already (incorrectly) claiming the replacement had happened. Now
+// genuinely consumed, and the root-zone blower's automatic fogging speed is
+// independent of canopy temperature/humidity demand and of CANOPY_FAN's PWM,
+// exactly as intended - confirmed default is 65%, not the previous 30%
+// (the comment previously and inconsistently also said "50%" here - neither
+// matched the actual 30 value; this is now internally consistent). Used as
+// the DEFAULT AND the boot/never-configured fallback - it is never written
+// back to Firebase on its own; see FirebaseManager::readSettings()'s own
+// comment for the accept/reject rule. The purge phase (BLOWER_PURGE_MS)
+// remains a separate, deliberately fixed 100% - never this value - see
+// processFogCycle()'s own comment. Range mirrors validPercentage()-style
+// bounds but narrower, since a fogging airflow test below 30% is not a
+// realistic operating point.
+constexpr uint8_t BLOWER_SPEED_DEFAULT_PERCENT = 65;
 constexpr uint8_t BLOWER_SPEED_MIN_PERCENT = 30;
 constexpr uint8_t BLOWER_SPEED_MAX_PERCENT = 100;
 
@@ -653,11 +834,26 @@ constexpr unsigned long EC_DILUTION_TIME = 5000UL;
 // MAX_EC_ATTEMPTS=3 retry-count limit as the trigger for locking a stalled
 // subsystem. Anchored to systemState.correctionCycleStartAt, set once when
 // a correction first begins and not reset by an internal redose - see
-// AutomationManager::handleStabilizingPH()/handleStabilizingEC(). If still
-// improving on its own when this expires, dosing simply stops (no more
-// redoses) but the subsystem is NOT locked - it keeps monitoring and lets
-// the existing phOutOfRange/ecLow/ecHigh alert path fire normally on any
-// further drift. Only a genuinely stalled reading locks at this deadline.
+// AutomationManager::handleStabilizingPH()/handleStabilizingEC(). A HARD
+// ceiling on the whole episode: once expired, the correction locks
+// (phSubsystemLocked/ecSubsystemLocked, requiring manual Reset Safety)
+// unless the target was already reached first - see the target-reached
+// check earlier in the same function, which returns via
+// completeCurrentOperation() independent of this budget. CONFIRMED BUG FIX
+// (correction-budget limbo): this previously locked ONLY when the reading
+// was also classified as not improving (phLastTrendImproving/
+// ecLastTrendImproving == false), which let a reading still classified as
+// improving - even glacially, via passive drift with no redose ever
+// actually landing it in range - remain parked in STABILIZING_PH/
+// STABILIZING_EC indefinitely: dosing correctly stopped (both redose paths
+// are separately gated on the budget too), but reservoirLocked stayed true
+// and the state never returned to NORMAL, permanently blocking the OTHER
+// chemical subsystem from ever being evaluated. Trend classification still
+// guides which redose path fires WHILE under budget; it no longer has any
+// bearing on whether the episode terminates once the budget expires. The
+// existing phOutOfRange/ecLow/ecHigh alert path is unaffected either way -
+// it re-evaluates off sensors.ph/ec every tick regardless of correction
+// state, so monitoring and notification continue normally after the lock.
 constexpr unsigned long PH_EC_CORRECTION_STALL_TIMEOUT_MS = 240000UL; // 4 min
 
 // A reading must hold continuously stable this long, past the first
@@ -725,6 +921,17 @@ constexpr unsigned long AUTOMATIC_REFILL_RUN_TIME = 30UL * 1000UL;
 constexpr unsigned long AUTOMATIC_REFILL_SETTLE_TIME = 10UL * 1000UL;
 
 constexpr unsigned long MANUAL_PUMP_RUNTIME = 5000UL;
+
+// Manual Mode automatically expires after this long with no legitimate
+// manual interaction (enabling Manual Mode, a fresh actuator command, or a
+// fresh REFILL/RESET_SAFETY operation request - see
+// FirebaseManager::lastManualCommandActivityAt and
+// ActuatorManager::update()'s expiry check). Enforced locally via millis(),
+// independent of Firebase/Wi-Fi connectivity, so it still fires if the app
+// closes, the Admin logs out, or the device goes offline. Does not extend
+// or shorten any actuator's own independent deadline above
+// (MANUAL_PUMP_RUNTIME/OPERATION_TIMEOUT_MS) - those remain authoritative.
+constexpr unsigned long MANUAL_MODE_INACTIVITY_TIMEOUT_MS = 15UL * 60UL * 1000UL;
 
 // ======================================================
 // Water Level Sensor Calibration
@@ -814,7 +1021,10 @@ constexpr float REFILL_STOP_CM = 3.0f;
 // enough to become the accepted control value. A single bad echo surrounded
 // by consistent real readings never accumulates 3 agreeing candidates and is
 // permanently rejected; a genuine drain/fill/overfill still confirms within
-// a few read cycles (each ~300ms apart, so ~0.6-0.9s worst case).
+// a few read cycles (each WATER_LEVEL_READ_INTERVAL_MS = 5s apart, so up to
+// ~10s worst case for 3 agreeing candidates - corrected from an earlier,
+// incorrect "~300ms apart" figure that belonged to pH's own, separate
+// PH_STEP_SAMPLE_INTERVAL_MS and did not describe this filter).
 constexpr float WATER_LEVEL_STEP_ACCEPT_CM = 0.40f;
 constexpr float WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM = 0.15f;
 constexpr uint8_t WATER_LEVEL_STEP_CONFIRM_COUNT = 3;

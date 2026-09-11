@@ -39,6 +39,21 @@ public:
 
     int maxValue() const;
 
+    // Raw 12-bit ADC count (analogRead(), 0-4095), captured UNCONDITIONALLY
+    // alongside the mode-selected samples[] above regardless of this
+    // instance's own ReadMode - i.e. a MILLIVOLTS-mode sampler (pH/EC's own
+    // ecSampler/phSampler) still tracks raw counts too, at no extra
+    // configuration cost. Added for rail-proximity hardware-fault detection
+    // (see Config.h's PH_FAULT_RAW_*/EC_FAULT_RAW_* and SensorManager::
+    // readPH()/readEC()): analogReadMilliVolts()'s calibrated ceiling varies
+    // per-chip (eFuse calibration data), but the raw ADC's own saturation
+    // point (0 or 4095 at 12-bit) is an architectural constant true on every
+    // ESP32 unit regardless of calibration - a chip-independent corroborating
+    // signal the calibrated millivolt reading alone cannot provide. Not used
+    // by any EXISTING filtering/calibration decision - median()/average()
+    // above are completely unaffected, still driven purely by ReadMode.
+    int rawMedian() const;
+
 private:
     uint8_t pin;
 
@@ -51,6 +66,10 @@ private:
     unsigned long lastSampleTime;
 
     int samples[MAX_SAMPLES];
+
+    // See rawMedian()'s own comment - parallel to samples[] above, always
+    // populated regardless of mode.
+    int rawSamples[MAX_SAMPLES];
 
     uint8_t sampleIndex;
 

@@ -333,10 +333,27 @@ void AutomationManager::update()
     // requests that return early below. Both physical and mock inputs have already
     // been normalized into the same effective sensors structure before this call.
     //
-    // This is deliberately ahead of the cultivation gate: reservoir cooling and
-    // the circulation it depends on are hardware protection, not cultivation,
-    // and must run whether or not a growth cycle exists.
+    // Deliberately ahead of the cultivation gate below - CONFIRMED, updated
+    // scope: water-TEMPERATURE SENSING and ALERTS (AlertManager::
+    // updateWaterTemperatureAlert(), called from within updateCooling()
+    // unconditionally) and MANUAL Peltier control must run regardless of
+    // cultivation state, so this call site stays here, ahead of the gate.
+    // AUTOMATIC cooling itself, however, now DOES require an active
+    // cultivation cycle (or isolated Cooling Automation Test Mode for bench
+    // testing) - see updateCooling()'s own comment on automaticCoolingAllowed
+    // for the full reasoning and how ending a cycle mid-cooling safely
+    // returns the pulse state machine to IDLE. The previous version of this
+    // comment claimed cooling "must run whether or not a growth cycle
+    // exists" without qualification - that was accurate for the old
+    // single-gate design and is no longer accurate for automatic cooling.
     updateCooling();
+
+    // Manual root fogging (processManualFogPairing()) must likewise run
+    // regardless of cultivation state, OperationRequest lifecycle, or RTC
+    // sync below - manual root-fogging is testable at any time, matching
+    // every other manual actuator - see item 11 of the confirmed Manual
+    // Mode audit.
+    processManualFogPairing();
 
     // Observes the active-cycle flag and acts on its transitions. Also runs
     // ahead of the operation lifecycle below so a chemistry dose that must not
@@ -556,14 +573,26 @@ void AutomationManager::handleCultivationPaused()
     // before this handler, so reaching here means no refill is in progress.
     actuatorManager.requestCommand(SOLENOID, false, "automatic", millis());
 
-    // Ventilation is kept at a safe baseline rather than stopped. No active
-    // growth cycle means handleCanopyClimate() itself isn't running, so this
-    // mirrors its own DHT-unavailable fallback (see the automation
-    // resilience pass report): retain the last automatic canopy demand
-    // rather than forcing 100% while DHT is unavailable/stale.
-    actuatorManager.requestCommand(
-        CANOPY_FAN, true, "automatic", millis(),
-        sensors.dhtAvailable ? 70 : lastAutomaticCanopySpeed);
+    // CONFIRMED BUG FIX (no-active-cultivation-cycle behavior): the canopy
+    // fan used to be kept running at a safe 70%/last-automatic-speed
+    // baseline here instead of stopping, on the reasoning that ventilation
+    // is a general good regardless of cultivation state. Per the confirmed
+    // production rule, "no active cultivation cycle" means NO automatic
+    // cultivation actuator operates, full stop - the canopy fan is an
+    // automatic cultivation actuator like any other in this function
+    // (grow light, dosing pumps, solenoid, fogging/blower above), not a
+    // standing exception. Commanded OFF every tick this handler runs (the
+    // same pattern already used for every other actuator above), so a fan
+    // left running automatically when the cycle ends is commanded off on
+    // the very next control update once cultivation goes inactive.
+    // Unaffected: manual control (this is still an "automatic"-source
+    // command, so an admin's manual ON under Manual Mode still outranks it
+    // exactly as it already does for every other actuator here - see
+    // ActuatorManager::requestCommand()'s manual-hold priority), and
+    // isolated Automation Test Mode (this function is never reached at all
+    // while any subsystem is isolated - see the cultivation gate in
+    // update()), so bench testing is unaffected either way.
+    actuatorManager.requestCommand(CANOPY_FAN, false, "automatic", millis());
 }
 
 void AutomationManager::setManualCoolingDemand(bool active)
@@ -835,8 +864,17 @@ void AutomationManager::validateSystem()
     // developer bypass: real water measurement/status stays active, but the
     // pre-startup refill requirement is skipped so the bench can proceed
     // straight to STARTUP.
+    // autoRefillEligible() (reservoir/refill lifecycle audit fix) - CONFIRMED
+    // BUG FIX: this site previously used alertState.lowWater && shouldAutoRefill()
+    // directly, omitting sensors.refillStartConfirmed entirely - the only one
+    // of the two production automatic-refill trigger sites that did. A
+    // pre-STARTUP refill could therefore begin on the debounced alert flag
+    // alone, without the same trusted HC-SR04 reading-agreement confirmation
+    // handleNormal()'s own trigger already required. Both sites now share
+    // the exact same eligibility condition - see its own comment in
+    // AutomationManager.h.
     if (automationAllowed(AutomationTestSubsystem::REFILL) &&
-        alertState.lowWater && shouldAutoRefill() &&
+        autoRefillEligible() &&
         !systemState.ignoreWaterLevelAutomation)
     {
         SafetyResult result =
@@ -1373,27 +1411,28 @@ void AutomationManager::handleNormal()
         }
     }
 
-    // Check for automatic refill before processing manual requests. The
-    // developer water-level override (systemState.ignoreWaterLevelAutomation)
-    // only ever suppresses this AUTOMATIC trigger - processRefillRequest()
-    // below still services an explicit manual "Trigger Refill" unconditionally.
+    // Check for automatic refill. Manual "Trigger Refill" requests never
+    // reach this function at all - they arrive as an OperationRequest
+    // (OperationType::REFILL, RequestSource::MANUAL) and are dispatched by
+    // the operation-lifecycle block earlier in updateAutomation(), before
+    // handleNormal() is ever called for that tick - see
+    // processRefillOperation().
     // refillSubsystemLocked is checked explicitly here, not only inside
     // canRefill() below, so a persistent low-water condition that already
     // exhausted MAX_REFILL_ATTEMPTS can never start a brand-new bounded
     // refill operation (a fresh "starting attempt 1") while that same
     // unresolved episode continues - only the re-arm check above, or an
     // explicit admin reset, can lift it.
-    // refillStartConfirmed (resilience pass follow-up, part 2 of the last
-    // targeted check) requires WATER_LEVEL_STEP_CONFIRM_COUNT consecutive
-    // ACCEPTED readings at/below refillStartLevelCm - see
-    // SensorManager::readWaterLevel(). alertState.lowWater is left as an
-    // additional gate, unchanged, rather than folded into this condition:
-    // its own notification-facing debounce/semantics are untouched, this
-    // only adds a stricter, independent requirement before an AUTOMATIC
-    // refill is actually allowed to start.
+    // autoRefillEligible() (reservoir/refill lifecycle audit fix) is the
+    // single shared eligibility condition - see its own comment in
+    // AutomationManager.h for why sensors.refillStartConfirmed (the TRUSTED
+    // HC-SR04 confirmation) is required on top of the debounced
+    // alertState.lowWater flag, and why every automatic-refill trigger site
+    // (this one and validateSystem()'s pre-STARTUP one) must use the exact
+    // same condition rather than each re-deriving its own.
     if (automationAllowed(AutomationTestSubsystem::REFILL) &&
         !systemState.refillSubsystemLocked &&
-        alertState.lowWater && sensors.refillStartConfirmed && shouldAutoRefill() &&
+        autoRefillEligible() &&
         !systemState.ignoreWaterLevelAutomation)
     {
         SafetyResult result = safetyManager.canRefill();
@@ -1416,11 +1455,6 @@ void AutomationManager::handleNormal()
             changeState(REFILLING);
             return;
         }
-    }
-
-    if(processRefillRequest())
-    {
-        return;
     }
 
     // Automatic re-arm for a terminal PH failure latch, mirroring the
@@ -1548,7 +1582,6 @@ bool AutomationManager::validateNormalOperation()
 {
     static bool diagnosticInitialized = false;
     static SafetyResult lastDiagnosticResult = SafetyResult::SAFE;
-    static bool coolingFoggingSuspendedLogged = false;
 
     SafetyResult result =
         safetyManager.canFog();
@@ -1581,6 +1614,12 @@ bool AutomationManager::validateNormalOperation()
                         Serial.print(sensors.waterLevelCm, 2);
                         Serial.print(" <= ");
                         Serial.println(systemState.refillStartLevelCm, 2);
+                        break;
+                    case SafetyResult::HIGH_WATER_TEMP:
+                        Serial.print("water temperature above maximum: ");
+                        Serial.print(sensors.waterTemp, 2);
+                        Serial.print(" > ");
+                        Serial.println(systemState.maxWaterTemp, 2);
                         break;
                     case SafetyResult::INVALID_PH:
                         if (sensors.ph < systemState.minPH)
@@ -1643,29 +1682,20 @@ bool AutomationManager::validateNormalOperation()
     diagnosticInitialized = true;
     lastDiagnosticResult = SafetyResult::SAFE;
 
-    // Root fogging must stay off for the entire duration active water
-    // cooling is required, independent of the chemistry hold below.
-    // coolingDemandActive is the same authoritative signal updateCooling()
-    // itself uses to drive circulation/Peltier - not a separate condition.
-    if (coolingDemandActive)
-    {
-        actuatorManager.requestCommand(FOGGER, false, "automatic", millis());
-        actuatorManager.requestCommand(BLOWER, false, "automatic", millis());
-
-        if (!coolingFoggingSuspendedLogged)
-        {
-            Serial.println("[COOLING] Root fogging suspended during water cooling");
-            coolingFoggingSuspendedLogged = true;
-        }
-
-        return false;
-    }
-
-    if (coolingFoggingSuspendedLogged)
-    {
-        Serial.println("[COOLING] Root fogging eligible after cooling");
-        coolingFoggingSuspendedLogged = false;
-    }
+    // REMOVED (cooling/fogging architecture update, confirmed design):
+    // fogging used to also stay off for the ENTIRE duration coolingDemandActive
+    // was true - i.e. for the whole band from the preventive cooling trigger
+    // down to the release threshold, not just above the 28C safety ceiling.
+    // That directly contradicted the confirmed design: normal cooling between
+    // the preventive trigger (26.5C) and the maximum (28C) must NOT suspend
+    // the programmed fog cadence - cooling and fogging are independent
+    // through that whole band. The only water-temperature condition that
+    // suspends fogging now is SafetyManager::canFog()'s own
+    // SafetyResult::HIGH_WATER_TEMP check (waterTemp > maxWaterTemp, the
+    // separate 28C safety ceiling), already evaluated above via the `result`
+    // this function returned early on if unsafe - so fogging suspension
+    // above 28C is still fully enforced, just through the single
+    // authoritative gate instead of this second, broader, now-incorrect one.
 
     // canFog() already confirmed pH/EC are in range and no dosing/stabilizing
     // is active. A just-completed automatic chemistry correction still holds
@@ -1696,33 +1726,58 @@ void AutomationManager::updateCooling()
 
     const SafetyResult coolingSafety = safetyManager.canCool();
 
-    const bool automaticCoolingAllowed =
-        automationAllowed(AutomationTestSubsystem::COOLING);
-
-    // The app's editable "Water Temperature" maximum (systemState.maxWaterTemp
-    // - already validated finite/in-bounds by FirebaseManager::
-    // applyTargetRange(), which rejects and keeps the last valid value rather
-    // than ever admitting NaN/out-of-bounds) is now the single authoritative
-    // cooling-ON ceiling, matching the same >maxWaterTemp comparison the
-    // water-temperature alert already uses (AlertManager::
-    // updateWaterTemperatureAlert()) - exactly at maxWaterTemp does not start
-    // a new cooling cycle, same as it does not raise the alert. The release
-    // threshold is derived from it with the existing 2.5C hysteresis
-    // (WATER_COOLING_HYSTERESIS) rather than reusing minWaterTemp, which is a
-    // separate, unrelated setting.
-    //
-    // highWaterTemp/coolerOffTemp are refreshed here (not removed) so every
-    // existing reader - this function's own diagnostic log below, Firebase
-    // status publishing, and ActuatorManager's manual-Peltier-override
-    // validation - keeps seeing the true effective thresholds without each
-    // needing its own edit, while maxWaterTemp remains the only field an
-    // admin actually configures.
-    systemState.highWaterTemp = systemState.maxWaterTemp;
-    systemState.coolerOffTemp = systemState.maxWaterTemp - WATER_COOLING_HYSTERESIS;
-
+    // Cooling/fogging architecture update - two independent thresholds now,
+    // not one derived pair:
+    //   - systemState.highWaterTemp: the PREVENTIVE automatic-cooling
+    //     trigger (26.5C default, HIGH_WATER_TEMP in Config.h). Despite
+    //     the field's name (kept unchanged - see this task's own "trace
+    //     before renaming" requirement - a full rename touches this field's
+    //     Firebase key, NVS key, and every C++ call site, more risk than
+    //     benefit for an un-compiled change), this is no longer "the
+    //     maximum" - it is the earlier, preventive trigger.
+    //   - systemState.coolerOffTemp: the cooling RELEASE threshold (25.5C
+    //     default, COOLER_OFF_TEMP), independently set, no longer derived
+    //     from the maximum via WATER_COOLING_HYSTERESIS. Resulting gap is
+    //     now 26.5 - 25.5 = 1.0C (down from the old 2.5C), a direct,
+    //     intentional consequence of moving the trigger down while keeping
+    //     the release point where it was confirmed to already be.
+    //   - systemState.maxWaterTemp: UNCHANGED role as the app-configurable
+    //     "Water Temperature" maximum in the target-range sense, but no
+    //     longer feeds cooling's own thresholds at all - it is now used
+    //     exclusively as the separate upper SAFETY ceiling (28.0C default):
+    //     the waterTempOutOfRange alert's own threshold, and (as of this
+    //     change) SafetyManager::canFog()'s water-temperature suspension
+    //     gate. 28C is "is this acceptable at all", 26.5/25.5C are "should
+    //     the cooler be running right now" - genuinely different questions,
+    //     no longer sharing one number.
+    // Both highWaterTemp/coolerOffTemp are NO LONGER overwritten from
+    // maxWaterTemp here (the previous tick-by-tick overwrite this comment
+    // used to describe is removed) - they are independently Firebase/NVS-
+    // authoritative again, exactly as their existing read/write/seed wiring
+    // in FirebaseManager already implied but the overwrite was silently
+    // defeating.
     const int8_t temperatureBand =
-        sensors.waterTemp > systemState.highWaterTemp ? 1 :
+        sensors.waterTemp >= systemState.highWaterTemp ? 1 :
         (sensors.waterTemp <= systemState.coolerOffTemp ? -1 : 0);
+
+    // Automatic Peltier cooling now requires an active cultivation cycle,
+    // mirroring pH/EC/refill/fogging - reservoir temperature protection was
+    // previously deliberately exempted from the cultivation gate ("hardware
+    // protection, not cultivation"), but the confirmed design now scopes
+    // AUTOMATIC cooling to an active cycle specifically, while leaving
+    // sensing/alerts (AlertManager::updateWaterTemperatureAlert(), called
+    // unconditionally every tick regardless of this function) and MANUAL
+    // Peltier control (manualCoolingDemandActive, checked independently of
+    // automaticCoolingAllowed further below) untouched. Isolated Cooling
+    // Automation Test Mode is the explicit bench-testing exception -
+    // automationTestSubsystem == COOLING bypasses the cultivation
+    // requirement the same way it already bypasses the isolation check
+    // automationAllowed() performs, so a developer can bench-test cooling
+    // with no cultivation cycle created at all.
+    const bool automaticCoolingAllowed =
+        automationAllowed(AutomationTestSubsystem::COOLING) &&
+        (systemState.automationTestSubsystem == AutomationTestSubsystem::COOLING ||
+         harvestScheduleCache.isActive());
 
     if (!automaticCoolingAllowed || coolingSafety != SafetyResult::SAFE)
     {
@@ -2023,8 +2078,13 @@ void AutomationManager::updateCoolingPulseStateMachine(bool automaticCoolingAllo
             if (dbgCooling)
             {
                 Serial.print("[COOL-PULSE] Aborting to IDLE: ");
+                const char* automaticBlockedReason =
+                    (systemState.automationTestSubsystem != AutomationTestSubsystem::NONE &&
+                     systemState.automationTestSubsystem != AutomationTestSubsystem::COOLING)
+                        ? "automatic cooling isolated by test mode"
+                        : "no active cultivation cycle";
                 Serial.println(!automaticCoolingAllowed
-                    ? "automatic cooling isolated by test mode"
+                    ? automaticBlockedReason
                     : safetyManager.getSafetyReason(coolingSafety));
             }
             systemState.coolingPulseState = CoolingPulseState::IDLE;
@@ -2282,23 +2342,6 @@ String AutomationManager::getCirculationReason(uint8_t demandMask) const
         reason += "ec_stabilization";
     }
     return reason;
-}
-
-//force refill request
-bool AutomationManager::processRefillRequest()
-{
-    if(!systemState.forceRefill)
-    {
-        return false;
-    }
-
-    systemState.forceRefill =
-        false;
-
-    changeState(
-        REFILLING);
-
-    return true;
 }
 
 //PH Correction Handling
@@ -2782,13 +2825,16 @@ void AutomationManager::processFogCycle()
 
     if(sensors.dhtAvailable)
     {
-        if(sensors.temperature >
+        // Inclusive boundaries: >= hotFogTemperature is HOT, <=
+        // coldFogTemperature is COLD, otherwise NORMAL. See
+        // HOT_FOG_TEMPERATURE/COLD_FOG_TEMPERATURE in Config.h.
+        if(sensors.temperature >=
            systemState.hotFogTemperature)
         {
             fogStrategy =
                 "hot";
         }
-        else if(sensors.temperature <
+        else if(sensors.temperature <=
                 systemState.coldFogTemperature)
         {
             fogStrategy =
@@ -2848,14 +2894,25 @@ void AutomationManager::processFogCycle()
         actuatorManager.requestCommand(
             FOGGER, true, "automatic", millis(), 100, activeFogStrategy);
 
-        // Blower speed follows the same air-temp/humidity threshold rule as
-        // the Canopy Fan (lastAutomaticCanopySpeed - see
-        // handleCanopyClimate()'s 70/100/50% hysteresis), not a fixed
-        // configured percentage. Only this ON case (the fogger/blower pair
+        // CONFIRMED BUG FIX (root-blower/canopy-fan speed separation): the
+        // root-zone Blower used to borrow lastAutomaticCanopySpeed - the
+        // CANOPY_FAN's own temp/humidity-derived speed (see
+        // handleCanopyClimate()'s 70/100/50% hysteresis) - meaning root-zone
+        // airflow through the PVC/root chamber changed whenever canopy
+        // conditions changed, with no independent identity of its own. The
+        // root blower moving fog to the roots and the canopy fan moving air
+        // around the grow space are physically and logically separate
+        // actuators serving different purposes; the confirmed design gives
+        // the root blower its own fixed automatic fogging speed
+        // (systemState.blowerSpeedPercent, default BLOWER_SPEED_DEFAULT_PERCENT
+        // = 65% - see Config.h's own comment for the full reasoning),
+        // independent of canopy temperature demand, humidity demand, and
+        // CANOPY_FAN's PWM. Only this ON case (the fogger/blower pair
         // actively running) uses it; the OFF/purge branch below is a
-        // separate, deliberately-untouched mechanism, not "the pair running".
+        // separate, deliberately-untouched mechanism at its own fixed 100%,
+        // not "the pair running".
         actuatorManager.requestCommand(
-            BLOWER, true, "automatic", millis(), lastAutomaticCanopySpeed, activeFogStrategy);
+            BLOWER, true, "automatic", millis(), systemState.blowerSpeedPercent, activeFogStrategy);
 
         if(elapsed >= fogOnTime)
         {
@@ -2902,6 +2959,97 @@ void AutomationManager::processFogCycle()
     }
 }
 
+// Manual root-fogging redesign: a normal Admin manual Fogger request
+// represents the complete root-fogging function (Fogger + root-zone Blower
+// together), not raw Fogger-only hardware testing. This does NOT touch
+// fogCycleOn/fogTimerStart/activeFogStrategy - the automatic fog-cycle timer
+// keeps running (or not) exactly as it already does under any other manual
+// override, so a manual root-fogging request can never start or corrupt the
+// automatic cycle's own state; ActuatorManager::requestCommand()'s existing
+// manual-outranks-automatic guard is what prevents the automatic FOGGER/
+// BLOWER commands from taking effect while manually held.
+//
+// Reads FOGGER's own already-validated status this same tick (FOGGER
+// precedes BLOWER in ActuatorManager's array-index order, so by the time
+// this runs next tick its status already reflects that tick's
+// validateCommand() outcome - see ActuatorManager.cpp's FOGGER case, now
+// gated by canFog() for manual too) rather than blindly mirroring the
+// request, so a rejected or not-yet-running manual Fogger command never
+// drags the Blower on with it.
+void AutomationManager::processManualFogPairing()
+{
+    const ActuatorStatus foggerStatus = actuatorManager.getStatus(FOGGER);
+    const bool foggerManuallyRunning =
+        foggerStatus.source == "manual" &&
+        foggerStatus.running &&
+        foggerStatus.state == ActuatorCommandState::RUNNING;
+
+    if (foggerManuallyRunning)
+    {
+        manualFogPurgeActive = false;
+        wasManualFoggerRunning = true;
+
+        // Base manual root-fogging blower speed is the same fixed
+        // automatic fogging speed (systemState.blowerSpeedPercent, default
+        // 65% - see Config.h). Existing fan-assisted environmental demand
+        // still takes priority for maximum airflow (100%):
+        //
+        // - Temperature: CONFIRMED FIX - compared directly against
+        //   systemState.hotFogTemperature (the same authoritative Hot
+        //   fogging threshold processFogCycle() uses to pick "hot" cadence,
+        //   >=32C by default), using this tick's live sensors.temperature.
+        //   Deliberately NOT highAirDemandActive: that is CANOPY_FAN's own,
+        //   differently-thresholded (>highAirTemp trigger / <=airTempRelease
+        //   release) hysteresis latch, which can sit well below (or, once
+        //   released, well after) the Hot fogging threshold and would give
+        //   the wrong 100%/65% decision here. This check has no hysteresis
+        //   of its own by design - a plain >=/< comparison re-evaluated
+        //   fresh every tick, exactly matching how processFogCycle() itself
+        //   selects hot/normal/cold cadence. Gated on sensors.dhtAvailable
+        //   so a stale/unavailable reading is never treated as a fresh
+        //   >=hotFogTemperature reading - falls through to the humidity
+        //   check (and otherwise the 65% baseline) instead, the same
+        //   "DHT selects/limits demand, never fabricates it" principle used
+        //   throughout this codebase (see processFogCycle()'s own comment).
+        // - Humidity: unchanged, still highHumidityDemandActive (trigger
+        //   >75% RH / release <=70% RH, preserved as-is, including that it
+        //   stays latched at its last value while DHT is unavailable).
+        const bool freshHotAirTemp =
+            sensors.dhtAvailable && sensors.temperature >= systemState.hotFogTemperature;
+        const uint8_t rootBlowerSpeed =
+            (freshHotAirTemp || highHumidityDemandActive) ? 100 : systemState.blowerSpeedPercent;
+
+        actuatorManager.requestCommand(
+            BLOWER, true, "manual", millis(), rootBlowerSpeed);
+        return;
+    }
+
+    if (wasManualFoggerRunning)
+    {
+        // Manual Fogger just stopped (Admin request, its own manual deadline,
+        // or Manual Mode expiry) - begin the same BLOWER_PURGE_MS clearing
+        // purge the automatic fog cycle already performs, at a fixed 100%
+        // (see processFogCycle()'s matching purge comment), before turning
+        // the root blower off.
+        wasManualFoggerRunning = false;
+        manualFogPurgeActive = true;
+        manualFogPurgeStart = millis();
+    }
+
+    if (manualFogPurgeActive)
+    {
+        if (millis() - manualFogPurgeStart < BLOWER_PURGE_MS)
+        {
+            actuatorManager.requestCommand(BLOWER, true, "manual", millis(), 100);
+        }
+        else
+        {
+            manualFogPurgeActive = false;
+            actuatorManager.requestCommand(BLOWER, false, "manual", millis());
+        }
+    }
+}
+
 //Grow Light Schedule Handling
 // Strict activation condition for the developer-only Grow Light mock time -
 // see the header's own comment. Both conditions gate independently: leaving
@@ -2918,14 +3066,20 @@ bool AutomationManager::growLightMockTimeActive() const
 
 void AutomationManager::updateGrowLightSchedule()
 {
-    // Confirmed defect (see the RTC report): getHour()/getMinute() only
-    // check RTCManager::isConnected(), not hasValidTime() - so a DS3231
-    // that lost power still returns whatever it currently reads, and this
-    // schedule would silently run against that garbage "current time"
-    // instead of the real one. Leave the grow light in its current
-    // commanded state rather than guess; matches the same
-    // hasValidTime()-guard NotificationManager already uses for its own
-    // time-dependent decisions.
+    // CONFIRMED BUG FIX (grow-light edge-case correction): getHour()/
+    // getMinute() only check RTCManager::isConnected(), not hasValidTime() -
+    // so a DS3231 that lost power still returns whatever it currently
+    // reads, and this schedule would silently run against that garbage
+    // "current time" instead of the real one. This USED TO simply return
+    // here, leaving the grow light in whatever state it last happened to be
+    // commanded - which could mean an automatically-running light stays ON
+    // indefinitely while the clock is untrustworthy, with no way to know if
+    // that is still correct. Now fails safe: automatic control is
+    // explicitly commanded OFF instead (see below) rather than merely
+    // frozen. Still "automatic" source, so an authorized manual hold still
+    // outranks this exactly per the existing hard-safety/manual/automatic
+    // priority architecture - this only changes what the AUTOMATIC signal
+    // itself asks for, never adds a new hard prohibition.
     //
     // The one narrow exception: the developer-only Grow Light mock time
     // (growLightMockTimeActive()) supplies a deterministic test "current
@@ -2938,6 +3092,9 @@ void AutomationManager::updateGrowLightSchedule()
     // selection must never observe this bypass.
     if (!rtcManager.hasValidTime() && !growLightMockTimeActive())
     {
+        actuatorManager.requestCommand(
+            GROW_LIGHT, false, "automatic", millis(), 100, "",
+            "Automatic lighting paused: RTC time is not currently valid");
         return;
     }
 
@@ -2947,6 +3104,16 @@ void AutomationManager::updateGrowLightSchedule()
             systemState.lightOnMinute,
             systemState.lightOffHour,
             systemState.lightOffMinute);
+
+    // Diagnostic only - isWithinSchedule() above is the single authoritative
+    // place the equal-ON/OFF-time rejection actually happens (already
+    // returned false for this case). This is purely so the OFF command
+    // below can carry a specific, human-readable reason distinguishing
+    // "invalid schedule" from an ordinary "currently outside the window" -
+    // it does not re-decide anything isWithinSchedule() already decided.
+    const bool scheduleInvalid =
+        systemState.lightOnHour == systemState.lightOffHour &&
+        systemState.lightOnMinute == systemState.lightOffMinute;
 
     // Serial Monitor Focus Mode: one compact line per decision change, not
     // every tick - see DebugManager::shouldPrintDebug()'s own comment. No
@@ -3003,8 +3170,18 @@ void AutomationManager::updateGrowLightSchedule()
     }
     else
     {
+        // Existing actuator-status "reason" field (already published to
+        // Firebase alongside every other actuator's on/off state, e.g. the
+        // "waiting_for_circulation"/deadline-reconciliation reasons used
+        // elsewhere in this file) is reused here rather than adding a new
+        // dedicated settings/status field for this diagnostic - an ordinary
+        // "currently outside the window" OFF carries no reason, same as
+        // before, only the specifically-invalid-schedule case does.
         actuatorManager.requestCommand(
-            GROW_LIGHT, false, "automatic", millis());
+            GROW_LIGHT, false, "automatic", millis(), 100, "",
+            scheduleInvalid
+                ? "Automatic lighting schedule invalid: ON time equals OFF time"
+                : "");
     }
 }
 //Get Current Time in Minutes
@@ -3041,6 +3218,21 @@ bool AutomationManager::isWithinSchedule(
     const int end =
         endHour * 60 +
         endMinute;
+
+    // CONFIRMED BUG FIX (grow-light edge-case correction): ON time == OFF
+    // time fell through to the "overnight schedule" branch below (start <
+    // end is false when they're equal), where current >= start || current <
+    // end is true for EVERY possible current value - i.e. an equal
+    // ON/OFF schedule silently meant "always on, 24 hours a day," never
+    // intended. The single, central point every caller already goes
+    // through (this function has exactly one caller,
+    // updateGrowLightSchedule()) - an equal ON/OFF pair is not a schedule
+    // at all and must never be interpreted as either a valid normal or
+    // valid overnight one.
+    if(start == end)
+    {
+        return false;
+    }
 
     // Normal schedule
     if(start < end)
@@ -3197,6 +3389,13 @@ bool AutomationManager::handleBoundedAutomaticRefill()
         return true;
     }
 
+    // Reached only with a VALID, trustworthy water-level reading that has
+    // genuinely settled and is still short of refillStopLevelCm after a real
+    // run+settle cycle - see handleRefilling()'s own matching comment on the
+    // canRefill() check above it, which is the SEPARATE fail-fast path for
+    // an untrustworthy measurement/safety condition and never reaches here
+    // at all. This is "valid sensor, insufficient fill progress" - the only
+    // case the 3-attempt budget is intentionally spent on.
     if(automaticRefillAttempt >= MAX_REFILL_ATTEMPTS)
     {
         Serial.println("[REFILL] maximum automatic refill attempts reached");
@@ -3252,8 +3451,8 @@ void AutomationManager::handleRefilling()
     devWaterOverrideExitLogged = false;
 
     // Any refill actually in progress supersedes a prior manual acceptance,
-    // regardless of which path started it (low-water auto-trigger, the
-    // admin's "Start Reservoir Refill" button, or forceRefill).
+    // regardless of which path started it (low-water auto-trigger, or the
+    // admin's "Start Reservoir Refill" button).
     manualRefillAcceptedLevel = NAN;
 
     alertManager.update();
@@ -3261,6 +3460,22 @@ void AutomationManager::handleRefilling()
     SafetyResult result =
         safetyManager.canRefill();
 
+    // Intentional fail-fast distinction (reservoir/refill lifecycle audit,
+    // confirmed by design - not a bug): this SafetyResult check, re-evaluated
+    // every tick, is a SEPARATE failure path from handleBoundedAutomaticRefill()'s
+    // own MAX_REFILL_ATTEMPTS counter below. canRefill() returning non-SAFE
+    // here means the water-level MEASUREMENT ITSELF is untrustworthy
+    // (SENSOR_FAULT - validWaterLevel()'s own 3-tick debounce already ruled
+    // out a single bad reading) or a genuine safety/subsystem lock is active
+    // - an UNRELIABLE INPUT, not "the solenoid ran and the level still isn't
+    // there yet". It locks immediately via abortCurrentOperation() ->
+    // failCurrentSubsystem(), on attempt 1 if that is when it happens,
+    // WITHOUT consuming or depending on automaticRefillAttempt at all. A
+    // valid, trustworthy reading that simply hasn't reached the stop level
+    // yet is the ONLY case that consumes the bounded 3-attempt budget - see
+    // handleBoundedAutomaticRefill()'s own matching comment. Do not conflate
+    // the two: a flaky sensor must never be retried blindly against a
+    // solenoid, but slow physical fill progress should be.
     if(result != SafetyResult::SAFE)
     {
         abortCurrentOperation(result);
@@ -3391,6 +3606,23 @@ bool AutomationManager::shouldAutoRefill() const
     }
 
     return sensors.waterLevelCm < manualRefillAcceptedLevel;
+}
+
+// See this function's own declaration in AutomationManager.h for the full
+// reasoning. alertState.lowWater alone is a debounced ALERT (sufficient to
+// notify a user, and it stays true across arbitrarily many main-loop ticks
+// off a single accepted reading) - sensors.refillStartConfirmed is the
+// STRICTER, separate confirmation (3 consecutive ACCEPTED HC-SR04 readings,
+// SensorManager::readWaterLevel()) that must additionally hold before
+// automation is trusted to actually open the solenoid. shouldAutoRefill()
+// is the existing manual-acceptance "snooze" check (manualRefillAcceptedLevel),
+// unchanged and still composed in here exactly as both trigger sites already
+// required it.
+bool AutomationManager::autoRefillEligible() const
+{
+    return alertState.lowWater &&
+        sensors.refillStartConfirmed &&
+        shouldAutoRefill();
 }
 
 //==================================================
@@ -3908,16 +4140,30 @@ void AutomationManager::handleStabilizingPH()
             }
         }
 
-        // Budget-expiry verdict: only a genuinely stalled reading locks
-        // here - one still improving (even slowly, via passive drift) just
-        // keeps being monitored quietly. alertManager.update() above
-        // already re-evaluates phOutOfRange/phHigh/phLow off sensors.ph
-        // every tick regardless of anything in this function, so a
-        // subsequent overshoot past the outer range still surfaces through
-        // the existing alert/notification path with no dosing and no lock.
-        if(budgetExpired && !systemState.phLastTrendImproving)
+        // Budget-expiry verdict: PH_EC_CORRECTION_STALL_TIMEOUT_MS is a hard
+        // upper bound on the whole episode, not merely a threshold for a
+        // "stalled" verdict - CONFIRMED BUG FIX (correction-budget limbo):
+        // this used to also require !phLastTrendImproving, which let a
+        // reading classified as still (even glacially) improving remain
+        // parked in STABILIZING_PH indefinitely once the budget expired -
+        // dosing correctly stopped (both redose paths above are separately
+        // gated on !budgetExpired), but reservoirLocked stayed true and the
+        // state never returned to NORMAL, permanently blocking the OTHER
+        // chemical subsystem (EC) from ever being evaluated again. The
+        // target-reached check earlier in this same block already returns
+        // early via completeCurrentOperation() the instant the target IS
+        // reached, budget expired or not, so reaching this line already
+        // means the target was NOT reached - trend classification has no
+        // further bearing on whether the episode terminates, only on
+        // whether it redoses WHILE still under budget. alertManager.update()
+        // above already re-evaluates phOutOfRange/phHigh/phLow off
+        // sensors.ph every tick regardless of anything in this function, so
+        // a subsequent out-of-range reading still surfaces through the
+        // existing alert/notification path even after this locks -
+        // monitoring is unaffected, only automatic dosing stops.
+        if(budgetExpired)
         {
-            failCurrentSubsystem("Maximum pH correction time reached; pH is not responding to dosing.");
+            failCurrentSubsystem("Maximum pH correction time reached before the correction target was achieved.");
         }
     }
 }
@@ -4241,10 +4487,11 @@ void AutomationManager::handleStabilizingEC()
         }
 
         // Budget-expiry verdict - see handleStabilizingPH()'s matching
-        // comment.
-        if(budgetExpired && !systemState.ecLastTrendImproving)
+        // comment (same correction-budget-limbo fix: the budget is now a
+        // hard episode ceiling regardless of ecLastTrendImproving).
+        if(budgetExpired)
         {
-            failCurrentSubsystem("Maximum EC correction time reached; EC is not responding to dosing.");
+            failCurrentSubsystem("Maximum EC correction time reached before the correction target was achieved.");
         }
     }
 }
@@ -4532,8 +4779,16 @@ void AutomationManager::handleCanopyClimate()
             lowAirDemandActive ? "LOW TEMP" : "NORMAL";
 
         // Only a fresh DHT-derived decision updates the retained value the
-        // unavailable branch above (and handleCultivationPaused()) fall back
-        // to - see lastAutomaticCanopySpeed's own comment.
+        // unavailable branch above falls back to - see
+        // lastAutomaticCanopySpeed's own comment. Both of its former
+        // outside-this-function readers are gone: handleCultivationPaused()
+        // no longer consumes it (no-active-cultivation-cycle fix - automatic
+        // canopy fan is commanded OFF there now, not held at a baseline
+        // speed), and processFogCycle()'s root-zone Blower no longer borrows
+        // it either (root-blower/canopy-fan speed separation fix - the
+        // Blower now uses its own independent systemState.blowerSpeedPercent).
+        // This value is CANOPY_FAN-only again, read solely within this
+        // function's own DHT-unavailable branch above.
         lastAutomaticCanopySpeed = speed;
     }
 

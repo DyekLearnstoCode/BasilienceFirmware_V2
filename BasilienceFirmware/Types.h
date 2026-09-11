@@ -49,9 +49,48 @@ struct SensorData
     float ecVoltage = NAN;
     int   ecRaw     = 0;
 
+    // True once SensorManager::readEC()'s rail-proximity fault detector
+    // (Config.h's EC_FAULT_* constants) has CONFIRMED the raw signal is
+    // persistently pinned at/near the ADC's own physical rail - conservative,
+    // debounced evidence of a probable hardware fault (disconnected/
+    // unpowered/shorted module), never a single abnormal sample and never a
+    // chemistry-range judgment (see EC_FAULT_RAIL_LOW_MV/HIGH_MV's own
+    // comment). While true, ec/tds above are forced to NaN and the EC
+    // stability window is held reset - never conflate this with ec merely
+    // being outside minEC/maxEC, which is a normal, valid, in-range-signal
+    // condition automation is expected to correct via dosing.
+    bool ecFault = false;
+
+    // True exactly when ec above is a currently-trusted, non-NaN reading
+    // (mirrors isfinite(ec) - published explicitly for the same reason
+    // dhtAvailable is, rather than making every consumer isfinite()-check
+    // itself). False while ecFault is true, while the post-(re)connect
+    // PH_EC_ANALOG_SETTLE_TIME window is running, or before the stability
+    // window has ever confirmed a first reading.
+    bool ecAvailable = false;
+
     // pH
     float ph          = NAN;
     int   phMilliVolts = 0;
+
+    // True once SensorManager::readPH()'s rail-proximity fault detector
+    // (Config.h's PH_FAULT_* constants) has CONFIRMED the raw millivolt
+    // signal is persistently pinned at/near the ADC's own physical rail or
+    // at/beyond the pH transmitter's own documented 0-3.0V output spec -
+    // conservative, debounced evidence of a probable hardware fault
+    // (disconnected/unpowered/shorted probe or a dead transmitter output),
+    // never a single abnormal sample and never a chemistry-range judgment.
+    // While true, ph above is forced to NaN and the pH stability window/step
+    // filter baseline are held reset, so recovery must fully re-earn trust
+    // through the normal pipeline (see PH_FAULT_RECOVERY_COUNT's own
+    // comment) - never conflate this with ph merely being outside minPH/
+    // maxPH, which is a normal, valid, in-range-signal condition automation
+    // is expected to correct via dosing.
+    bool phFault = false;
+
+    // True exactly when ph above is a currently-trusted, non-NaN reading -
+    // same reasoning as ecAvailable above.
+    bool phAvailable = false;
 
     // True while the pH temporal step filter has an unconfirmed
     // confirmation streak in progress - either the very first baseline
@@ -90,7 +129,9 @@ struct SensorData
     // 0.20cm off) can still pass that filter's WATER_LEVEL_STEP_ACCEPT_CM
     // band and momentarily cross REFILL_START_CM/REFILL_STOP_CM on its own.
     // These flags require WATER_LEVEL_STEP_CONFIRM_COUNT consecutive
-    // ACCEPTED readings (SensorManager::readWaterLevel(), ~300ms apart) on
+    // ACCEPTED readings (SensorManager::readWaterLevel(),
+    // WATER_LEVEL_READ_INTERVAL_MS = 5s apart, not the ~300ms an earlier
+    // version of this comment incorrectly stated) on
     // the correct side of the threshold before the crossing is trusted -
     // REFILL START/COMPLETE must read these, never waterLevelCm compared
     // against the threshold directly.
@@ -502,8 +543,6 @@ struct SystemState
 
     bool reservoirLocked = false;
 
-    bool forceRefill = false;
-
     bool resetSafetyLock = false;
 
     // Developer Mode physical sensor diagnostics
@@ -633,8 +672,13 @@ struct SystemState
 
     // Trend tracking for handleStabilizingPH() - lets it tell "still
     // improving on its own," "stalled," and "reversing" apart instead of
-    // blindly redosing on a timer. phLastTrendImproving is what the
-    // PH_EC_CORRECTION_STALL_TIMEOUT_MS deadline verdict is judged by.
+    // blindly redosing on a timer. phLastTrendImproving gates whether a
+    // NEW redose fires while the correction is still under budget (a
+    // reversal redoses immediately; "improving"/no-progress do not). It no
+    // longer has any bearing on the PH_EC_CORRECTION_STALL_TIMEOUT_MS
+    // deadline verdict itself (correction-budget limbo fix) - that deadline
+    // is a hard episode ceiling regardless of this flag's value; see
+    // Config.h's own comment on PH_EC_CORRECTION_STALL_TIMEOUT_MS.
     float phTrendReferenceValue = NAN;
     unsigned long phLastTrendCheckAt = 0;
     bool phLastTrendImproving = true;
@@ -844,9 +888,11 @@ struct SystemState
     float coolerOffTemp =
         COOLER_OFF_TEMP;
 
-    float hotFogTemperature = 30.0f;
+    float hotFogTemperature =
+        HOT_FOG_TEMPERATURE;
 
-    float coldFogTemperature = 20.0f;
+    float coldFogTemperature =
+        COLD_FOG_TEMPERATURE;
 
     // Automatic Blower PWM speed used while the Fogger/Blower pair is
     // automatically ON (real-hardware Canopy/Blower PWM follow-up) - see
@@ -854,6 +900,18 @@ struct SystemState
     // BLOWER_SPEED_DEFAULT_PERCENT/MIN/MAX for the full contract. Explicit
     // manual Blower speed commands are unaffected by this field entirely.
     uint8_t blowerSpeedPercent = BLOWER_SPEED_DEFAULT_PERCENT;
+
+    // Config/settings schema migration bookkeeping - see CONFIG_SCHEMA_VERSION
+    // in Config.h. True from boot (set in FirebaseManager::
+    // loadPersistedSettings() whenever the persisted NVS "cfgVersion" is
+    // behind CONFIG_SCHEMA_VERSION) until this device's corrected
+    // maxAirTemp/blowerSpeedPercent values have been successfully PUSHED to
+    // Firebase at least once (FirebaseManager::readSettings()), at which
+    // point cfgVersion is persisted and this never fires again. Local
+    // values are corrected immediately regardless of this flag - it only
+    // gates the one-time Firebase-side reconciliation, which needs
+    // connectivity this field's own local correction does not.
+    bool configMigrationPending = false;
 };
 
 //==================================================

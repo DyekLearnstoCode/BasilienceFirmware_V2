@@ -234,6 +234,16 @@ void AlertManager::updateWaterTemperatureAlert()
         valid && sensors.waterTemp > systemState.maxWaterTemp,
         waterTempOutOfRangePendingCount);
 
+    // No active water-heating actuator exists in this design and none is
+    // added by this alert - low water temperature is a MONITORED/ALERT
+    // condition only, never an automatic control trigger. The ultrasonic
+    // fogger's normal operation does produce PASSIVE warming of the
+    // nutrient solution as a side effect of its own unrelated function
+    // (misting the root chamber) - that is not, and must not be confused
+    // with, a closed-loop heater: nothing here commands extra fogging (or
+    // anything else) in response to this alert, and the programmed fog
+    // cadence (AutomationManager::processFogCycle()) is untouched by water
+    // temperature in either direction.
     setAlertDebounced(
         "waterTempLow",
         alertState.waterTempLow,
