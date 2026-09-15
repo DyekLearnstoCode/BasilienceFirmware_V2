@@ -3925,6 +3925,21 @@ void FirebaseManager::writeStatus()
         systemState.ecDirection == EC_RAISE ? "raise" :
         systemState.ecDirection == EC_DILUTE ? "dilute" : "none");
 
+    // Lets the app tell "still in the silent settle window, reading not
+    // trustworthy yet" from "settled and watching" during STABILIZING_PH/EC -
+    // the exact same signal SafetyManager::canFog() already uses internally
+    // for the same purpose. See phWatchPhaseActive's own comment in Types.h.
+    json.set("phWatchPhaseActive", systemState.phWatchPhaseActive);
+    json.set("ecWatchPhaseActive", systemState.ecWatchPhaseActive);
+
+    // Countdown, in seconds, for the app's stabilizing-loader UI. Only
+    // meaningful while currentMode is STABILIZING_PH/STABILIZING_EC/REFILLING
+    // respectively - see each field's own comment in Types.h for what they
+    // mean (and don't mean) outside that state.
+    json.set("phStabilizeSecondsRemaining", systemState.phStabilizeSecondsRemaining);
+    json.set("ecStabilizeSecondsRemaining", systemState.ecStabilizeSecondsRemaining);
+    json.set("refillSecondsRemaining", systemState.refillSecondsRemaining);
+
     json.set(
         "manualMode",
         systemState.manualMode);
@@ -4119,8 +4134,10 @@ bool FirebaseManager::writeAlerts()
     ADD_ALERT_FIELD(criticalLowWater);
     ADD_ALERT_FIELD(waterLevelLow);
     ADD_ALERT_FIELD(waterLevelHigh);
+    ADD_ALERT_FIELD(refillIneffective);
     ADD_ALERT_FIELD(ecLow);
     ADD_ALERT_FIELD(ecHigh);
+    ADD_ALERT_FIELD(ecDilutionIneffective);
     ADD_ALERT_FIELD(phOutOfRange);
     ADD_ALERT_FIELD(phLow);
     ADD_ALERT_FIELD(phHigh);
@@ -4176,8 +4193,10 @@ bool FirebaseManager::writeAlerts()
     LOG_ALERT_TRANSITION(criticalLowWater);
     LOG_ALERT_TRANSITION(waterLevelLow);
     LOG_ALERT_TRANSITION(waterLevelHigh);
+    LOG_ALERT_TRANSITION(refillIneffective);
     LOG_ALERT_TRANSITION(ecLow);
     LOG_ALERT_TRANSITION(ecHigh);
+    LOG_ALERT_TRANSITION(ecDilutionIneffective);
     LOG_ALERT_TRANSITION(phOutOfRange);
     LOG_ALERT_TRANSITION(phLow);
     LOG_ALERT_TRANSITION(phHigh);

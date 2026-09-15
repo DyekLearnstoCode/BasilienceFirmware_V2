@@ -77,6 +77,17 @@ namespace
         return source == "manual";
     }
 
+    // FOGGER's relay module drives the load ON when its GPIO is LOW, the
+    // opposite of every other relay in this system (all HIGH-on). Isolated
+    // to one place so "which physical level means ON" is never duplicated by
+    // hand at each of the four sites that write this pin directly: begin()'s
+    // startup init, turnOn(), turnOff(), and onDeadlineExpired()'s
+    // safety-forced-off path.
+    bool isActiveLowActuator(Actuator actuator)
+    {
+        return actuator == FOGGER;
+    }
+
     // CANOPY_FAN and BLOWER are both MOSFET-driven DC fans, so both can take
     // a PWM duty cycle for variable speed the same way. SOLENOID shares the
     // same "MOSFET Outputs" pin group in Config.h but is a valve, not a fan -
@@ -294,7 +305,7 @@ void ActuatorManager::begin()
         else
         {
             pinMode(getPin((Actuator)i), OUTPUT);
-            digitalWrite(getPin((Actuator)i), LOW);
+            digitalWrite(getPin((Actuator)i), isActiveLowActuator((Actuator)i) ? HIGH : LOW);
         }
 
         actuatorStates[i] = false;
@@ -334,7 +345,7 @@ void ActuatorManager::turnOn(Actuator actuator)
 {
     if (!isPwmActuator(actuator))
     {
-        digitalWrite(getPin(actuator), HIGH);
+        digitalWrite(getPin(actuator), isActiveLowActuator(actuator) ? LOW : HIGH);
     }
     // For PWM actuators (CANOPY_FAN, BLOWER), speed is applied dynamically in update()
 
@@ -368,7 +379,7 @@ void ActuatorManager::turnOff(Actuator actuator)
     }
     else
     {
-        digitalWrite(getPin(actuator), LOW);
+        digitalWrite(getPin(actuator), isActiveLowActuator(actuator) ? HIGH : LOW);
     }
 
     actuatorStates[actuator] = false;
@@ -577,7 +588,8 @@ void ActuatorManager::onDeadlineExpired(void* arg)
     const int index = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     if (index < 0 || index >= ACTUATOR_COUNT) return;
 
-    digitalWrite(actuatorManager.getPin((Actuator)index), LOW);
+    digitalWrite(actuatorManager.getPin((Actuator)index),
+        isActiveLowActuator((Actuator)index) ? HIGH : LOW);
     actuatorManager.deadlineExpired[index] = true;
 }
 

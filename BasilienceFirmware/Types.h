@@ -535,6 +535,23 @@ struct SystemState
     bool refillSubsystemLocked = false;
     bool coolingSubsystemLocked = false;
 
+    // Consecutive automatic-refill attempts (AutomationManager::
+    // handleBoundedAutomaticRefill()) that ran their full
+    // AUTOMATIC_REFILL_RUN_TIME + settle cycle without the water level
+    // actually rising past sensor noise (WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM).
+    // Mirrors ecDilutionNoRiseStreak's exact same report-only design: reported
+    // as the refillIneffective alert once it reaches 2, never blocks or
+    // changes the existing MAX_REFILL_ATTEMPTS budget on its own.
+    uint8_t refillNoRiseStreak = 0;
+
+    // Seconds remaining in the current bounded-automatic-refill attempt's
+    // RUNNING or SETTLING phase (AutomationManager::handleBoundedAutomaticRefill()).
+    // Pinned to 0 for the whole duration of a manual/continuous refill
+    // (handleRefilling()), which has no fixed duration to count down - the
+    // app treats 0 as "no countdown available, show an indeterminate loader"
+    // rather than a real "0 seconds left."
+    uint16_t refillSecondsRemaining = 0;
+
     // Pulse-cooling task: current phase of the FILL/COOL_SOAK/FLUSH cycle.
     // Owned/advanced by AutomationManager::updateCoolingPulseStateMachine();
     // read (never written) by ActuatorManager for the one narrow COOL_SOAK
@@ -659,6 +676,16 @@ struct SystemState
     bool phWatchPhaseActive = false;
     bool ecWatchPhaseActive = false;
 
+    // Seconds remaining in the current STABILIZING_PH/STABILIZING_EC silent
+    // settle window (PH_STABILIZATION_TIME/EC_STABILIZATION_TIME), i.e. time
+    // left before phWatchPhaseActive/ecWatchPhaseActive turns true. Recomputed
+    // fresh every tick by handleStabilizingPH()/handleStabilizingEC() - never
+    // meaningful outside those states, so nothing resets it separately. Lets
+    // the app show a countdown instead of just an opaque "stabilizing" spinner
+    // while the reading is known to be untrustworthy.
+    uint16_t phStabilizeSecondsRemaining = 0;
+    uint16_t ecStabilizeSecondsRemaining = 0;
+
     //==================================================
     // pH
     //==================================================
@@ -730,6 +757,22 @@ struct SystemState
     unsigned long ecDoseTime = 0;
 
     uint8_t ecAttempts = 0;
+
+    // Water-level baseline captured at the start of each automatic EC-dilution
+    // interval (NAN whenever no dilution interval is currently running) - lets
+    // handleStabilizingEC() confirm the solenoid actually raised the reservoir
+    // level, not just that the EC reading moved, before crediting the interval
+    // as real progress. Re-captured fresh at every DOSING_EC entry, so a stale
+    // value from an earlier episode never leaks into the next one's check.
+    float ecDiluteIntervalStartLevel = NAN;
+
+    // Consecutive automatic dilution intervals that ran their full duration
+    // without the water level rising past sensor noise
+    // (WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM). Reported once it reaches 2 as
+    // the ecDilutionIneffective alert - chosen to report only, not block,
+    // since the reservoir's fill hose/pump has no fixed expected flow rate to
+    // validate against, only "did the level move at all."
+    uint8_t ecDilutionNoRiseStreak = 0;
 
     // Mirrors the phTrendReferenceValue/phLastTrendCheckAt/
     // phLastTrendImproving trio above, for handleStabilizingEC().
@@ -931,6 +974,14 @@ struct AlertState
     // actuator gating of its own.
     bool criticalLowWater = false;
 
+    // Report-only: automatic refill has run for 2 consecutive attempts
+    // without the reservoir's water level actually rising (see
+    // SystemState::refillNoRiseStreak). Suggests the refill water source/
+    // pump/hose isn't delivering water even though the solenoid command is
+    // being sent. Never blocks or changes the existing MAX_REFILL_ATTEMPTS
+    // budget on its own - mirrors ecDilutionIneffective's exact same design.
+    bool refillIneffective = false;
+
     bool highTemperature = false;
 
     bool lowAirTemperature = false;
@@ -938,6 +989,14 @@ struct AlertState
     bool ecLow = false;
 
     bool ecHigh = false;
+
+    // Report-only: automatic EC dilution has run for 2 consecutive intervals
+    // without the reservoir's water level actually rising (see
+    // SystemState::ecDilutionNoRiseStreak). Suggests the dilution water
+    // source/pump/hose isn't delivering water even though the solenoid
+    // command is being sent. Never blocks or locks EC correction on its own -
+    // the existing EC correction budget/attempts logic is unaffected.
+    bool ecDilutionIneffective = false;
 
     bool phOutOfRange = false;
 

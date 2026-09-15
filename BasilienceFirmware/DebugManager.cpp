@@ -365,6 +365,12 @@ void DebugManager::printSystemStatus()
     Serial.print("EC Attempts     : ");
     Serial.println(systemState.ecAttempts);
 
+    Serial.print("Dilution No-Rise Streak : ");
+    Serial.println(systemState.ecDilutionNoRiseStreak);
+
+    Serial.print("Refill No-Rise Streak   : ");
+    Serial.println(systemState.refillNoRiseStreak);
+
     printBool(
     "Safety Lock",
     systemState.currentMode ==

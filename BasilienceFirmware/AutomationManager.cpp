@@ -2563,6 +2563,12 @@ bool AutomationManager::processECCorrection()
     systemState.firstCorrectionCycle = true;
     systemState.ecAttempts = 0;
 
+    // Fresh dilution-progress baseline for this correction episode's first
+    // interval - see ecDiluteIntervalStartLevel's own comment in Types.h.
+    systemState.ecDiluteIntervalStartLevel =
+        systemState.ecDirection == EC_DILUTE ? sensors.waterLevelCm : NAN;
+    systemState.ecDilutionNoRiseStreak = 0;
+
     // Set only now that DOSING_EC is actually about to start - not earlier,
     // where a safety rejection above would have left it stuck at
     // EC_DOSING_TIME while currentMode stayed NORMAL and nothing was dosing.
@@ -2799,6 +2805,12 @@ void AutomationManager::processECCorrectionOperation()
 
         systemState.firstCorrectionCycle = true;
         systemState.ecAttempts = 0;
+
+    // Fresh dilution-progress baseline - see processECCorrection()'s
+    // matching comment.
+    systemState.ecDiluteIntervalStartLevel =
+        systemState.ecDirection == EC_DILUTE ? sensors.waterLevelCm : NAN;
+    systemState.ecDilutionNoRiseStreak = 0;
 
     // Set only now that DOSING_EC is actually about to start - see
     // processECCorrection()'s matching comment.
@@ -3255,6 +3267,7 @@ void AutomationManager::resetAutomaticRefillAttempts()
     automaticRefillAttempt = 1;
     automaticRefillPhaseStartedAt = 0;
     automaticRefillAttemptStartLevel = sensors.waterLevelCm;
+    systemState.refillNoRiseStreak = 0;
 }
 
 void AutomationManager::completeRefillSuccess()
@@ -3265,6 +3278,7 @@ void AutomationManager::completeRefillSuccess()
     if (dbgWater) Serial.println("[REFILL] Solenoid OFF");
 
     systemState.reservoirLocked = false;
+    systemState.refillNoRiseStreak = 0;
     completeCurrentOperation();
     if (dbgWater) Serial.println("[REFILL] Operation COMPLETED");
 
@@ -3299,6 +3313,11 @@ bool AutomationManager::handleBoundedAutomaticRefill()
     // wrong, so manual keeps the simpler continuous-run behavior below.
     if(systemState.operationRequest.source != RequestSource::AUTOMATIC)
     {
+        // Continuous/manual refill (handleRefilling()) has no fixed duration
+        // to count down - see refillSecondsRemaining's own comment in
+        // Types.h. Pinned here so a stale number from an earlier automatic
+        // attempt can never leak into a manual refill's display.
+        systemState.refillSecondsRemaining = 0;
         return false;
     }
 
@@ -3310,6 +3329,18 @@ bool AutomationManager::handleBoundedAutomaticRefill()
         Serial.println("[REFILL] starting attempt 1");
     }
     const unsigned long elapsed = now - automaticRefillPhaseStartedAt;
+
+    // Countdown for the app's stabilizing-loader UI, for whichever phase of
+    // this attempt is currently running - see refillSecondsRemaining's own
+    // comment in Types.h.
+    {
+        const unsigned long phaseDuration = automaticRefillPhase == AutomaticRefillPhase::RUNNING
+            ? AUTOMATIC_REFILL_RUN_TIME
+            : AUTOMATIC_REFILL_SETTLE_TIME;
+        systemState.refillSecondsRemaining = elapsed >= phaseDuration
+            ? 0
+            : (uint16_t)((phaseDuration - elapsed) / 1000UL);
+    }
 
     if(automaticRefillPhase == AutomaticRefillPhase::RUNNING)
     {
@@ -3373,6 +3404,30 @@ bool AutomationManager::handleBoundedAutomaticRefill()
     Serial.print(automaticRefillAttemptStartLevel, 2);
     Serial.print(" settled=");
     Serial.println(sensors.waterLevelCm, 2);
+
+    // Water-level fill-progress check (report-only - mirrors
+    // ecDilutionNoRiseStreak's exact same design for EC dilution). This
+    // attempt ran its full RUNNING+SETTLING cycle; if the level did not
+    // genuinely rise (beyond WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM sensor
+    // noise) despite that, count it toward the streak. A successful attempt
+    // still passes through here, but completeRefillSuccess() below
+    // unconditionally clears the streak right after, so a completed refill
+    // is never left showing a stale non-zero count.
+    if(isfinite(automaticRefillAttemptStartLevel) && isfinite(sensors.waterLevelCm))
+    {
+        const bool levelRose =
+            (sensors.waterLevelCm - automaticRefillAttemptStartLevel) >
+                WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
+
+        if(levelRose)
+        {
+            systemState.refillNoRiseStreak = 0;
+        }
+        else if(systemState.refillNoRiseStreak < 2)
+        {
+            systemState.refillNoRiseStreak++;
+        }
+    }
 
     // Same refillStopConfirmed requirement as the continuous handleRefilling()
     // path above (resilience pass follow-up) - the preceding
@@ -3940,6 +3995,21 @@ void AutomationManager::handleStabilizingPH()
     actuatorManager.requestCommand(
         PH_DOWN_PUMP, false, "automatic", millis());
 
+    // Countdown for the app's stabilizing-loader UI - see
+    // phStabilizeSecondsRemaining's own comment in Types.h. Computed fresh
+    // every tick from the exact same timer the watch-phase check below uses,
+    // so the two can never disagree. Full window reported while circulation
+    // hasn't even confirmed running yet (the wait hasn't started, so the
+    // full duration is still ahead).
+    {
+        const unsigned long phSettleElapsed = phStabilizationCirculationConfirmedAt != 0
+            ? millis() - phStabilizationCirculationConfirmedAt
+            : 0;
+        systemState.phStabilizeSecondsRemaining = phSettleElapsed >= PH_STABILIZATION_TIME
+            ? 0
+            : (uint16_t)((PH_STABILIZATION_TIME - phSettleElapsed) / 1000UL);
+    }
+
     // Measured from circulation actually being confirmed running (see
     // phStabilizationCirculationConfirmedAt's own comment), not from
     // stateStartTime: entering this state and CIRCULATION_PUMP reaching
@@ -4321,6 +4391,18 @@ void AutomationManager::handleStabilizingEC()
         SOLENOID, false, "automatic", millis(), 100,
         systemState.ecDirection == EC_DILUTE ? "dilution" : "");
 
+    // Countdown for the app's stabilizing-loader UI - see
+    // handleStabilizingPH()'s matching comment and
+    // ecStabilizeSecondsRemaining's own comment in Types.h.
+    {
+        const unsigned long ecSettleElapsed = ecStabilizationCirculationConfirmedAt != 0
+            ? millis() - ecStabilizationCirculationConfirmedAt
+            : 0;
+        systemState.ecStabilizeSecondsRemaining = ecSettleElapsed >= EC_STABILIZATION_TIME
+            ? 0
+            : (uint16_t)((EC_STABILIZATION_TIME - ecSettleElapsed) / 1000UL);
+    }
+
     // Measured from circulation actually being confirmed running (see
     // ecStabilizationCirculationConfirmedAt's own comment), not from
     // stateStartTime - same reasoning and fix as handleStabilizingPH()'s
@@ -4393,12 +4475,41 @@ void AutomationManager::handleStabilizingEC()
                         ? sensors.ec >= systemState.ecTargetMin
                         : sensors.ec <= systemState.ecTargetMax;
 
+                // Water-level dilution-progress check (report-only - see
+                // ecDilutionNoRiseStreak's own comment in Types.h). The
+                // interval that just ran is the one ecDiluteIntervalStartLevel
+                // was captured for, so this is evaluated exactly once per
+                // completed dilution interval. EC_RAISE never touches the
+                // solenoid, so it never contributes to this streak. A missing/
+                // invalid current reading is neither a rise nor a no-rise - it
+                // is simply skipped, exactly like handleBoundedAutomaticRefill()'s
+                // matching check, so a sensor hiccup can never masquerade as
+                // evidence the solenoid isn't actually adding water.
+                if(systemState.ecDirection == EC_DILUTE &&
+                   isfinite(systemState.ecDiluteIntervalStartLevel) &&
+                   isfinite(sensors.waterLevelCm))
+                {
+                    const bool levelRose =
+                        (sensors.waterLevelCm - systemState.ecDiluteIntervalStartLevel) >
+                            WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
+
+                    if(levelRose)
+                    {
+                        systemState.ecDilutionNoRiseStreak = 0;
+                    }
+                    else if(systemState.ecDilutionNoRiseStreak < 2)
+                    {
+                        systemState.ecDilutionNoRiseStreak++;
+                    }
+                }
+
                 if(targetReached)
                 {
                     systemState.ecAttempts = 0;
                     systemState.ecDirection = EC_NONE;
                     systemState.reservoirLocked = false;
                     systemState.correctionCycleStartAt = 0;
+                    systemState.ecDilutionNoRiseStreak = 0;
 
                     completeCurrentOperation();
 
@@ -4417,6 +4528,13 @@ void AutomationManager::handleStabilizingEC()
                     systemState.ecAttempts++;
 
                     systemState.firstCorrectionCycle = false;
+
+                    // Fresh baseline for the next interval - the streak
+                    // itself (ecDilutionNoRiseStreak) is NOT reset here, so
+                    // it keeps accumulating across retries within this same
+                    // episode.
+                    systemState.ecDiluteIntervalStartLevel =
+                        systemState.ecDirection == EC_DILUTE ? sensors.waterLevelCm : NAN;
 
                     systemState.ecDoseTime = EC_DOSING_TIME;
 
@@ -4466,6 +4584,11 @@ void AutomationManager::handleStabilizingEC()
                         systemState.ecAttempts++;
 
                         systemState.firstCorrectionCycle = false;
+
+                        // Fresh baseline for the next interval - see the
+                        // matching comment on the plateau-retry branch above.
+                        systemState.ecDiluteIntervalStartLevel =
+                            systemState.ecDirection == EC_DILUTE ? sensors.waterLevelCm : NAN;
 
                         systemState.ecDoseTime = EC_DOSING_TIME;
 

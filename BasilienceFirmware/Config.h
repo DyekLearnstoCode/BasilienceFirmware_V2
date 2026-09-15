@@ -567,18 +567,16 @@ constexpr float COOLER_OFF_TEMP = 25.5f;
 constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 
 // ======================================================
-// Pulse cooling (FILL / COOL_SOAK / FLUSH) - TEMPORARY, UNCALIBRATED
+// Pulse cooling (FILL / COOL_SOAK / FLUSH) - bench-calibrated
 // ======================================================
-// !!! NOT VALIDATED ON HARDWARE YET !!!
-// These four values are conservative bench-test placeholders only, picked
-// to be safe (short soak, generous confirm timeout) rather than efficient.
-// None of them come from a bench measurement of this specific cooling loop's
-// fill time, trapped-water cooling rate, or flush/mixing time - see the
-// pulse-cooling task's own calibration procedure (log DS18B20 through a
-// manual FILL, a manual Peltier-only soak, and a manual FLUSH via
-// DevOptionsFragment's existing manual actuator controls) before treating
-// any of these as final. Kept as their own named constants specifically so
-// they are easy to find and change once that calibration is done.
+// Durations confirmed against this specific reservoir/Peltier pair (manual
+// FILL/soak/FLUSH via DevOptionsFragment's manual actuator controls, DS18B20
+// observed through each phase): 5s is enough to fill, 30s of Peltier-only
+// soak is the cooling window, 5s is enough to flush. Still named with the
+// _TEMP suffix - not because the values are placeholders any more, but
+// because the underlying reservoir/Peltier hardware they're tuned to could
+// change (a bigger reservoir, a different Peltier module) and would need
+// these re-measured, not just re-guessed.
 //
 // DEFERRED - ineffective-cooling detection: deliberately NOT implemented.
 // The pulse mechanism can currently repeat FILL->COOL_SOAK->FLUSH
@@ -595,9 +593,9 @@ constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 // ambient conditions than bench-tested; and whether one Peltier module can
 // hold this ~10.6L working volume below 28C at all under worst-case ambient.
 // Flagged here, not solved, until that data exists.
-constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 60UL * 1000UL;
-constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 120UL * 1000UL;
-constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 60UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 5UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 30UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 5UL * 1000UL;
 // Independent hardware-timer deadline for automatic Peltier during
 // COOL_SOAK = intended soak duration + this margin, mirroring
 // AUTOMATIC_DOSE_DEADLINE_MARGIN_MS's exact same "backstop only fires if

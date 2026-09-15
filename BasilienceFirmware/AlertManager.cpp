@@ -19,7 +19,8 @@ namespace
             return true;
 
         if (strcmp(name, "lowWater") == 0 || strcmp(name, "criticalLowWater") == 0 ||
-            strcmp(name, "waterLevelLow") == 0 || strcmp(name, "waterLevelHigh") == 0)
+            strcmp(name, "waterLevelLow") == 0 || strcmp(name, "waterLevelHigh") == 0 ||
+            strcmp(name, "refillIneffective") == 0)
         {
             return debugManager.shouldPrintDebug(DebugCategory::WATER);
         }
@@ -30,7 +31,8 @@ namespace
             return debugManager.shouldPrintDebug(DebugCategory::PH);
         }
 
-        if (strcmp(name, "ecLow") == 0 || strcmp(name, "ecHigh") == 0)
+        if (strcmp(name, "ecLow") == 0 || strcmp(name, "ecHigh") == 0 ||
+            strcmp(name, "ecDilutionIneffective") == 0)
         {
             return debugManager.shouldPrintDebug(DebugCategory::EC);
         }
@@ -177,6 +179,16 @@ void AlertManager::updateLowWaterAlert()
     setAlertDebounced("waterLevelHigh", alertState.waterLevelHigh,
         valid && sensors.waterLevel > systemState.maxWaterLevel,
         waterLevelHighPendingCount);
+
+    // AutomationManager::handleBoundedAutomaticRefill() already debounces
+    // this itself (systemState.refillNoRiseStreak requires 2 consecutive
+    // no-rise refill attempts before reaching 2) - no separate pendingCount
+    // needed here, unlike the threshold alerts above. Mirrors
+    // ecDilutionIneffective's exact same treatment in updateECAlert().
+    setAlert(
+        "refillIneffective",
+        alertState.refillIneffective,
+        systemState.refillNoRiseStreak >= 2);
 }
 
 void AlertManager::updateTemperatureAlert()
@@ -288,6 +300,15 @@ void AlertManager::updateECAlert()
         alertState.ecHigh,
         isfinite(sensors.ec) && sensors.ec > systemState.maxEC,
         ecHighPendingCount);
+
+    // AutomationManager::handleStabilizingEC() already debounces this itself
+    // (systemState.ecDilutionNoRiseStreak requires 2 consecutive no-rise
+    // dilution intervals before reaching 2) - no separate pendingCount
+    // needed here, unlike the threshold alerts above.
+    setAlert(
+        "ecDilutionIneffective",
+        alertState.ecDilutionIneffective,
+        systemState.ecDilutionNoRiseStreak >= 2);
 }
 
 void AlertManager::updateSensorFaultAlert()
