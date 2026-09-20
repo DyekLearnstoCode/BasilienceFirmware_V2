@@ -1,0 +1,185 @@
+// Copied from BasilienceFirmware/AnalogSampler.cpp so this calibration-check
+// sketch can build standalone (Arduino IDE only compiles files inside the
+// sketch folder). Keep this in sync with the original if it ever changes.
+#include "AnalogSampler.h"
+
+#include <cstring>
+
+AnalogSampler::AnalogSampler(
+    uint8_t pin,
+    uint8_t sampleCount,
+    unsigned long sampleInterval,
+    ReadMode mode)
+{
+    this->pin = pin;
+
+    this->mode = mode;
+
+    if (sampleCount > MAX_SAMPLES)
+        sampleCount = MAX_SAMPLES;
+
+    this->sampleCount = sampleCount;
+
+    this->sampleInterval = sampleInterval;
+
+    lastSampleTime = 0;
+
+    sampleIndex = 0;
+
+    bufferFilled = false;
+}
+
+void AnalogSampler::begin()
+{
+    memset(samples, 0, sizeof(samples));
+    memset(rawSamples, 0, sizeof(rawSamples));
+
+    sampleIndex = 0;
+    bufferFilled = false;
+    lastSampleTime = 0;
+}
+
+void AnalogSampler::update()
+{
+    if (millis() - lastSampleTime < sampleInterval)
+        return;
+
+    lastSampleTime = millis();
+
+    switch (mode)
+    {
+    case RAW_ADC:
+
+        samples[sampleIndex] =
+            analogRead(pin);
+
+        rawSamples[sampleIndex] = samples[sampleIndex];
+
+        break;
+
+    case MILLIVOLTS:
+
+        samples[sampleIndex] =
+            analogReadMilliVolts(pin);
+
+        rawSamples[sampleIndex] =
+            analogRead(pin);
+
+        break;
+    }
+
+    sampleIndex++;
+
+    if (sampleIndex >= sampleCount)
+    {
+        sampleIndex = 0;
+
+        bufferFilled = true;
+    }
+}
+
+bool AnalogSampler::ready() const
+{
+    return bufferFilled;
+}
+
+int AnalogSampler::median() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int sorted[MAX_SAMPLES];
+
+    memcpy(
+        sorted,
+        samples,
+        sampleCount * sizeof(int));
+
+    for (int i = 0; i < sampleCount - 1; i++)
+    {
+        for (int j = i + 1; j < sampleCount; j++)
+        {
+            if (sorted[j] < sorted[i])
+            {
+                int temp = sorted[i];
+
+                sorted[i] = sorted[j];
+
+                sorted[j] = temp;
+            }
+        }
+    }
+
+    return sorted[sampleCount / 2];
+}
+
+float AnalogSampler::average() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    long sum = 0;
+
+    for (int i = 0; i < sampleCount; i++)
+    {
+        sum += samples[i];
+    }
+
+    return (float)sum / sampleCount;
+}
+
+int AnalogSampler::rawMedian() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int sorted[MAX_SAMPLES];
+
+    memcpy(
+        sorted,
+        rawSamples,
+        sampleCount * sizeof(int));
+
+    for (int i = 0; i < sampleCount - 1; i++)
+    {
+        for (int j = i + 1; j < sampleCount; j++)
+        {
+            if (sorted[j] < sorted[i])
+            {
+                int temp = sorted[i];
+
+                sorted[i] = sorted[j];
+
+                sorted[j] = temp;
+            }
+        }
+    }
+
+    return sorted[sampleCount / 2];
+}
+
+int AnalogSampler::minValue() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int lo = samples[0];
+    for (int i = 1; i < sampleCount; i++)
+    {
+        if (samples[i] < lo) lo = samples[i];
+    }
+    return lo;
+}
+
+int AnalogSampler::maxValue() const
+{
+    if (!bufferFilled)
+        return 0;
+
+    int hi = samples[0];
+    for (int i = 1; i < sampleCount; i++)
+    {
+        if (samples[i] > hi) hi = samples[i];
+    }
+    return hi;
+}

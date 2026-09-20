@@ -236,11 +236,15 @@ void RTCManager::pollNetworkTimeSync()
     syncSource = SyncSource::NTP;
     Serial.println("[RTC] DS3231 adjusted successfully");
 
-    DateTime nowDt = rtc.now();
+    // Log the values just written, not a fresh rtc.now() read-back over I2C -
+    // a re-read immediately after adjust() can occasionally catch a
+    // transient/garbled register value (observed on real hardware as a
+    // nonsensical printed line, e.g. a minute above 59) even though the
+    // write itself (confirmed by the lostPower() check above) landed fine.
     char localTime[20];
     snprintf(localTime, sizeof(localTime), "%04u-%02u-%02u %02u:%02u:%02u",
-              nowDt.year(), nowDt.month(), nowDt.day(),
-              nowDt.hour(), nowDt.minute(), nowDt.second());
+              (unsigned)year, (unsigned)(timeinfo.tm_mon + 1), (unsigned)timeinfo.tm_mday,
+              (unsigned)timeinfo.tm_hour, (unsigned)timeinfo.tm_min, (unsigned)timeinfo.tm_sec);
     Serial.print("[RTC] local=");
     Serial.println(localTime);
 }

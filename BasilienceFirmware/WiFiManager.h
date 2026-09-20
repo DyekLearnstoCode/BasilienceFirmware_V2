@@ -144,6 +144,17 @@ private:
     unsigned long lastAPReconnectAttempt = 0;
     unsigned long apReconnectStartedAt = 0;
     static constexpr unsigned long RECONNECT_INTERVAL = 5000;
+    // Bounds a single association attempt (see connectionStartedAt's own
+    // comment). Deliberately shorter than RECOVERY_TIMEOUT below - a normal
+    // WPA2 handshake resolves in a few seconds, and this must leave enough
+    // of the cumulative window for at least one real RECONNECT_INTERVAL-
+    // spaced retry. Previously this branch used RECOVERY_TIMEOUT itself,
+    // which meant a single failed attempt (e.g. reason=2 AUTH_EXPIRE, seen
+    // on real hardware failing in under 2 seconds but not recognized as
+    // failed until this timeout) consumed the entire cumulative outage
+    // window on its own, so the device fell straight to AP provisioning
+    // fallback without ever actually retrying the saved network first.
+    static constexpr unsigned long CONNECT_ATTEMPT_TIMEOUT = 8000;
     static constexpr unsigned long RECOVERY_TIMEOUT = 20000;
     static constexpr unsigned long AP_RECONNECT_INTERVAL = 30000;
 

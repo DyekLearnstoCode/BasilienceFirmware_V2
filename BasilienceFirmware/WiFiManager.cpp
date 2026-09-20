@@ -714,7 +714,11 @@ void WiFiManager::update()
         case WifiState::CONNECTING:
         {
             // Poll only. No radio reconfiguration happens in this state.
-            if (now - connectionStartedAt < RECOVERY_TIMEOUT)
+            // Per-attempt bound (CONNECT_ATTEMPT_TIMEOUT), not the cumulative
+            // RECOVERY_TIMEOUT - see that constant's own comment in the
+            // header for why reusing RECOVERY_TIMEOUT here left no room for
+            // RETRY_WAIT to ever actually retry.
+            if (now - connectionStartedAt < CONNECT_ATTEMPT_TIMEOUT)
             {
                 break;
             }
