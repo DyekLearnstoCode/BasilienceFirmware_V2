@@ -287,13 +287,37 @@ constexpr float EC_TARGET_MIN = 1.4f;
 constexpr float EC_TARGET_MAX = 1.8f;
 
 // ======================================================
+// Alert Hysteresis (Stage 2 sensor architecture redesign)
+// ======================================================
+// Schmitt-trigger recovery margins for AlertManager's threshold alerts - see
+// AlertManager::risesAboveWithHysteresis()/fallsBelowWithHysteresis(). Once a
+// reading has crossed a configured min/max and latched the alert, it must
+// cross back past (threshold +/- this margin), not merely back over the same
+// line, before the alert clears - stops a reading sitting right at the
+// configured boundary from flapping the alert (and firing a fresh
+// notification) on ordinary sensor noise. Applied only at the alert layer;
+// never modifies the user-configured min/max thresholds themselves, and
+// unrelated to any control-side hysteresis (e.g. WATER_COOLING_HYSTERESIS)
+// which answers a different question (when equipment switches, not when to
+// notify). One constant per parameter, sized relative to that parameter's own
+// min/max gap and known sensor noise floor (e.g. PH_STABILITY_TOLERANCE,
+// EC_STABILITY_TOLERANCE above).
+constexpr float PH_ALERT_HYSTERESIS = 0.1f;
+constexpr float EC_ALERT_HYSTERESIS = 0.1f;
+constexpr float AIR_TEMP_ALERT_HYSTERESIS = 1.0f;           // TARGET_MIN_AIR_TEMP/TARGET_MAX_AIR_TEMP below
+constexpr float HUMIDITY_ALERT_HYSTERESIS = 3.0f;           // TARGET_MIN_HUMIDITY/TARGET_MAX_HUMIDITY below
+constexpr float WATER_TEMP_ALERT_HYSTERESIS = 1.0f;         // TARGET_MIN_WATER_TEMP/TARGET_MAX_WATER_TEMP below
+constexpr float WATER_LEVEL_ALERT_HYSTERESIS = 3.0f;        // TARGET_MIN_WATER_LEVEL/TARGET_MAX_WATER_LEVEL below (percentage)
+constexpr float WATER_LEVEL_CM_ALERT_HYSTERESIS = 0.3f;     // refillStartLevelCm/criticalLowWaterCm below (depth, cm)
+
+// ======================================================
 // pH/EC Last-Stable-Value Filter
 // ======================================================
-// Second-stage stability gate over readPH()/readEC()'s already ~1s-averaged
+// Second-stage stability gate over readPH()/readEC()'s already-averaged
 // output - see SensorManager::updateStabilityWindow() and
 // applyEffectiveSensors(). A sliding window of STABILITY_SAMPLE_WINDOW
-// samples, taken roughly STABILITY_SAMPLE_INTERVAL_MS apart, must all agree
-// within the tolerance below before sensors.ph/sensors.ec (the ONE dataset
+// samples, taken roughly one interval apart, must all agree within the
+// tolerance below before sensors.ph/sensors.ec (the ONE dataset
 // AutomationManager/AlertManager/SafetyManager/Firebase publication all
 // consume - no separate raw path feeds any of them) accept a new value; an
 // unstable window keeps the previous accepted value instead of
@@ -303,21 +327,27 @@ constexpr float EC_TARGET_MAX = 1.8f;
 //
 // Sampling cadence: readPH()/readEC() recompute their rolling average every
 // loop() tick, but the underlying ring buffer only advances by one raw ADC
-// sample every PH_SAMPLE_INTERVAL/EC_SAMPLE_INTERVAL (20ms) - consecutive
-// loop-tick reads of that average are therefore heavily autocorrelated
-// (49-50 of 51/61 underlying samples unchanged between them) and would make
-// "10 agreeing samples" trivially true even mid-excursion. 1000ms is
-// approximately one full turnover of that underlying rolling average (51-61
-// samples * 20ms =~1.0-1.2s), so each stability-window sample is a
-// genuinely fresh observation rather than a near-duplicate of the last.
+// sample every PH_SAMPLE_INTERVAL/EC_SAMPLE_INTERVAL - consecutive loop-tick
+// reads of that average are therefore heavily autocorrelated and would make
+// "10 agreeing samples" trivially true even mid-excursion. Each sensor's own
+// interval (STABILITY_SAMPLE_INTERVAL_MS for EC, PH_STABILITY_SAMPLE_INTERVAL_MS
+// for pH, passed into updateStabilityWindow() per call) is sized to
+// approximately one full turnover of that sensor's own rolling average, so
+// each stability-window sample is a genuinely fresh observation rather than
+// a near-duplicate of the last. EC stays at 61 samples * 20ms =~1.2s, while
+// pH is now 90 samples * 30ms =~2.7s (widened - see PH_SAMPLE_COUNT/
+// PH_SAMPLE_INTERVAL's own comment - the shared 1000ms interval this used to
+// be was tuned for pH's old ~1.0s turnover and went stale for pH once that
+// window grew).
 constexpr uint8_t STABILITY_SAMPLE_WINDOW = 10;
-constexpr unsigned long STABILITY_SAMPLE_INTERVAL_MS = 1000UL;
+constexpr unsigned long STABILITY_SAMPLE_INTERVAL_MS = 1000UL;   // EC only now
+constexpr unsigned long PH_STABILITY_SAMPLE_INTERVAL_MS = 2700UL;   // pH only
 
 // Starting point per the task spec - tight enough to still reject genuine
-// probe noise, loose enough that 10 samples (~10s) reliably converge once
-// the reading has actually settled. Re-tune only against observed
-// near-threshold noise amplitude, never as a stand-in for fixing a noisy
-// connection.
+// probe noise, loose enough that 10 samples (~27s at PH_STABILITY_SAMPLE_INTERVAL_MS)
+// reliably converge once the reading has actually settled. Re-tune only
+// against observed near-threshold noise amplitude, never as a stand-in for
+// fixing a noisy connection.
 constexpr float PH_STABILITY_TOLERANCE = 0.05f;
 
 // EC's anchor-point calibration (Calibration.h) maps the 1.2-2.0 mS/cm
@@ -371,18 +401,18 @@ constexpr float PH_STEP_CONFIRM_TOLERANCE = 0.05f;
 constexpr uint8_t PH_STEP_CONFIRM_COUNT = 3;
 
 // Quick-response refinement: the step filter's own evaluation cadence,
-// deliberately separate from STABILITY_SAMPLE_INTERVAL_MS (1000ms) - the
+// deliberately separate from PH_STABILITY_SAMPLE_INTERVAL_MS (2700ms) - the
 // automation-trust stability window below still samples at that slower,
 // stricter cadence unchanged. This is a dedicated, faster cadence purely
 // for how often the TEMPORAL FILTER itself pulls a fresh candidate from
-// the continuously-updating 51-sample median - fast enough that 3
+// the continuously-updating 90-sample median - fast enough that 3
 // confirmations (PH_STEP_CONFIRM_COUNT) complete in ~3x this interval
 // (~0.75-1.2s at 300ms), slow enough that consecutive evaluations are
 // still genuinely distinct observations rather than re-evaluating one
 // barely-changed rolling median value from adjacent loop() ticks (each
-// individual raw ADC sample only refreshes every PH_SAMPLE_INTERVAL=20ms,
-// so 250-400ms already spans several fresh raw samples sliding through
-// the median).
+// individual raw ADC sample only refreshes every PH_SAMPLE_INTERVAL=30ms,
+// so 300ms already spans several fresh raw samples sliding through the
+// median).
 constexpr unsigned long PH_STEP_SAMPLE_INTERVAL_MS = 300UL;
 
 // ======================================================
@@ -451,7 +481,7 @@ constexpr int EC_FAULT_RAIL_HIGH_MV = 3200;
 //
 // Margins: 5 counts (~0.12% of full scale) off each hard rail, wide enough
 // to absorb residual ADC dither at true saturation even after the existing
-// 51/61-sample median, narrow enough that no plausible mid-range signal
+// 90/61-sample median, narrow enough that no plausible mid-range signal
 // (pH or EC alike) can ever wander into it. Combined with the millivolt
 // checks via OR - either signal alone is sufficient evidence of a fault,
 // see SensorManager::readPH()/readEC().
@@ -493,6 +523,30 @@ constexpr uint8_t EC_FAULT_CONFIRM_COUNT = 8;
 // confirmed -> normal stability criteria satisfied -> automation eligible.
 constexpr uint8_t PH_FAULT_RECOVERY_COUNT = 8;
 constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
+
+// EC calibration-plausibility fault (SensorManager::readEC(), fail-safe
+// added after a real-hardware finding: a voltage nowhere near either
+// electrical rail above - e.g. ~365-400mV - can still fall so far outside
+// the domain EC_CAL_1_VOLTAGE/EC_CAL_2_VOLTAGE (Calibration.h) were actually
+// fit against that the two-point line extrapolates it into a physically
+// impossible negative EC, which the rail check alone never catches. This
+// does NOT change the calibration anchors or the two-point formula itself -
+// it only judges whether a given reading is far enough outside that model's
+// validated domain to be untrustworthy. Margin (not a hard clamp at the two
+// anchor voltages) because only two solutions were ever captured and real
+// cultivation-range EC can legitimately sit a bit outside that narrow
+// 2.142-2.440V span; 0.3V is generous enough to cover normal probe/solution
+// variation while still catching a reading this far off (the diagnosed
+// 365-400mV case is roughly 1.5V past this margin, not a borderline call).
+// Same EC_FAULT_CONFIRM_COUNT/EC_FAULT_RECOVERY_COUNT/EC_FAULT_CHECK_INTERVAL_MS
+// debounce shape as the rail check above, but its own separate streak state
+// (SensorManager's ecCalibrationFaultStreak/ecCalibrationFaultRecoveryStreak)
+// and its own fault field (physicalSensors.ecCalibrationFault) - kept
+// independent of the rail detector's own ecFaultStreak/physicalSensors.ecFault
+// so the two confirm/recovery debounces can never race each other into
+// clearing a fault the other one is still confirming; applyEffectiveSensors()
+// ORs both into the one published ecFault flag/NaN override.
+constexpr float EC_CAL_VOLTAGE_MARGIN_V = 0.3f;
 
 // Throttle for updateStabilityWindow()'s periodic diagnostic dump (real-
 // hardware pre-integration follow-up, Part A) - independent of
@@ -683,8 +737,17 @@ constexpr unsigned long EC_SAMPLE_INTERVAL = 20;
 // pH Sampling
 // ======================================================
 
-constexpr uint8_t PH_SAMPLE_COUNT = 51;
-constexpr unsigned long PH_SAMPLE_INTERVAL = 20;
+// Widened from 51 samples @ 20ms (~1.0s) to 90 @ 30ms (~2.7s) - real-hardware
+// use showed the pH candidate swinging by whole pH units within a single
+// window even with no dosing running, i.e. genuine noise on the raw mV
+// signal, not something the downstream step/stability filters could ever
+// fully absorb. A longer raw median window averages more of that noise out
+// before it becomes a candidate at all. Requires AnalogSampler::MAX_SAMPLES
+// >= 90 (bumped to 100) and PH_STABILITY_SAMPLE_INTERVAL_MS below to grow
+// with it, or the stability window starts re-sampling a not-yet-turned-over
+// median (see that constant's own comment).
+constexpr uint8_t PH_SAMPLE_COUNT = 90;
+constexpr unsigned long PH_SAMPLE_INTERVAL = 30;
 
 // ======================================================
 // Timing
@@ -854,12 +917,18 @@ constexpr unsigned long EC_DILUTION_TIME = 5000UL;
 // state, so monitoring and notification continue normally after the lock.
 constexpr unsigned long PH_EC_CORRECTION_STALL_TIMEOUT_MS = 240000UL; // 4 min
 
-// A reading must hold continuously stable this long, past the first
-// checkpoint, before it is trusted enough to publish to Firebase and to end
-// a correction on. Longer than SensorManager's own stability window
-// (STABILITY_SAMPLE_WINDOW * STABILITY_SAMPLE_INTERVAL_MS = 10s) - that
-// window says "not currently moving," this says "stayed that way."
-constexpr unsigned long PH_EC_STABLE_HOLD_FOR_PUBLISH_MS = 25000UL;
+// A reading must hold continuously stable this long, past the point
+// SensorManager's own stability window first agrees, before AutomationManager
+// trusts it enough to decide a correction has reached target or needs a
+// redose (handleStabilizingPH()/handleStabilizingEC()). Longer than that
+// window itself (STABILITY_SAMPLE_WINDOW * interval = ~12s for EC, ~27s for
+// pH now that PH_STABILITY_SAMPLE_INTERVAL_MS is widened) - that window says
+// "not currently moving," this says "stayed that way." Automation-only since
+// Stage 1 of the sensor architecture redesign - despite the name, this no
+// longer gates Firebase publication (Firebase now always publishes the
+// current filtered sensors.ph/ec, see FirebaseManager::writeSensors()); the
+// name is kept to minimize churn, not renamed in Stage 1.
+constexpr unsigned long PH_EC_STABLE_HOLD_FOR_PUBLISH_MS = 30000UL;
 
 // Minimum change between two trend samples (PH_EC_RECHECK_INTERVAL_MS apart)
 // to count as real movement rather than probe/ADC noise. Starting values -
@@ -1026,4 +1095,36 @@ constexpr float REFILL_STOP_CM = 3.0f;
 constexpr float WATER_LEVEL_STEP_ACCEPT_CM = 0.40f;
 constexpr float WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM = 0.15f;
 constexpr uint8_t WATER_LEVEL_STEP_CONFIRM_COUNT = 3;
+
+// ======================================================
+// HC-SR04 Large-Jump Quarantine (fail-safe over the step filter above)
+// ======================================================
+// Real-hardware finding: the step filter above treats ANY jump beyond
+// WATER_LEVEL_STEP_ACCEPT_CM the same way regardless of magnitude - 3
+// consecutive candidates that merely agree WITH EACH OTHER (not with
+// physical reality) were enough to promote a trusted ~3.5cm depth straight
+// to a bogus ~23.6cm/100% reading, e.g. from a run of repeated fogger-mist
+// echoes. This section adds a magnitude gate on top of the existing
+// count-based confirmation (SensorManager::readWaterLevel()) rather than
+// replacing it - it does not touch WATER_LEVEL_STEP_ACCEPT_CM/
+// WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM/WATER_LEVEL_STEP_CONFIRM_COUNT
+// above, which still govern ordinary small changes and initial
+// reacquisition exactly as before.
+//
+// A jump this large or larger from the current TRUSTED depth is never
+// physically plausible in a single read cycle (a genuine fast manual
+// fill/drain still moves far less than the entire working range in 5-10s)
+// and is never eligible to become trusted no matter how many times it
+// repeats - tied to the existing MAX_WORKING_WATER_CM geometry constant
+// rather than an arbitrary new number.
+constexpr float WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM = MAX_WORKING_WATER_CM;
+
+// A jump smaller than the implausible ceiling above (still a genuine "large
+// jump" past WATER_LEVEL_STEP_ACCEPT_CM, but not physically absurd) is
+// merely quarantined, not immediately rejected - it needs STRONGER
+// confirmation than an ordinary small change before replacing the trusted
+// value: more consecutive mutually-agreeing candidates than
+// WATER_LEVEL_STEP_CONFIRM_COUNT, at the same WATER_LEVEL_READ_INTERVAL_MS
+// cadence (so up to ~25-30s of sustained agreement, not ~10s).
+constexpr uint8_t WATER_LEVEL_JUMP_CONFIRM_COUNT = 6;
 #endif

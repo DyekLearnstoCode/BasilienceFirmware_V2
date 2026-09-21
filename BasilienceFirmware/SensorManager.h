@@ -11,15 +11,16 @@
 
 // Sliding-window stability gate for pH/EC - see
 // SensorManager::updateStabilityWindow() and applyEffectiveSensors(), and
-// STABILITY_SAMPLE_WINDOW/STABILITY_SAMPLE_INTERVAL_MS/PH_EC_STABLE_TIMEOUT_MS
-// in Config.h for the cadence/tolerance/staleness design. One instance per
-// sensor (SensorManager's phStabilityWindow/ecStabilityWindow).
+// STABILITY_SAMPLE_WINDOW/STABILITY_SAMPLE_INTERVAL_MS/PH_STABILITY_SAMPLE_INTERVAL_MS/
+// PH_EC_STABLE_TIMEOUT_MS in Config.h for the cadence/tolerance/staleness
+// design. One instance per sensor (SensorManager's
+// phStabilityWindow/ecStabilityWindow).
 struct StabilityWindow
 {
     float samples[STABILITY_SAMPLE_WINDOW] = {NAN};
     uint8_t count = 0;              // valid samples currently held (<= STABILITY_SAMPLE_WINDOW)
     uint8_t next = 0;                // next ring-buffer slot to write
-    unsigned long lastSampleAt = 0;  // throttles candidate intake to ~STABILITY_SAMPLE_INTERVAL_MS
+    unsigned long lastSampleAt = 0;  // throttles candidate intake to ~intervalMs (STABILITY_SAMPLE_INTERVAL_MS or PH_STABILITY_SAMPLE_INTERVAL_MS, per updateStabilityWindow()'s caller)
     float lastStable = NAN;          // last accepted representative value - kept through a temporary-unstable or stale period as diagnostic history AND as what sensors.ph/ec keeps displaying/publishing (see applyEffectiveSensors())
     unsigned long lastStableAt = 0;  // millis() of that acceptance; staleness is measured from this
     bool hasStable = false;          // true once ANY stable value has ever been accepted (permanent - not cleared by a later stale timeout)
@@ -117,6 +118,14 @@ private:
     uint8_t waterTempFailureStreak = 0;
     float lastValidWaterTemp = NAN;
 
+    // Stage 2 (AlertManager sample-confirmed alerts): increments exactly
+    // once per genuinely accepted new DS18B20 reading - see
+    // readWaterTemperature()'s own physicalSensors.waterTemp write. Never
+    // advances on a not-due-yet tick, a transient failure, or a confirmed
+    // failure - only a real accepted observation. getWaterTempSampleVersion()
+    // below exposes it read-only.
+    uint32_t waterTempSampleVersion = 0;
+
     // Light exponential smoothing over accepted raw DS18B20 readings - see
     // readWaterTemperature()'s own comment for why (real-hardware
     // pre-integration Part D: occasional per-sample flicker with no
@@ -139,12 +148,24 @@ private:
     enum class EcCompensationSource { LIVE, LAST_VALID, FALLBACK_DEFAULT };
     EcCompensationSource lastEcCompensationSource = EcCompensationSource::LIVE;
 
+    // Stage 2 (AlertManager sample-confirmed alerts): incremented inside
+    // updateStabilityWindow() (shared with pH below) at EC's own DECISION
+    // cadence, STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the raw
+    // ~20ms AnalogSampler ADC cadence, which is far too fast to represent a
+    // meaningful filtered decision observation for alert-confirmation
+    // purposes (that raw cadence remains exactly as fast for LIVE telemetry,
+    // sensors.ec - only alert confirmation is throttled to this slower
+    // cadence). Each increment corresponds to the current median-filtered/
+    // calibrated/temperature-compensated physicalSensors.ec value being fed
+    // to ecStabilityWindow. getEcSampleVersion() below exposes it read-only.
+    uint32_t ecSampleVersion = 0;
+
     // Authoritative pH/EC stability state - see StabilityWindow's own
     // comment and applyEffectiveSensors()'s use of these to build
     // sensors.ph/sensors.ec.
     StabilityWindow phStabilityWindow;
     StabilityWindow ecStabilityWindow;
-    void updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, const char* logTag, DebugCategory category);
+    void updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, unsigned long intervalMs, const char* logTag, DebugCategory category, uint32_t& sampleVersion);
     void resetStabilityWindow(StabilityWindow& window);
 
     // pH/EC rail-proximity hardware-fault detection - see Config.h's
@@ -168,6 +189,29 @@ private:
     unsigned long lastEcFaultCheckAt = 0;
     uint8_t ecFaultStreak = 0;
     uint8_t ecFaultRecoveryStreak = 0;
+
+    // EC calibration-plausibility fault (Config.h's EC_CAL_VOLTAGE_MARGIN_V,
+    // fail-safe over the EC_CAL_* two-point model - see readEC()'s own
+    // comment and physicalSensors.ecCalibrationFault's declaration-site
+    // comment in Types.h). A SEPARATE streak/throttle from
+    // ecFaultStreak/ecFaultRecoveryStreak/lastEcFaultCheckAt above -
+    // deliberately not shared, so this detector's own confirm/recovery
+    // debounce can never race the rail detector's into clearing a fault the
+    // other is still confirming.
+    unsigned long lastEcCalibrationFaultCheckAt = 0;
+    uint8_t ecCalibrationFaultStreak = 0;
+    uint8_t ecCalibrationFaultRecoveryStreak = 0;
+
+    // Per-observation plausibility result, recomputed EVERY readEC() tick
+    // (unlike ecCalibrationFaultStreak above, which only advances on the
+    // throttled EC_FAULT_CHECK_INTERVAL_MS cadence) - true when THIS
+    // sample's compensatedEc/voltage is non-finite, negative, or outside
+    // the EC_CAL_VOLTAGE_MARGIN_V-widened calibration domain. Lets
+    // applyEffectiveSensors() invalidate sensors.ec immediately for a single
+    // bad observation without waiting on EC_FAULT_CONFIRM_COUNT consecutive
+    // confirmations - that streak still, and only, controls the separate
+    // PERSISTENT physicalSensors.ecCalibrationFault flag.
+    bool ecImplausibleThisSample = false;
 
     // pH temporal step filter - see Config.h's PH_STEP_ACCEPT_DELTA/
     // PH_STEP_CONFIRM_TOLERANCE/PH_STEP_CONFIRM_COUNT and
@@ -200,9 +244,25 @@ private:
     // log, mirroring StabilityWindow::staleLogged's own pattern.
     bool phTelemetryStaleLogged = false;
 
+    // Stage 2 (AlertManager sample-confirmed alerts): incremented inside
+    // updateStabilityWindow() (shared with EC above) at pH's own DECISION
+    // cadence, PH_STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the
+    // faster ~300ms PH_STEP_SAMPLE_INTERVAL_MS step-filter cadence, which is
+    // too fast to represent a meaningful filtered decision observation for
+    // alert-confirmation purposes (that faster cadence remains exactly as
+    // fast for LIVE telemetry, sensors.ph - only alert confirmation is
+    // throttled to this slower cadence). Each increment corresponds to the
+    // current filtered/accepted pH value (phCandidateForWindow, which falls
+    // back to lastAcceptedPhCandidate on a tick that only reconfirmed the
+    // existing anchor - see applyEffectiveSensors()'s own comment) being fed
+    // to phStabilityWindow, so it keeps advancing even once pH has settled
+    // and stopped producing new accepted-VALUE changes - required so
+    // AlertManager's recovery-side confirmation can still progress.
+    uint32_t phSampleVersion = 0;
+
     // Throttles the step filter's own evaluation (state advancement AND its
     // [PH-FILTER] diagnostics) to PH_STEP_SAMPLE_INTERVAL_MS (quick-response
-    // refinement task - deliberately faster than STABILITY_SAMPLE_INTERVAL_MS,
+    // refinement task - deliberately faster than PH_STABILITY_SAMPLE_INTERVAL_MS,
     // which the automation-trust window below still uses unchanged). readPH()
     // recomputes physicalSensors.ph on every loop() tick from a
     // continuously-updating median, so without this throttle "3 consecutive
@@ -249,6 +309,18 @@ private:
     float waterLevelStepCandidateCm = NAN;
     uint8_t waterLevelStepCandidateCount = 0;
 
+    // Large-jump quarantine fail-safe (Config.h's WATER_LEVEL_JUMP_PLAUSIBLE_
+    // MAX_CM/WATER_LEVEL_JUMP_CONFIRM_COUNT) - see readWaterLevel()'s own
+    // comment. Counts consecutive ACCEPTED-cycle readings whose candidate
+    // has been beyond WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM from the current
+    // trusted depth; a plausible reading (small change OR a large-but-
+    // plausible quarantined jump) resets it to 0. Deliberately a SEPARATE
+    // counter from waterLevelFailureStreak above (that one is for the raw
+    // HC-SR04 read itself failing/timing out) - this one is for a read that
+    // SUCCEEDED but produced a physically-implausible jump, so the two must
+    // never be conflated or reset each other.
+    uint8_t waterLevelJumpFaultStreak = 0;
+
     // Refill threshold confirmation - see Types.h's refillStartConfirmed/
     // refillStopConfirmed and readWaterLevel()'s own comment. Counts
     // consecutive ACCEPTED readings (not loop() ticks) on the correct side
@@ -277,6 +349,16 @@ private:
     // line needs to print.
     unsigned long lastWaterLevelDiagnosticAt = 0;
 
+    // Stage 2 (AlertManager sample-confirmed alerts): increments exactly
+    // once per genuinely accepted new HC-SR04 depth - see
+    // readWaterLevel()'s two physicalSensors.waterLevelCm write sites
+    // (baseline establishment and the normal accept/hold path - both are
+    // real processed echoes, not just re-publishing an old value). Does NOT
+    // advance while skipped for the fogger being on, not due yet, a
+    // transient failure, a confirmed failure, or while still reacquiring a
+    // baseline with nothing accepted yet.
+    uint32_t waterLevelSampleVersion = 0;
+
     // DHT22 read scheduling and transient-failure tolerance, mirroring the
     // water-temperature/water-level pattern above. physicalSensors.humidity/
     // temperature only become NaN once a scheduled read has failed
@@ -301,6 +383,15 @@ private:
     // Throttle for readDHT()'s [DHT-RAW] diagnostic's VALID case - see
     // DHT_RAW_DIAGNOSTIC_INTERVAL_MS's own comment.
     unsigned long lastDhtRawDiagnosticAt = 0;
+
+    // Stage 2 (AlertManager sample-confirmed alerts): increments exactly
+    // once per genuinely accepted new DHT22 reading - see readDHT()'s two
+    // physicalSensors.humidity/temperature write sites (the normal-operation
+    // accept and the post-outage recovery accept). One shared counter for
+    // both parameters since a single DHT read produces both together. Never
+    // advances on a not-due-yet tick, a transient failure, or while
+    // confirmed unavailable.
+    uint32_t dhtSampleVersion = 0;
 
     // =====================================================
     // Sensor Reading Functions
@@ -404,6 +495,25 @@ public:
     bool isWaterTempStateKnown() const;
     bool isWaterLevelStateKnown() const;
     bool isEcStateKnown() const;
+
+    // Stage 2 (sensor architecture redesign, incident-style alerts):
+    // per-parameter sample-sequence counters, each incremented ONLY at the
+    // point in this class where that parameter's live value gets a
+    // genuinely new accepted/valid observation - never merely because time
+    // elapsed or a read function was called again. AlertManager compares
+    // each against its own last-processed copy (current != last processed
+    // -> a real new sample arrived -> advance that alert's confirmation
+    // count once; current == last processed -> do nothing) instead of
+    // gating confirmation on loop() ticks or a fixed interval, so a sensor
+    // that fails, holds a stale value, or intentionally skips acquisition
+    // (e.g. the HC-SR04 while the fogger is on) can never fake a
+    // confirmation. See each counter's own declaration-site comment above
+    // for exactly where it advances.
+    uint32_t getPhSampleVersion() const { return phSampleVersion; }
+    uint32_t getEcSampleVersion() const { return ecSampleVersion; }
+    uint32_t getDhtSampleVersion() const { return dhtSampleVersion; }
+    uint32_t getWaterTempSampleVersion() const { return waterTempSampleVersion; }
+    uint32_t getWaterLevelSampleVersion() const { return waterLevelSampleVersion; }
 };
 
 #endif

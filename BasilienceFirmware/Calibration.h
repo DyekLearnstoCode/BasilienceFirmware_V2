@@ -62,8 +62,10 @@ constexpr int ADC_RESOLUTION = 4095;
 // dipped in a 12.88 mS/cm reference solution, EC module powered from 5V,
 // through the expansion board, ESP32 reading GPIO34. Landed on ~2.44V every
 // time it was captured this session, regardless of power source - the
-// stable anchor of the two.
-constexpr float EC_CAL_1_VOLTAGE = 2.440f;   // volts
+// stable anchor of the two. Re-captured at 2.443V in a later session -
+// updated below; still the same solution/wiring path, within normal
+// session-to-session variation of the original ~2.44V reading.
+constexpr float EC_CAL_1_VOLTAGE = 2.443f;   // volts
 constexpr float EC_CAL_1_EC      = 12.88f;   // mS/cm
 
 // Point 2 - CONFIRMED on real hardware (EC calibration redesign task): probe
@@ -71,20 +73,22 @@ constexpr float EC_CAL_1_EC      = 12.88f;   // mS/cm
 // real 1.2-2.0 mS/cm cultivation range (EC_TARGET_MIN/EC_TARGET_MAX,
 // Config.h) rather than another high-concentration point, since that is
 // where dosing decisions actually operate. Took several recaptures within
-// the same session (1.734V direct-to-ESP32, then 2.007V/2.122V/2.142V
+// the original session (1.734V direct-to-ESP32, then 2.007V/2.122V/2.142V
 // through the expansion board) before the expansion-board wiring path was
-// identified as the actual variable - 2.142V is the value from the capture
-// that held a long, genuine plateau (tens of consecutive stable samples)
-// through the expansion board, the real production path. Because these two
-// points are closer together in voltage than the original 1.734V/12.88
-// pair, the fitted line is meaningfully steeper - the whole 1.2-2.0 mS/cm
-// cultivation range now spans only ~21mV of signal (vs. ~50mV before), so
-// ordinary ADC noise will show up as a larger apparent swing in reported EC
-// within that range than it used to. Worth revisiting if that turns out to
-// matter in practice (e.g. a lower-concentration second reference solution
-// instead).
-constexpr float EC_CAL_2_VOLTAGE = 2.142f;   // volts
-constexpr float EC_CAL_2_EC      = 1.4f;     // mS/cm
+// identified as the actual variable. Re-captured again in a later session at
+// 2.205V through the expansion board - updated below; slightly widens the
+// gap from Point 1 versus the original 2.142V capture, so the swing-per-mV
+// concern noted below is somewhat less pronounced than originally measured,
+// though still tighter than the very first 1.734V/12.88 pairing. Because
+// these two points are still much closer together in voltage than that
+// original pairing, the fitted line is meaningfully steeper than a
+// full-range calibration would give - ordinary ADC noise will show up as a
+// larger apparent swing in reported EC within the real cultivation range
+// than it would with two more widely-separated anchors. Worth revisiting if
+// that turns out to matter in practice (e.g. a lower-concentration second
+// reference solution instead).
+constexpr float EC_CAL_2_VOLTAGE = 2.205f;   // volts
+constexpr float EC_CAL_2_EC      = 1.40f;    // mS/cm
 
 // ======================================================
 // pH Calibration

@@ -12,7 +12,9 @@ public:
         MILLIVOLTS
     };
 
-    static const uint8_t MAX_SAMPLES = 60;
+    // Raised from 60 to fit pH's widened PH_SAMPLE_COUNT=90 (Config.h) -
+    // EC's own 61-sample window still fits comfortably under this ceiling.
+    static const uint8_t MAX_SAMPLES = 100;
 
     AnalogSampler(
         uint8_t pin,

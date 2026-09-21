@@ -92,22 +92,62 @@ void AlertManager::setAlert(const char* name, bool& currentValue, bool nextValue
     Serial.println(millis());
 }
 
-void AlertManager::setAlertDebounced(const char* name, bool& currentValue,
-                                     bool nextValue, uint8_t& pendingCount)
+void AlertManager::setAlertDebounced(const char* name, bool& currentValue, bool nextAbnormal,
+                                     uint8_t& abnormalPendingCount, uint8_t& recoveryPendingCount,
+                                     bool newSample)
 {
-    if (!nextValue)
+    if (nextAbnormal)
     {
-        pendingCount = 0;
-        setAlert(name, currentValue, false);
-        return;
-    }
+        recoveryPendingCount = 0;
 
-    if (pendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        if (newSample && abnormalPendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            abnormalPendingCount++;
+        }
+
+        if (abnormalPendingCount >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            setAlert(name, currentValue, true);
+        }
+    }
+    else
     {
-        pendingCount++;
-    }
+        abnormalPendingCount = 0;
 
-    setAlert(name, currentValue, pendingCount >= SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+        if (newSample && recoveryPendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            recoveryPendingCount++;
+        }
+
+        if (recoveryPendingCount >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            setAlert(name, currentValue, false);
+        }
+    }
+}
+
+bool AlertManager::newObservation(uint32_t currentVersion, uint32_t& lastProcessedVersion)
+{
+    if (currentVersion == lastProcessedVersion)
+    {
+        return false;
+    }
+    lastProcessedVersion = currentVersion;
+    return true;
+}
+
+bool AlertManager::aboveWithHysteresis(bool currentlyActive, float value,
+                                       float threshold, float hysteresis, bool valid)
+{
+    if (!valid) return false;
+    return currentlyActive ? (value > threshold - hysteresis) : (value > threshold);
+}
+
+bool AlertManager::belowWithHysteresis(bool currentlyActive, float value,
+                                       float threshold, float hysteresis, bool valid)
+{
+    if (!valid) return false;
+    return currentlyActive ? (value < threshold + hysteresis) : (value < threshold);
 }
 
 void AlertManager::update()
@@ -130,9 +170,9 @@ void AlertManager::update()
 
     updateLowWaterAlert();
 
-    updateTemperatureAlert();
+    const bool dhtSampleReady = updateTemperatureAlert();
 
-    updateHumidityAlert();
+    updateHumidityAlert(dhtSampleReady);
 
     updateWaterTemperatureAlert();
 
@@ -147,6 +187,14 @@ void AlertManager::updateLowWaterAlert()
 {
     const bool valid = isfinite(sensors.waterLevel);
 
+    // Stage 2: one shared "genuinely new HC-SR04 observation" gate for all
+    // four waterLevel/waterLevelCm-derived alerts below - see
+    // newObservation()'s own comment. Sourced from SensorManager's own
+    // waterLevelSampleVersion, which does NOT advance while the fogger has
+    // skipped acquisition, a read isn't due yet, or a read failed/is still
+    // reacquiring a baseline - only a genuinely accepted new depth.
+    const bool newSample = newObservation(sensorManager.getWaterLevelSampleVersion(), waterLevelLastProcessedVersion);
+
     // CONTROL signal - stays on refillStartLevelCm (water depth, cm)
     // because it gates AutomationManager::handleNormal()'s automatic refill
     // trigger and SafetyManager::canResetSafety() - see Config.h's "Water
@@ -155,49 +203,65 @@ void AlertManager::updateLowWaterAlert()
     // SafetyManager/ActuatorManager, independent of this alert): this flag
     // means "eligible to refill," a materially less severe condition.
     // Retargeting this at minWaterLevel would change when the valve opens,
-    // which is a control change, not a reporting one.
+    // which is a control change, not a reporting one. A LOW-only condition
+    // (no upper bound) - recovers once the depth has risen back past
+    // refillStartLevelCm + WATER_LEVEL_CM_ALERT_HYSTERESIS, not merely back
+    // over the same line the refill valve itself just opened at.
     setAlertDebounced("lowWater", alertState.lowWater,
-        valid && sensors.waterLevelCm <= systemState.refillStartLevelCm,
-        lowWaterPendingCount);
+        belowWithHysteresis(alertState.lowWater, sensors.waterLevelCm,
+            systemState.refillStartLevelCm, WATER_LEVEL_CM_ALERT_HYSTERESIS, valid),
+        lowWaterAbnormalPendingCount, lowWaterRecoveryPendingCount, newSample);
 
-    // Severity escalation on top of lowWater - same debounce shape (see
-    // setAlertDebounced()'s own comment), same `valid` NaN gate, so an
-    // invalid/unavailable HC-SR04 reading can never raise this any more than
-    // it can raise lowWater. No actuator gate reads this directly - the
-    // <=2.0cm operational block above already covers pH/EC/fogging/cooling;
-    // this is purely a status/notification severity signal for a reservoir
-    // that has fallen even further, past criticalLowWaterCm.
+    // Severity escalation on top of lowWater - same debounce/hysteresis
+    // shape, same `valid` NaN gate, so an invalid/unavailable HC-SR04
+    // reading can never raise this any more than it can raise lowWater. No
+    // actuator gate reads this directly - the <=2.0cm operational block
+    // above already covers pH/EC/fogging/cooling; this is purely a
+    // status/notification severity signal for a reservoir that has fallen
+    // even further, past criticalLowWaterCm.
     setAlertDebounced("criticalLowWater", alertState.criticalLowWater,
-        valid && sensors.waterLevelCm <= systemState.criticalLowWaterCm,
-        criticalLowWaterPendingCount);
+        belowWithHysteresis(alertState.criticalLowWater, sensors.waterLevelCm,
+            systemState.criticalLowWaterCm, WATER_LEVEL_CM_ALERT_HYSTERESIS, valid),
+        criticalLowWaterAbnormalPendingCount, criticalLowWaterRecoveryPendingCount, newSample);
 
     // TARGET-RANGE classification, reported alongside it.
     setAlertDebounced("waterLevelLow", alertState.waterLevelLow,
-        valid && sensors.waterLevel < systemState.minWaterLevel,
-        waterLevelLowPendingCount);
+        belowWithHysteresis(alertState.waterLevelLow, sensors.waterLevel,
+            systemState.minWaterLevel, WATER_LEVEL_ALERT_HYSTERESIS, valid),
+        waterLevelLowAbnormalPendingCount, waterLevelLowRecoveryPendingCount, newSample);
 
     setAlertDebounced("waterLevelHigh", alertState.waterLevelHigh,
-        valid && sensors.waterLevel > systemState.maxWaterLevel,
-        waterLevelHighPendingCount);
+        aboveWithHysteresis(alertState.waterLevelHigh, sensors.waterLevel,
+            systemState.maxWaterLevel, WATER_LEVEL_ALERT_HYSTERESIS, valid),
+        waterLevelHighAbnormalPendingCount, waterLevelHighRecoveryPendingCount, newSample);
 
     // AutomationManager::handleBoundedAutomaticRefill() already debounces
     // this itself (systemState.refillNoRiseStreak requires 2 consecutive
     // no-rise refill attempts before reaching 2) - no separate pendingCount
     // needed here, unlike the threshold alerts above. Mirrors
-    // ecDilutionIneffective's exact same treatment in updateECAlert().
+    // ecDilutionIneffective's exact same treatment in updateECAlert(). Not a
+    // Stage 2 threshold alert - untouched.
     setAlert(
         "refillIneffective",
         alertState.refillIneffective,
         systemState.refillNoRiseStreak >= 2);
 }
 
-void AlertManager::updateTemperatureAlert()
+bool AlertManager::updateTemperatureAlert()
 {
     // dhtAvailable, not isfinite(sensors.temperature) - see the automation
     // resilience pass report. A held last-good reading (dhtStale=true) is
     // finite but must not drive a fresh target-range classification; only a
     // currently-fresh measurement should be able to raise/clear these.
     const bool valid = sensors.dhtAvailable;
+
+    // Stage 2: shared "genuinely new DHT observation" gate - one read
+    // refreshes temperature AND humidity together (SensorManager's single
+    // dhtSampleVersion), so updateHumidityAlert() reuses the same result
+    // (passed back to update() below) rather than tracking its own. Does
+    // NOT advance on a not-due-yet tick or a failed/held-stale read - only
+    // a genuinely accepted new reading.
+    const bool newSample = newObservation(sensorManager.getDhtSampleVersion(), dhtLastProcessedVersion);
 
     // Both sides now come from the configured target range. Previously the low
     // side compared against the hard-coded COLD_FOG_TEMPERATURE constant, which
@@ -207,29 +271,40 @@ void AlertManager::updateTemperatureAlert()
     setAlertDebounced(
         "lowAirTemperature",
         alertState.lowAirTemperature,
-        valid && sensors.temperature < systemState.minAirTemp,
-        lowAirTemperaturePendingCount);
+        belowWithHysteresis(alertState.lowAirTemperature, sensors.temperature,
+            systemState.minAirTemp, AIR_TEMP_ALERT_HYSTERESIS, valid),
+        lowAirTemperatureAbnormalPendingCount, lowAirTemperatureRecoveryPendingCount, newSample);
 
     setAlertDebounced(
         "highTemperature",
         alertState.highTemperature,
-        valid && sensors.temperature > systemState.maxAirTemp,
-        highTemperaturePendingCount);
+        aboveWithHysteresis(alertState.highTemperature, sensors.temperature,
+            systemState.maxAirTemp, AIR_TEMP_ALERT_HYSTERESIS, valid),
+        highTemperatureAbnormalPendingCount, highTemperatureRecoveryPendingCount, newSample);
+
+    return newSample;
 }
 
-void AlertManager::updateHumidityAlert()
+void AlertManager::updateHumidityAlert(bool newSample)
 {
     // dhtAvailable, not isfinite(sensors.humidity) - see
-    // updateTemperatureAlert()'s matching comment.
+    // updateTemperatureAlert()'s matching comment. newSample is computed
+    // once by updateTemperatureAlert() and passed in - same DHT read
+    // refreshes both, so a second independent newObservation() call here
+    // against the same dhtSampleVersion (already consumed into
+    // dhtLastProcessedVersion by updateTemperatureAlert() this cycle) would
+    // always read false.
     const bool valid = sensors.dhtAvailable;
 
     setAlertDebounced("humidityLow", alertState.humidityLow,
-        valid && sensors.humidity < systemState.minHumidity,
-        humidityLowPendingCount);
+        belowWithHysteresis(alertState.humidityLow, sensors.humidity,
+            systemState.minHumidity, HUMIDITY_ALERT_HYSTERESIS, valid),
+        humidityLowAbnormalPendingCount, humidityLowRecoveryPendingCount, newSample);
 
     setAlertDebounced("humidityHigh", alertState.humidityHigh,
-        valid && sensors.humidity > systemState.maxHumidity,
-        humidityHighPendingCount);
+        aboveWithHysteresis(alertState.humidityHigh, sensors.humidity,
+            systemState.maxHumidity, HUMIDITY_ALERT_HYSTERESIS, valid),
+        humidityHighAbnormalPendingCount, humidityHighRecoveryPendingCount, newSample);
 }
 
 void AlertManager::updateWaterTemperatureAlert()
@@ -240,11 +315,17 @@ void AlertManager::updateWaterTemperatureAlert()
     // highWaterTemp / coolerOffTemp directly.
     const bool valid = isfinite(sensors.waterTemp);
 
+    // Stage 2: shared "genuinely new DS18B20 observation" gate for both
+    // directions below - does NOT advance on a not-due-yet tick or a
+    // transient/confirmed failure.
+    const bool newSample = newObservation(sensorManager.getWaterTempSampleVersion(), waterTempLastProcessedVersion);
+
     setAlertDebounced(
         "waterTempOutOfRange",
         alertState.waterTempOutOfRange,
-        valid && sensors.waterTemp > systemState.maxWaterTemp,
-        waterTempOutOfRangePendingCount);
+        aboveWithHysteresis(alertState.waterTempOutOfRange, sensors.waterTemp,
+            systemState.maxWaterTemp, WATER_TEMP_ALERT_HYSTERESIS, valid),
+        waterTempOutOfRangeAbnormalPendingCount, waterTempOutOfRangeRecoveryPendingCount, newSample);
 
     // No active water-heating actuator exists in this design and none is
     // added by this alert - low water temperature is a MONITORED/ALERT
@@ -259,28 +340,34 @@ void AlertManager::updateWaterTemperatureAlert()
     setAlertDebounced(
         "waterTempLow",
         alertState.waterTempLow,
-        valid && sensors.waterTemp < systemState.minWaterTemp,
-        waterTempLowPendingCount);
+        belowWithHysteresis(alertState.waterTempLow, sensors.waterTemp,
+            systemState.minWaterTemp, WATER_TEMP_ALERT_HYSTERESIS, valid),
+        waterTempLowAbnormalPendingCount, waterTempLowRecoveryPendingCount, newSample);
 }
 
 
 
 void AlertManager::updatePHAlert()
 {
-    // sensors.ph is now the stable-value filter's authoritative output (see
-    // SensorManager::applyEffectiveSensors()/updateStabilityWindow()) - it
-    // only ever changes when a new 10-sample window has actually agreed
-    // within tolerance, so a plain single-threshold comparison here no
-    // longer chatters. The decision-layer Schmitt-trigger hysteresis this
-    // function used to carry (PH_ALERT_HYSTERESIS) was a second, overlapping
-    // anti-flicker system on top of that upstream fix and has been removed;
-    // minPH/maxPH stay the sole, simple, authoritative comparison.
+    // sensors.ph is the live SensorManager-filtered value (Stage 1 of the
+    // sensor architecture redesign - see SensorManager::applyEffectiveSensors())
+    // and can now change every loop() tick, not just once per confirmed
+    // stability-window agreement as before Stage 1 - so the raw threshold
+    // compare alone would chatter again exactly the way the old, now-removed
+    // PH_ALERT_HYSTERESIS was originally added to fix. Stage 2 reinstates
+    // that anti-flicker margin at the alert layer specifically (Config.h's
+    // PH_ALERT_HYSTERESIS), this time paired with genuine-observation-based
+    // confirmation (newObservation()) instead of overlapping with an
+    // upstream stability gate - see aboveWithHysteresis()/belowWithHysteresis().
     const bool valid = isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
-    const bool low = valid && sensors.ph < systemState.minPH;
-    const bool high = valid && sensors.ph > systemState.maxPH;
+    const bool newSample = newObservation(sensorManager.getPhSampleVersion(), phLastProcessedVersion);
+    const bool low = belowWithHysteresis(alertState.phLow, sensors.ph,
+        systemState.minPH, PH_ALERT_HYSTERESIS, valid);
+    const bool high = aboveWithHysteresis(alertState.phHigh, sensors.ph,
+        systemState.maxPH, PH_ALERT_HYSTERESIS, valid);
 
-    setAlertDebounced("phLow", alertState.phLow, low, phLowPendingCount);
-    setAlertDebounced("phHigh", alertState.phHigh, high, phHighPendingCount);
+    setAlertDebounced("phLow", alertState.phLow, low, phLowAbnormalPendingCount, phLowRecoveryPendingCount, newSample);
+    setAlertDebounced("phHigh", alertState.phHigh, high, phHighAbnormalPendingCount, phHighRecoveryPendingCount, newSample);
     // Derived from the two flags above, which are already debounced - no
     // separate pending counter needed here.
     setAlert("phOutOfRange", alertState.phOutOfRange,
@@ -289,22 +376,26 @@ void AlertManager::updatePHAlert()
 
 void AlertManager::updateECAlert()
 {
+    const bool valid = isfinite(sensors.ec);
+    const bool newSample = newObservation(sensorManager.getEcSampleVersion(), ecLastProcessedVersion);
+
     setAlertDebounced(
         "ecLow",
         alertState.ecLow,
-        isfinite(sensors.ec) && sensors.ec < systemState.minEC,
-        ecLowPendingCount);
+        belowWithHysteresis(alertState.ecLow, sensors.ec, systemState.minEC, EC_ALERT_HYSTERESIS, valid),
+        ecLowAbnormalPendingCount, ecLowRecoveryPendingCount, newSample);
 
     setAlertDebounced(
         "ecHigh",
         alertState.ecHigh,
-        isfinite(sensors.ec) && sensors.ec > systemState.maxEC,
-        ecHighPendingCount);
+        aboveWithHysteresis(alertState.ecHigh, sensors.ec, systemState.maxEC, EC_ALERT_HYSTERESIS, valid),
+        ecHighAbnormalPendingCount, ecHighRecoveryPendingCount, newSample);
 
     // AutomationManager::handleStabilizingEC() already debounces this itself
     // (systemState.ecDilutionNoRiseStreak requires 2 consecutive no-rise
     // dilution intervals before reaching 2) - no separate pendingCount
-    // needed here, unlike the threshold alerts above.
+    // needed here, unlike the threshold alerts above. Not a Stage 2
+    // threshold alert - untouched.
     setAlert(
         "ecDilutionIneffective",
         alertState.ecDilutionIneffective,

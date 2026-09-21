@@ -231,8 +231,9 @@ bool SensorManager::isEcStateKnown() const
 
 // Feeds one new already-filtered pH/EC candidate (physicalSensors.ph/.ec)
 // into its sliding stability window, rate-limited to one sample roughly
-// every STABILITY_SAMPLE_INTERVAL_MS (see the constant's own comment for
-// why - candidate values change every loop() tick but are heavily
+// every `intervalMs` (STABILITY_SAMPLE_INTERVAL_MS for EC,
+// PH_STABILITY_SAMPLE_INTERVAL_MS for pH - see either constant's own comment
+// for why - candidate values change every loop() tick but are heavily
 // autocorrelated faster than that). Once the window holds
 // STABILITY_SAMPLE_WINDOW samples, accepts a new window.lastStable/updates
 // window.currentlyStable only when they all agree within `tolerance`;
@@ -240,7 +241,7 @@ bool SensorManager::isEcStateKnown() const
 // clears currentlyStable (what gates a NEW correction - see
 // AutomationManager::canStartNewPHCorrection()/canStartNewECCorrection()).
 // Logs only on a genuine transition, never every sample.
-void SensorManager::updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, const char* logTag, DebugCategory category)
+void SensorManager::updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, unsigned long intervalMs, const char* logTag, DebugCategory category, uint32_t& sampleVersion)
 {
     if (!isfinite(candidate)) return;
 
@@ -251,11 +252,25 @@ void SensorManager::updateStabilityWindow(StabilityWindow& window, float candida
     const bool dbg = debugManager.shouldPrintDebug(category);
 
     unsigned long now = millis();
-    if (window.lastSampleAt != 0 && now - window.lastSampleAt < STABILITY_SAMPLE_INTERVAL_MS)
+    if (window.lastSampleAt != 0 && now - window.lastSampleAt < intervalMs)
     {
         return;
     }
     window.lastSampleAt = now;
+
+    // Stage 2 (AlertManager sample-confirmed alerts, corrected): the caller
+    // passes phSampleVersion/ecSampleVersion here - this is the pH/EC
+    // DECISION cadence (PH_STABILITY_SAMPLE_INTERVAL_MS/
+    // STABILITY_SAMPLE_INTERVAL_MS, per the intervalMs throttle just above),
+    // not the raw ~20-30ms ADC sampler cadence, and `candidate` is always
+    // the current filtered/accepted value (phCandidateForWindow, which
+    // falls back to lastAcceptedPhCandidate on a reconfirm tick - see
+    // applyEffectiveSensors()'s own comment - or physicalSensors.ec, the
+    // calibrated/temperature-compensated median). AlertManager's live
+    // telemetry (sensors.ph/sensors.ec) is completely unaffected by this -
+    // this only governs how often the alert layer's confirmation counters
+    // are allowed to advance.
+    sampleVersion++;
 
     window.samples[window.next] = candidate;
     window.next = (window.next + 1) % STABILITY_SAMPLE_WINDOW;
@@ -487,6 +502,17 @@ void SensorManager::applyEffectiveSensors()
     // reverting to a real, possibly noisy physical reading.
     if (systemState.mockSensorsEnabled)
     {
+        // Mirrors the mock->physical transition reset below: a stability
+        // window carrying samples accumulated while sourcing PHYSICAL data
+        // must not keep blending those in once mock becomes authoritative,
+        // for the same reason (a candidate from the old source is not
+        // trusted evidence about the new one).
+        if (!lastReportedMockSource)
+        {
+            resetStabilityWindow(phStabilityWindow);
+            resetStabilityWindow(ecStabilityWindow);
+        }
+
         updateDynamicMockSensors();
         sensors = systemState.mockSensors;
         sensors.tds = isnan(sensors.ec) ? NAN : sensors.ec * 500.0f;
@@ -524,6 +550,24 @@ void SensorManager::applyEffectiveSensors()
         sensors.ecFault = false;
         sensors.phAvailable = isfinite(sensors.ph);
         sensors.ecAvailable = isfinite(sensors.ec);
+
+        // CONFIRMED BUG FIX: phSampleVersion/ecSampleVersion were only ever
+        // incremented on the physical-sensor path (the else branch below,
+        // via updateStabilityWindow()). While mock is enabled that branch
+        // never runs, so the version numbers froze - AlertManager's
+        // newObservation() then always returned false, abnormalPendingCount/
+        // recoveryPendingCount could never advance, and phLow/phHigh/ecLow/
+        // ecHigh could get stuck in whatever state they were in when mock
+        // was turned on, regardless of how far the mock value moved back
+        // into range. Feeding the effective mock reading through the same
+        // stability windows here keeps both AlertManager's recovery
+        // confirmation AND isPhCurrentlyStable()/isEcCurrentlyStable()
+        // (automation trust) working the same way mock does for every
+        // other field - a fully controlled dataset, not a frozen one.
+        updateStabilityWindow(phStabilityWindow, sensors.ph, PH_STABILITY_TOLERANCE,
+            PH_STABILITY_SAMPLE_INTERVAL_MS, "[PH-STABLE]", DebugCategory::PH, phSampleVersion);
+        updateStabilityWindow(ecStabilityWindow, sensors.ec, EC_STABILITY_TOLERANCE,
+            STABILITY_SAMPLE_INTERVAL_MS, "[EC-STABLE]", DebugCategory::EC, ecSampleVersion);
 
         if (systemState.mockApplyPending)
         {
@@ -598,12 +642,20 @@ void SensorManager::applyEffectiveSensors()
         }
         else
         {
-            // sensors.ph/sensors.ec become authoritative ONLY here: the last
-            // accepted stable value from a sliding window of already-filtered
-            // candidates (physicalSensors.ph/.ec), never the instantaneous
-            // reading directly - see updateStabilityWindow(). This is the one
-            // dataset AutomationManager/AlertManager/SafetyManager/Firebase
-            // publication all read; none of them see a raw candidate.
+            // sensors.ph/sensors.ec become authoritative here. Since Stage 1
+            // of the sensor architecture redesign, BOTH are the latest live
+            // SensorManager-filtered candidate (pH: lastAcceptedPhCandidate,
+            // the temporal step filter's trusted value; EC:
+            // physicalSensors.ec, the calibrated/temperature-compensated
+            // median), never the raw instantaneous ADC reading, and never
+            // gated on the separate phStabilityWindow/ecStabilityWindow
+            // below - that window is AUTOMATION-TRUST only (see
+            // isPhCurrentlyStable()/isEcCurrentlyStable(),
+            // canStartNewPHCorrection()/canStartNewECCorrection()). This is
+            // still the one dataset AutomationManager/AlertManager/
+            // SafetyManager/Firebase publication all read for the CURRENT
+            // reading; automation additionally and independently consults
+            // the stability window before acting on it.
             //
             // A stale accepted value (no new confirmation within
             // PH_EC_STABLE_TIMEOUT_MS) is not kept forever - it reverts to
@@ -642,7 +694,7 @@ void SensorManager::applyEffectiveSensors()
             // value (quick-response refinement task) - published as
             // sensors.ph further below independent of whether the window
             // has converged. Throttled to PH_STEP_SAMPLE_INTERVAL_MS (not
-            // STABILITY_SAMPLE_INTERVAL_MS - that slower cadence is now
+            // PH_STABILITY_SAMPLE_INTERVAL_MS - that slower cadence is now
             // only the window's own), so a "3 consecutive candidates"
             // streak means 3 genuinely distinct ~300ms-apart observations,
             // not 3 re-evaluations of one unchanged median within
@@ -799,9 +851,9 @@ void SensorManager::applyEffectiveSensors()
                     phCandidateForWindow = lastAcceptedPhCandidate;
                 }
 
-                updateStabilityWindow(phStabilityWindow, phCandidateForWindow, PH_STABILITY_TOLERANCE, "[PH-STABLE]", DebugCategory::PH);
+                updateStabilityWindow(phStabilityWindow, phCandidateForWindow, PH_STABILITY_TOLERANCE, PH_STABILITY_SAMPLE_INTERVAL_MS, "[PH-STABLE]", DebugCategory::PH, phSampleVersion);
             }
-            updateStabilityWindow(ecStabilityWindow, physicalSensors.ec, EC_STABILITY_TOLERANCE, "[EC-STABLE]", DebugCategory::EC);
+            updateStabilityWindow(ecStabilityWindow, physicalSensors.ec, EC_STABILITY_TOLERANCE, STABILITY_SAMPLE_INTERVAL_MS, "[EC-STABLE]", DebugCategory::EC, ecSampleVersion);
 
             const unsigned long now = millis();
             const bool phStale = phStabilityWindow.hasStable &&
@@ -915,7 +967,43 @@ void SensorManager::applyEffectiveSensors()
             // phStepCandidate state isPhCurrentlyStable() already reads for
             // the automation-trust side, just exposed for display too.
             sensors.phConfirming = !isnan(phStepCandidate);
-            sensors.ec = (ecStabilityWindow.hasStable && !ecStale) ? ecStabilityWindow.lastStable : NAN;
+            // Stage 1 of the sensor architecture redesign: sensors.ec is now
+            // the live calibrated/temperature-compensated median
+            // (physicalSensors.ec, set every tick in readEC() - see its own
+            // comment), matching sensors.ph's existing pattern above. EC has
+            // no separate step-filter/fast-telemetry candidate the way pH
+            // does (no equivalent noise-jump confirmation stage exists for
+            // EC in this firmware), so physicalSensors.ec - already
+            // calibrated and median-filtered, never raw ADC - is the
+            // correct SensorManager-owned layer to use directly. Previously
+            // this read ecStabilityWindow.lastStable, which meant Firebase/
+            // Android only ever saw a new EC value once every ~10s
+            // (STABILITY_SAMPLE_WINDOW * STABILITY_SAMPLE_INTERVAL_MS), the
+            // same cadence automation itself uses to decide stability - the
+            // two concerns were not actually separated. ecStabilityWindow
+            // below is now automation-trust only (isEcCurrentlyStable()/
+            // canStartNewECCorrection()), exactly mirroring phStabilityWindow.
+            // ecFault is handled by the existing override a few lines below
+            // (mirrors how phFault is handled for sensors.ph, not checked
+            // inline here either). Still gated on !ecStale (computed above
+            // from ecStabilityWindow.lastStableAt, PH_EC_STABLE_TIMEOUT_MS =
+            // 180s) - that is a genuinely-dead/disconnected-probe detector,
+            // not the ~12s automation stability cadence: a probe that keeps
+            // producing plausible-but-never-stable readings (e.g. mid
+            // correction) won't trip it, but one that stops corroborating
+            // for a full 3 minutes will, same as phTelemetryStale does for
+            // pH via a different clock (lastAcceptedPhCandidateAt).
+            // ecImplausibleThisSample (SensorManager.h, set every readEC()
+            // tick) invalidates THIS observation immediately - non-finite,
+            // negative, or far outside the calibration voltage domain -
+            // without waiting on EC_FAULT_CONFIRM_COUNT consecutive
+            // confirmations. That streak (physicalSensors.ecCalibrationFault,
+            // handled by the override below) is unchanged and still,
+            // separately, controls the PERSISTENT fault flag; this check
+            // only ever stops a single bad reading from reaching EC Low,
+            // automation, or Firebase before the streak has had a chance to
+            // confirm anything.
+            sensors.ec = (isfinite(physicalSensors.ec) && !ecStale && !ecImplausibleThisSample) ? physicalSensors.ec : NAN;
             // TDS is unaffected by pH/EC stability gating - it already has no
             // water-temperature dependency (kept from the prior pass) and is
             // published from physicalSensors.tds via the `sensors =
@@ -952,14 +1040,24 @@ void SensorManager::applyEffectiveSensors()
                 phStepCandidateCount = 0;
                 lastPhStepEvalAt = 0;
             }
-            if (physicalSensors.ecFault)
+            // Also forces NaN on the SEPARATE calibration-plausibility fault
+            // (Types.h's physicalSensors.ecCalibrationFault, readEC()'s own
+            // comment) - a voltage electrically ordinary enough that the
+            // rail check above never confirms it, but far enough outside
+            // the EC_CAL_* two-point model's domain to be untrustworthy.
+            // OR'd together here (and in the published sensors.ecFault
+            // below) rather than kept as two separately-published flags, so
+            // every existing ecFault consumer (AlertManager, SafetyManager's
+            // validEC(), Firebase/Android) already treats either one exactly
+            // like a hardware fault with no separate wiring.
+            if (physicalSensors.ecFault || physicalSensors.ecCalibrationFault)
             {
                 sensors.ec = NAN;
                 resetStabilityWindow(ecStabilityWindow);
             }
 
             sensors.phFault = physicalSensors.phFault;
-            sensors.ecFault = physicalSensors.ecFault;
+            sensors.ecFault = physicalSensors.ecFault || physicalSensors.ecCalibrationFault;
             sensors.phAvailable = isfinite(sensors.ph);
             sensors.ecAvailable = isfinite(sensors.ec);
         }
@@ -1173,6 +1271,10 @@ void SensorManager::readDHT()
         physicalSensors.temperature = dhtTemperatureFiltered;
         physicalSensors.dhtAvailable = true;
         physicalSensors.dhtStale = false;
+        // Stage 2 (AlertManager sample-confirmed alerts): a genuinely
+        // accepted new DHT22 reading - see dhtSampleVersion's own
+        // declaration-site comment (SensorManager.h).
+        dhtSampleVersion++;
         return;
     }
 
@@ -1218,6 +1320,10 @@ void SensorManager::readDHT()
 
     physicalSensors.dhtAvailable = true;
     physicalSensors.dhtStale = false;
+    // Stage 2 (AlertManager sample-confirmed alerts): recovery is also a
+    // genuinely accepted new DHT22 reading - see the earlier normal-accept
+    // branch's matching comment.
+    dhtSampleVersion++;
 }
 
 void SensorManager::readWaterTemperature()
@@ -1365,6 +1471,10 @@ void SensorManager::readWaterTemperature()
 
     lastValidWaterTemp = waterTempFiltered;
     physicalSensors.waterTemp = waterTempFiltered;
+    // Stage 2 (AlertManager sample-confirmed alerts): a genuinely accepted
+    // new DS18B20 reading - see waterTempSampleVersion's own
+    // declaration-site comment (SensorManager.h).
+    waterTempSampleVersion++;
 }
 
 void SensorManager::readWaterLevel()
@@ -1552,6 +1662,62 @@ void SensorManager::readWaterLevel()
         // from an unconfirmed candidate, and never fabricated as 0cm - and
         // the refill threshold counters below are never reached, so a
         // refill can neither start nor complete from reacquisition data.
+        // Absolute physical plausibility gate - same MAX_WORKING_WATER_CM
+        // check the have-baseline branch below already applies to every
+        // candidate. Without this, a single physically impossible echo
+        // (e.g. the diagnosed 23.61cm reading on an empty reservoir) could
+        // still accumulate WATER_LEVEL_STEP_CONFIRM_COUNT agreeing repeats
+        // of ITSELF and become the initial trusted baseline outright, since
+        // the reacquisition streak below only ever checked candidates
+        // against each other, never against the physical working range.
+        const bool withinPhysicalRange = candidateDepthCm <= MAX_WORKING_WATER_CM;
+
+        if (!withinPhysicalRange)
+        {
+            // Out of range - must not seed or extend a reacquisition streak,
+            // and must never become the baseline no matter how many times it
+            // repeats or how well repeats agree with each other. Abandon any
+            // in-progress streak rather than let it keep counting, mirroring
+            // the have-baseline branch's implausible-jump handling below.
+            waterLevelStepCandidateCm = NAN;
+            waterLevelStepCandidateCount = 0;
+
+            if (waterLevelJumpFaultStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD) waterLevelJumpFaultStreak++;
+
+            if (dbgWater)
+            {
+                Serial.print("[WATER-FILTER] reacquiring OUT-OF-RANGE candidate=");
+                Serial.print(candidateDepthCm, 2);
+                Serial.print(" (> ");
+                Serial.print(MAX_WORKING_WATER_CM, 2);
+                Serial.print("cm) faultStreak=");
+                Serial.print(waterLevelJumpFaultStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+
+            if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                // Same outward outcome as every other confirmed sensor
+                // fault: publish unavailable rather than ever fabricating a
+                // level (never a fake 0% or 100%) from an out-of-range
+                // candidate. There is no trusted baseline to preserve here
+                // (that is exactly why we are in this branch), so unlike the
+                // have-baseline jump-fault path there is nothing else to
+                // hold onto.
+                physicalSensors.waterLevel = NAN;
+                physicalSensors.waterLevelCm = NAN;
+                physicalSensors.waterVolumeLiters = NAN;
+                physicalSensors.waterLevelDistanceCm = NAN;
+                physicalSensors.refillStartConfirmed = false;
+                physicalSensors.refillStopConfirmed = false;
+                waterLevelHistoryCount = 0;
+                refillStartConfirmCount = 0;
+                refillStopConfirmCount = 0;
+            }
+            return;
+        }
+
         const bool agreesWithPending = !isnan(waterLevelStepCandidateCm) &&
             fabsf(candidateDepthCm - waterLevelStepCandidateCm) <= WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
 
@@ -1580,12 +1746,19 @@ void SensorManager::readWaterLevel()
             lastAcceptedWaterDepthCm = candidateDepthCm;
             waterLevelStepCandidateCm = NAN;
             waterLevelStepCandidateCount = 0;
+            waterLevelJumpFaultStreak = 0;
 
             physicalSensors.waterLevelCm = lastAcceptedWaterDepthCm;
             physicalSensors.waterLevel =
                 constrain((lastAcceptedWaterDepthCm / MAX_WORKING_WATER_CM) * 100.0f, 0.0f, 100.0f);
             physicalSensors.waterVolumeLiters =
                 lastAcceptedWaterDepthCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f;
+
+            // Stage 2 (AlertManager sample-confirmed alerts): a genuinely
+            // accepted new HC-SR04 depth (baseline established) - see
+            // waterLevelSampleVersion's own declaration-site comment
+            // (SensorManager.h).
+            waterLevelSampleVersion++;
 
             if (dbgWater)
             {
@@ -1603,52 +1776,196 @@ void SensorManager::readWaterLevel()
         acceptedDepthCm = candidateDepthCm;
         waterLevelStepCandidateCm = NAN;
         waterLevelStepCandidateCount = 0;
+        waterLevelJumpFaultStreak = 0;
     }
     else
     {
+        // Holds the trusted value while a large jump is suspect - unchanged
+        // from before. What changes below is that repetition ALONE can no
+        // longer promote it: see Config.h's "HC-SR04 Large-Jump Quarantine"
+        // section for the full design this implements.
         acceptedDepthCm = lastAcceptedWaterDepthCm;
 
-        const bool agreesWithPending = !isnan(waterLevelStepCandidateCm) &&
-            fabsf(candidateDepthCm - waterLevelStepCandidateCm) <= WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
+        // Absolute physical plausibility, checked DIRECTLY against the
+        // configured working range - independent of, and in addition to,
+        // the relative delta-from-trusted check below. A candidate above
+        // MAX_WORKING_WATER_CM must never become trusted regardless of what
+        // the delta says (candidateDepthCm itself is still computed without
+        // an upper clamp - see its own comment above - only its eligibility
+        // to become the TRUSTED value is gated here). This is what rejects
+        // the diagnosed 23.6cm reading outright, on its own absolute
+        // magnitude, not merely because it differs a lot from the previous
+        // ~3.5cm trusted depth.
+        const bool withinPhysicalRange = candidateDepthCm <= MAX_WORKING_WATER_CM;
+        const float jumpMagnitude = fabsf(candidateDepthCm - lastAcceptedWaterDepthCm);
+        const bool jumpPlausible = withinPhysicalRange &&
+            jumpMagnitude <= WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM;
 
-        if (agreesWithPending)
+        if (!jumpPlausible)
         {
-            waterLevelStepCandidateCount++;
+            // Physically implausible (e.g. the diagnosed 3.5cm -> 23.6cm
+            // repeated-fogger-echo case - out of range on its own, and also
+            // a large delta) - never eligible for promotion no matter how
+            // many times it repeats or how well repeats agree with each
+            // other; abandon any in-progress quarantine streak rather than
+            // let it keep counting toward acceptance.
+            waterLevelStepCandidateCm = NAN;
+            waterLevelStepCandidateCount = 0;
+
+            if (waterLevelJumpFaultStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD) waterLevelJumpFaultStreak++;
+
+            if (dbgWater)
+            {
+                Serial.print("[WATER-FILTER] IMPLAUSIBLE jump rawDepth=");
+                Serial.print(candidateDepthCm, 2);
+                Serial.print(" trusted=");
+                Serial.print(lastAcceptedWaterDepthCm, 2);
+                Serial.print(" delta=");
+                Serial.print(jumpMagnitude, 2);
+                Serial.print(withinPhysicalRange ? " (delta > " : " (OUTSIDE working range > ");
+                Serial.print(withinPhysicalRange ? WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM : MAX_WORKING_WATER_CM, 2);
+                Serial.print("cm) faultStreak=");
+                Serial.print(waterLevelJumpFaultStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+
+            if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                // Persisted long enough to treat like the existing raw-
+                // read-failure fault path above (same outward outcome:
+                // publish unavailable rather than holding a now-
+                // untrustworthy value forever) - but deliberately DOES NOT
+                // clear lastAcceptedWaterDepthCm the way that path does.
+                // Clearing it would drop straight into the reacquisition
+                // branch above (isnan(lastAcceptedWaterDepthCm)), whose own
+                // confirmation check has no magnitude/range gate at all -
+                // exactly the same repeated false echo that triggered this
+                // fault could then satisfy THAT weaker check next and become
+                // the new baseline, the failure mode this correction closes.
+                // The trusted depth is kept so every subsequent reading -
+                // including more of the same bad echo - keeps being
+                // evaluated against a real baseline by the checks above.
+                // waterLevelJumpFaultStreak is also deliberately NOT reset
+                // here (stays pinned at SENSOR_TRANSIENT_FAILURE_THRESHOLD,
+                // the increment above already caps it) - resetting it would
+                // let the very next implausible reading fall through to the
+                // "not yet confirmed" branch below and briefly republish the
+                // held value as live again before re-confirming, flapping
+                // available/unavailable every few ticks instead of staying
+                // sticky for as long as the implausible readings continue.
+                // Only a genuinely plausible reading (the jumpPlausible/
+                // small-change branches below and above) ever clears it.
+                if (dbgWater)
+                {
+                    Serial.println("[SENSOR] Water level confirmed unavailable (implausible jump persisted); trusted depth preserved");
+                }
+                physicalSensors.waterLevel = NAN;
+                physicalSensors.waterLevelCm = NAN;
+                physicalSensors.waterVolumeLiters = NAN;
+                physicalSensors.waterLevelDistanceCm = NAN;
+                physicalSensors.refillStartConfirmed = false;
+                physicalSensors.refillStopConfirmed = false;
+                waterLevelHistoryCount = 0;
+                refillStartConfirmCount = 0;
+                refillStopConfirmCount = 0;
+                return;
+            }
+
+            // Not yet confirmed faulted - falls through to the shared
+            // publish-held-value tail below, same as any other held
+            // reading this cycle (a real echo WAS taken and evaluated).
         }
         else
         {
-            waterLevelStepCandidateCm = candidateDepthCm;
-            waterLevelStepCandidateCount = 1;
-        }
+            // Plausible large jump - quarantined, not immediately accepted.
+            // Needs WATER_LEVEL_JUMP_CONFIRM_COUNT mutually-agreeing
+            // candidates (stronger than the ordinary WATER_LEVEL_STEP_
+            // CONFIRM_COUNT small-change confirmation) before ever
+            // replacing the trusted value. Deliberately does NOT clear
+            // waterLevelJumpFaultStreak just for entering quarantine
+            // (unlike the small-change branch above, which does) - if the
+            // sensor is already in a CONFIRMED jump-fault state, merely
+            // seeing one in-range-but-still-unconfirmed candidate is not
+            // itself a recovery; the fault clears only once a candidate is
+            // actually promoted below.
+            const bool agreesWithPending = !isnan(waterLevelStepCandidateCm) &&
+                fabsf(candidateDepthCm - waterLevelStepCandidateCm) <= WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
 
-        if (dbgWater)
-        {
-            Serial.print("[WATER-FILTER] rawDepth=");
-            Serial.print(candidateDepthCm, 2);
-            Serial.print(" accepted=");
-            Serial.print(lastAcceptedWaterDepthCm, 2);
-            Serial.print(" delta=");
-            Serial.print(fabsf(candidateDepthCm - lastAcceptedWaterDepthCm), 2);
-            Serial.print(" candidate=");
-            Serial.print(waterLevelStepCandidateCount);
-            Serial.print("/");
-            Serial.print(WATER_LEVEL_STEP_CONFIRM_COUNT);
-        }
+            if (agreesWithPending)
+            {
+                if (waterLevelStepCandidateCount < WATER_LEVEL_JUMP_CONFIRM_COUNT) waterLevelStepCandidateCount++;
+            }
+            else
+            {
+                waterLevelStepCandidateCm = candidateDepthCm;
+                waterLevelStepCandidateCount = 1;
+            }
 
-        if (waterLevelStepCandidateCount >= WATER_LEVEL_STEP_CONFIRM_COUNT)
-        {
-            acceptedDepthCm = candidateDepthCm;
-            waterLevelStepCandidateCm = NAN;
-            waterLevelStepCandidateCount = 0;
             if (dbgWater)
             {
-                Serial.print(" -> ACCEPT ");
-                Serial.println(acceptedDepthCm, 2);
+                Serial.print("[WATER-FILTER] QUARANTINE rawDepth=");
+                Serial.print(candidateDepthCm, 2);
+                Serial.print(" trusted=");
+                Serial.print(lastAcceptedWaterDepthCm, 2);
+                Serial.print(" delta=");
+                Serial.print(jumpMagnitude, 2);
+                Serial.print(" candidate=");
+                Serial.print(waterLevelStepCandidateCount);
+                Serial.print("/");
+                Serial.print(WATER_LEVEL_JUMP_CONFIRM_COUNT);
             }
-        }
-        else if (dbgWater)
-        {
-            Serial.println(" -> REJECT/HOLD");
+
+            if (waterLevelStepCandidateCount >= WATER_LEVEL_JUMP_CONFIRM_COUNT)
+            {
+                // Promoted - this is the only point that clears a
+                // CONFIRMED jump fault (see this branch's own comment
+                // above); an ordinary pre-fault quarantine (streak never
+                // reached SENSOR_TRANSIENT_FAILURE_THRESHOLD) had nothing
+                // to clear here either way.
+                acceptedDepthCm = candidateDepthCm;
+                waterLevelStepCandidateCm = NAN;
+                waterLevelStepCandidateCount = 0;
+                waterLevelJumpFaultStreak = 0;
+                if (dbgWater)
+                {
+                    Serial.print(" -> ACCEPT ");
+                    Serial.println(acceptedDepthCm, 2);
+                }
+            }
+            else
+            {
+                if (dbgWater)
+                {
+                    Serial.println(" -> REJECT/HOLD");
+                }
+
+                if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+                {
+                    // Already in a CONFIRMED jump-fault state and this
+                    // candidate, though within physical range, has not yet
+                    // been promoted - keep publishing unavailable (same as
+                    // the implausible-jump confirmed-fault branch above)
+                    // rather than resuming display of the held trusted
+                    // value while the fault is still active. Does not touch
+                    // lastAcceptedWaterDepthCm (baseline preserved, same
+                    // reasoning as the implausible-jump fault above) or
+                    // waterLevelJumpFaultStreak itself (stays pinned - only
+                    // the ACCEPT branch above clears it). Skips the shared
+                    // publish tail/waterLevelSampleVersion increment below,
+                    // matching every other "still confirmed unavailable"
+                    // return in this function.
+                    physicalSensors.waterLevel = NAN;
+                    physicalSensors.waterLevelCm = NAN;
+                    physicalSensors.waterVolumeLiters = NAN;
+                    physicalSensors.waterLevelDistanceCm = NAN;
+                    physicalSensors.refillStartConfirmed = false;
+                    physicalSensors.refillStopConfirmed = false;
+                    refillStartConfirmCount = 0;
+                    refillStopConfirmCount = 0;
+                    return;
+                }
+            }
         }
     }
 
@@ -1661,6 +1978,15 @@ void SensorManager::readWaterLevel()
 
     physicalSensors.waterVolumeLiters =
         acceptedDepthCm * RESERVOIR_LENGTH_CM * RESERVOIR_WIDTH_CM / 1000.0f;
+
+    // Stage 2 (AlertManager sample-confirmed alerts): a genuinely processed
+    // new HC-SR04 echo - see waterLevelSampleVersion's own declaration-site
+    // comment (SensorManager.h). Fires whether this cycle's candidate moved
+    // the accepted depth or was held (a large-jump candidate still pending
+    // confirmation) - either way a real new echo was taken and evaluated
+    // this cycle, mirroring how phSampleVersion above also advances on a
+    // pH reconfirm that doesn't change the accepted value.
+    waterLevelSampleVersion++;
 
     // Refill threshold confirmation (resilience pass follow-up): the step
     // filter above already protects against a LARGE jump, but a small
@@ -1937,6 +2263,98 @@ void SensorManager::readEC()
     // this is the same conversion convention as before, just no longer
     // riding on the retired polynomial/EC_FACTOR to get there.
     physicalSensors.tds = uncompensatedEc * 500.0f;
+
+    // Fail-safe EC plausibility check (Config.h's EC_CAL_VOLTAGE_MARGIN_V) -
+    // separate from the rail-proximity fault detector above (electrically-
+    // implausible voltage at/near the ADC's own physical rails). This
+    // instead catches a voltage that is electrically ordinary (nowhere near
+    // either rail, so the rail check above never flags it) but falls far
+    // outside the domain the EC_CAL_1_*/EC_CAL_2_* two-point line
+    // (Calibration.h) was actually fit against, or that the line
+    // extrapolates into a physically impossible negative EC - exactly the
+    // real-hardware finding this guards against: a ~365-400mV reading, far
+    // below EC_CAL_2_VOLTAGE, extrapolating through the steep two-point
+    // slope into roughly -63 mS/cm with nothing to catch it. Does NOT touch
+    // EC_CAL_1_*/EC_CAL_2_*/the two-point formula themselves, and does NOT
+    // clamp uncompensatedEc/compensatedEc to zero or any other value - only
+    // judges whether THIS reading is trustworthy enough to publish.
+    //
+    // Evaluated EVERY tick (not just on the throttled confirm-streak cadence
+    // below) and cached in ecImplausibleThisSample - applyEffectiveSensors()
+    // reads that flag to gate sensors.ec IMMEDIATELY for the CURRENT
+    // observation, never waiting on the persistent-fault streak. Without
+    // this, physicalSensors.ec (finite even when negative/absurd) was
+    // published straight through to sensors.ec, EC Low, automation's
+    // validEC() (partially - it does already reject negative, but not an
+    // implausible positive extrapolation), and Firebase for up to
+    // EC_FAULT_CONFIRM_COUNT-1 ticks before physicalSensors.ecCalibrationFault
+    // ever confirmed. The streak below is UNCHANGED - it still, and only,
+    // controls when this graduates from "this one observation is
+    // untrustworthy" to "the sensor itself is persistently faulted"
+    // (physicalSensors.ecCalibrationFault, EC_FAULT_CONFIRM_COUNT/
+    // EC_FAULT_RECOVERY_COUNT unchanged).
+    const float ecCalVoltageLow = min(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) - EC_CAL_VOLTAGE_MARGIN_V;
+    const float ecCalVoltageHigh = max(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) + EC_CAL_VOLTAGE_MARGIN_V;
+
+    ecImplausibleThisSample =
+        !isfinite(compensatedEc) ||
+        compensatedEc < 0.0f ||
+        voltage < ecCalVoltageLow ||
+        voltage > ecCalVoltageHigh;
+
+    // Own separate streak/field (ecCalibrationFaultStreak/
+    // physicalSensors.ecCalibrationFault) from the rail detector above - see
+    // either's own declaration-site comment for why they are deliberately
+    // not shared. Same EC_FAULT_CHECK_INTERVAL_MS/EC_FAULT_CONFIRM_COUNT/
+    // EC_FAULT_RECOVERY_COUNT debounce shape, suppressed during the same
+    // post-(re)connect analog settle window as the rail check for the same
+    // reason (an unsettled reading is expected to look implausible
+    // transiently - not fault evidence). Unchanged: still only decides the
+    // PERSISTENT fault flag, reading the same ecImplausibleThisSample just
+    // computed above instead of recomputing it.
+    const unsigned long nowForEcCalibrationFault = millis();
+    if (!isPhEcAnalogSettling() &&
+        nowForEcCalibrationFault - lastEcCalibrationFaultCheckAt >= EC_FAULT_CHECK_INTERVAL_MS)
+    {
+        lastEcCalibrationFaultCheckAt = nowForEcCalibrationFault;
+
+        if (ecImplausibleThisSample)
+        {
+            ecCalibrationFaultRecoveryStreak = 0;
+            if (ecCalibrationFaultStreak < EC_FAULT_CONFIRM_COUNT) ecCalibrationFaultStreak++;
+
+            if (ecCalibrationFaultStreak >= EC_FAULT_CONFIRM_COUNT && !physicalSensors.ecCalibrationFault)
+            {
+                physicalSensors.ecCalibrationFault = true;
+                if (debugManager.shouldPrintDebug(DebugCategory::EC))
+                {
+                    Serial.print("[EC-FAULT] calibration-implausible confirmed - V=");
+                    Serial.print(voltage, 4);
+                    Serial.print(" uncompensatedEC=");
+                    Serial.print(uncompensatedEc, 3);
+                    Serial.println(" outside usable calibrated model");
+                }
+            }
+        }
+        else
+        {
+            ecCalibrationFaultStreak = 0;
+            if (physicalSensors.ecCalibrationFault)
+            {
+                if (ecCalibrationFaultRecoveryStreak < EC_FAULT_RECOVERY_COUNT) ecCalibrationFaultRecoveryStreak++;
+
+                if (ecCalibrationFaultRecoveryStreak >= EC_FAULT_RECOVERY_COUNT)
+                {
+                    physicalSensors.ecCalibrationFault = false;
+                    ecCalibrationFaultRecoveryStreak = 0;
+                    if (debugManager.shouldPrintDebug(DebugCategory::EC))
+                    {
+                        Serial.println("[EC-FAULT] calibration-implausible recovered - voltage back within usable calibrated model");
+                    }
+                }
+            }
+        }
+    }
 
     const unsigned long now = millis();
     if (debugManager.shouldPrintDebug(DebugCategory::EC) &&

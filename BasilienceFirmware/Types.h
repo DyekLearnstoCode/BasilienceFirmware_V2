@@ -61,6 +61,21 @@ struct SensorData
     // condition automation is expected to correct via dosing.
     bool ecFault = false;
 
+    // True once SensorManager::readEC()'s SEPARATE calibration-plausibility
+    // fault detector (Config.h's EC_CAL_VOLTAGE_MARGIN_V) has CONFIRMED the
+    // computed EC is negative/non-finite, or the underlying voltage sits far
+    // outside the domain the EC_CAL_1_*/EC_CAL_2_* two-point line was
+    // actually fit against - a reading electrically ordinary enough that
+    // ecFault's own rail-proximity check above never flags it, yet still not
+    // a value the calibration model can be trusted to represent. Kept as its
+    // own field/streak rather than folded into ecFault above so the two
+    // independent detectors' confirm/recovery debounces can never race each
+    // other; applyEffectiveSensors() ORs both into the one published
+    // sensors.ecFault flag/NaN override, so every existing ecFault consumer
+    // (AlertManager, SafetyManager's validEC(), Firebase/Android) already
+    // treats this exactly like a hardware fault with no separate wiring.
+    bool ecCalibrationFault = false;
+
     // True exactly when ec above is a currently-trusted, non-NaN reading
     // (mirrors isfinite(ec) - published explicitly for the same reason
     // dhtAvailable is, rather than making every consumer isfinite()-check
@@ -710,23 +725,23 @@ struct SystemState
     unsigned long phLastTrendCheckAt = 0;
     bool phLastTrendImproving = true;
 
-    // First-checkpoint / stable-hold-for-publish bookkeeping - see
-    // PH_EC_STABLE_HOLD_FOR_PUBLISH_MS (Config.h).
-    bool phFirstCheckpointPublished = false;
+    // Stable-hold confirmation bookkeeping for AutomationManager::
+    // handleStabilizingPH()'s retry-vs-complete decision - see
+    // PH_EC_STABLE_HOLD_FOR_PUBLISH_MS (Config.h). Automation-only since
+    // Stage 1 of the sensor architecture redesign (Firebase telemetry no
+    // longer holds/checkpoints on this timer - see phLastPublishedValue's
+    // own comment below).
     unsigned long phStableSince = 0;
     bool phStableCheckpointPublished = false;
 
-    // One-shot: AutomationManager sets this true for exactly the tick a
-    // checkpoint should be published; FirebaseManager consumes and clears
-    // it in the same write that includes the value.
-    bool phPublishPending = false;
-
     // FirebaseManager::writeSensors() writes the /sensors node with a full
     // setJSON() overwrite, not a merge - omitting "ph" from that JSON would
-    // DELETE the field from the database, not freeze it. This holds the
-    // last value actually published (either normal unheld publishing, or
-    // one of the two correction checkpoints) so a held write can keep
-    // republishing something instead of wiping the field.
+    // DELETE the field from the database rather than just skip an update.
+    // This is a pure NaN-fallback cache: updated unconditionally whenever
+    // sensors.ph is valid (Firebase always publishes the current filtered
+    // reading, including while a correction is DOSING_PH/STABILIZING_PH),
+    // and only left stale to republish the last known-good value on a
+    // transient invalid reading.
     float phLastPublishedValue = NAN;
 
     // millis() a pH-Up/pH-Down pump last actually finished running, from
@@ -780,15 +795,14 @@ struct SystemState
     unsigned long ecLastTrendCheckAt = 0;
     bool ecLastTrendImproving = true;
 
-    // Mirrors the ph* checkpoint/publish bookkeeping above, for EC.
-    bool ecFirstCheckpointPublished = false;
+    // Mirrors the ph* stable-hold bookkeeping above, for EC. Automation-only.
     unsigned long ecStableSince = 0;
     bool ecStableCheckpointPublished = false;
-    bool ecPublishPending = false;
 
-    // See phLastPublishedValue's own comment above. ecLastPublishedTds
-    // mirrors ecLastPublishedValue for the derived tds field, held/
-    // published in lockstep with ec rather than tracked independently.
+    // See phLastPublishedValue's own comment above - a pure NaN-fallback
+    // cache, updated unconditionally. ecLastPublishedTds mirrors
+    // ecLastPublishedValue for the derived tds field, kept in lockstep with
+    // ec rather than tracked independently.
     float ecLastPublishedValue = NAN;
     float ecLastPublishedTds = NAN;
 

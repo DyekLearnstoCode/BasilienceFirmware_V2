@@ -3687,22 +3687,20 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     // Nutrient
     //--------------------------------------------------
 
-    // Quiet-monitoring/4-minute-budget correction redesign: while a pH/EC
-    // correction is actively dosing/circulating/silently settling, hold the
-    // published value at whatever was last actually published instead of
-    // tracking the live in-flight candidate every tick - only the two
-    // checkpoints (systemState.phPublishPending/ecPublishPending, set for
-    // exactly one tick by AutomationManager::handleStabilizingPH()/
-    // handleStabilizingEC()) push a fresh value. writeSensors() overwrites
-    // the whole /sensors node via setJSON() (not a merge), so simply
-    // omitting "ph"/"ec" here would DELETE the field rather than freeze it -
-    // phLastPublishedValue/ecLastPublishedValue (Types.h) is what actually
-    // gets republished during a hold.
-    const bool phCorrectionActive =
-        systemState.currentMode == DOSING_PH || systemState.currentMode == STABILIZING_PH;
-    const bool phShouldPublishFresh = !phCorrectionActive || systemState.phPublishPending;
-    systemState.phPublishPending = false;
-    if (phShouldPublishFresh && !isnan(publishedSensors.ph))
+    // Telemetry/control separation (Stage 1 of the sensor architecture
+    // redesign): Firebase now always publishes the CURRENT filtered
+    // sensors.ph, including while a pH correction is DOSING_PH/STABILIZING_PH
+    // - it no longer holds/freezes at a checkpoint value just because a
+    // correction is active. Automation's own stability/confirmation logic
+    // (sensorManager.isPhCurrentlyStable(), systemState.phStableSince/
+    // phStableCheckpointPublished in AutomationManager::handleStabilizingPH())
+    // is completely independent of this and is untouched by this file.
+    // phLastPublishedValue is kept only as a NaN-fallback cache: writeSensors()
+    // overwrites the whole /sensors node via setJSON() (not a merge), so a
+    // transient invalid reading would otherwise DELETE the "ph" field instead
+    // of leaving the last known-good value in place - same behavior as
+    // before this change, just no longer gated on correction state.
+    if (!isnan(publishedSensors.ph))
     {
         systemState.phLastPublishedValue = publishedSensors.ph;
     }
@@ -3719,17 +3717,13 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
     json.set("phFault", publishedSensors.phFault);
     json.set("phAvailable", publishedSensors.phAvailable);
 
-    // tds is derived from the same EC reading, so it is held/published in
-    // lockstep with ec below rather than tracked independently.
-    const bool ecCorrectionActive =
-        systemState.currentMode == DOSING_EC || systemState.currentMode == STABILIZING_EC;
-    const bool ecShouldPublishFresh = !ecCorrectionActive || systemState.ecPublishPending;
-    systemState.ecPublishPending = false;
-    if (ecShouldPublishFresh)
-    {
-        if (!isnan(publishedSensors.ec)) systemState.ecLastPublishedValue = publishedSensors.ec;
-        if (!isnan(publishedSensors.tds)) systemState.ecLastPublishedTds = publishedSensors.tds;
-    }
+    // tds is derived from the same EC reading, so it is cached/published in
+    // lockstep with ec below. See the pH block's own comment above - same
+    // Stage 1 change: always reflects the current filtered sensors.ec/tds,
+    // no longer held during DOSING_EC/STABILIZING_EC. ecLastPublishedValue/
+    // ecLastPublishedTds remain only as the NaN-fallback cache.
+    if (!isnan(publishedSensors.ec)) systemState.ecLastPublishedValue = publishedSensors.ec;
+    if (!isnan(publishedSensors.tds)) systemState.ecLastPublishedTds = publishedSensors.tds;
     if (!isnan(systemState.ecLastPublishedValue)) json.set("ec", systemState.ecLastPublishedValue);
     if (!isnan(systemState.ecLastPublishedTds)) json.set("tds", systemState.ecLastPublishedTds);
     // EC hardware-fault state - same shape/reasoning as phFault/phAvailable
@@ -3852,9 +3846,10 @@ bool FirebaseManager::writeSensors(bool force, const SensorData* snapshot)
             Serial.print(publishedSensors.waterLevel, 2);
             Serial.print(" ph=");
             // Reflects what was actually written to Firebase this call
-            // (systemState.phLastPublishedValue/ecLastPublishedValue), not
-            // the live in-flight candidate - the two differ while a
-            // correction is holding telemetry between checkpoints.
+            // (systemState.phLastPublishedValue/ecLastPublishedValue) -
+            // since Stage 1, this always equals the live filtered sensors.ph
+            // when valid, and only falls back to the last known-good value
+            // on a transient NaN (see the pH block's own comment above).
             Serial.print(systemState.phLastPublishedValue, 2);
             Serial.print(" ec=");
             Serial.print(systemState.ecLastPublishedValue, 2);

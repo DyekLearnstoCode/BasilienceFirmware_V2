@@ -1111,7 +1111,6 @@ if(newMode == STARTUP)
         // (not per whole-correction) so a redose still gets a fresh 90s
         // checkpoint pulse and a fresh trend baseline - only
         // correctionCycleStartAt itself (Types.h) persists across redoses.
-        systemState.phFirstCheckpointPublished = false;
         systemState.phStableSince = 0;
         systemState.phStableCheckpointPublished = false;
         systemState.phTrendReferenceValue = NAN;
@@ -1128,7 +1127,6 @@ if(newMode == STARTUP)
         ecStabilizationCirculationConfirmedAt = 0;
 
         // Mirrors STABILIZING_PH's own reset above.
-        systemState.ecFirstCheckpointPublished = false;
         systemState.ecStableSince = 0;
         systemState.ecStableCheckpointPublished = false;
         systemState.ecTrendReferenceValue = NAN;
@@ -2459,7 +2457,6 @@ bool AutomationManager::processPHCorrection()
         systemState.phTrendReferenceValue = NAN;
         systemState.phLastTrendCheckAt = 0;
         systemState.phLastTrendImproving = true;
-        systemState.phFirstCheckpointPublished = false;
         systemState.phStableSince = 0;
         systemState.phStableCheckpointPublished = false;
     }
@@ -2584,7 +2581,6 @@ bool AutomationManager::processECCorrection()
         systemState.ecTrendReferenceValue = NAN;
         systemState.ecLastTrendCheckAt = 0;
         systemState.ecLastTrendImproving = true;
-        systemState.ecFirstCheckpointPublished = false;
         systemState.ecStableSince = 0;
         systemState.ecStableCheckpointPublished = false;
     }
@@ -4039,26 +4035,19 @@ void AutomationManager::handleStabilizingPH()
             processFogCycle();
         }
 
-        // First checkpoint: one-shot publish of whatever value exists once
-        // the initial silent window (30s circulation + 60s silent read,
-        // PH_STABILIZATION_TIME) has passed, regardless of whether it has
-        // settled yet - quiet-monitoring/4-minute-budget redesign.
-        if(!systemState.phFirstCheckpointPublished)
-        {
-            systemState.phPublishPending = true;
-            systemState.phFirstCheckpointPublished = true;
-        }
-
         const bool budgetExpired =
             millis() - systemState.correctionCycleStartAt >=
             PH_EC_CORRECTION_STALL_TIMEOUT_MS;
 
-        // Stable-hold-for-publish bookkeeping: tracks how long the reading
-        // has sat continuously inside SensorManager's own stability window,
+        // Stable-hold bookkeeping: tracks how long the reading has sat
+        // continuously inside SensorManager's own stability window,
         // independent of the trend re-sample below - this is what
         // eventually redoses a genuinely stalled-but-out-of-range plateau,
         // or completes the correction, once it has held long enough to
-        // trust (PH_EC_STABLE_HOLD_FOR_PUBLISH_MS).
+        // trust (PH_EC_STABLE_HOLD_FOR_PUBLISH_MS). Automation-only since
+        // Stage 1 of the sensor architecture redesign - Firebase telemetry
+        // no longer holds on this timer (see FirebaseManager::writeSensors()),
+        // but the correction retry-vs-complete decision below still does.
         if(sensorManager.isPhCurrentlyStable())
         {
             if(systemState.phStableSince == 0)
@@ -4077,17 +4066,17 @@ void AutomationManager::handleStabilizingPH()
            millis() - systemState.phStableSince >=
            PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
         {
-            systemState.phPublishPending = true;
             systemState.phStableCheckpointPublished = true;
 
-            // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
-            // value sensors.ph is still (correctly) retaining for
-            // Firebase/display - wait here until the live pH signal has
-            // reconfirmed a fresh stable reading. Bounded by the existing
-            // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDosePH() path
-            // already re-checked every tick above, so a probe that never
-            // restabilizes still aborts via the existing safety model
-            // rather than waiting forever.
+            // Do not decide retry-vs-complete the instant SensorManager's own
+            // stability window first agrees - that only proves the reading
+            // has stopped moving for its own (much shorter) window, not that
+            // it has genuinely settled. Wait out the extra
+            // PH_EC_STABLE_HOLD_FOR_PUBLISH_MS margin above first. Bounded by
+            // the existing PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT ->
+            // canDosePH() path already re-checked every tick above, so a
+            // probe that never restabilizes still aborts via the existing
+            // safety model rather than waiting forever.
             if(canStartNewPHCorrection())
             {
                 const bool targetReached =
@@ -4425,20 +4414,13 @@ void AutomationManager::handleStabilizingEC()
             processFogCycle();
         }
 
-        // First checkpoint: one-shot publish - see handleStabilizingPH()'s
-        // matching comment.
-        if(!systemState.ecFirstCheckpointPublished)
-        {
-            systemState.ecPublishPending = true;
-            systemState.ecFirstCheckpointPublished = true;
-        }
-
         const bool budgetExpired =
             millis() - systemState.correctionCycleStartAt >=
             PH_EC_CORRECTION_STALL_TIMEOUT_MS;
 
-        // Stable-hold-for-publish bookkeeping - see handleStabilizingPH()'s
-        // matching comment.
+        // Stable-hold bookkeeping - see handleStabilizingPH()'s matching
+        // comment. Automation-only since Stage 1 of the sensor architecture
+        // redesign - Firebase telemetry no longer holds on this timer.
         if(sensorManager.isEcCurrentlyStable())
         {
             if(systemState.ecStableSince == 0)
@@ -4457,17 +4439,15 @@ void AutomationManager::handleStabilizingEC()
            millis() - systemState.ecStableSince >=
            PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
         {
-            systemState.ecPublishPending = true;
             systemState.ecStableCheckpointPublished = true;
 
-            // Do not decide retry-vs-complete from the pre-dose/pre-disturbance
-            // value sensors.ec is still (correctly) retaining for
-            // Firebase/display - wait here until the live EC signal has
-            // reconfirmed a fresh stable reading. Bounded by the existing
-            // PH_EC_STABLE_TIMEOUT_MS -> SENSOR_FAULT -> canDoseEC()/
-            // canDiluteEC() path already re-checked every tick above, so a
-            // probe that never restabilizes still aborts via the existing
-            // safety model rather than waiting forever.
+            // Do not decide retry-vs-complete the instant SensorManager's own
+            // stability window first agrees - see handleStabilizingPH()'s
+            // matching comment. Bounded by the existing PH_EC_STABLE_TIMEOUT_MS
+            // -> SENSOR_FAULT -> canDoseEC()/canDiluteEC() path already
+            // re-checked every tick above, so a probe that never restabilizes
+            // still aborts via the existing safety model rather than waiting
+            // forever.
             if(canStartNewECCorrection())
             {
                 const bool targetReached =
