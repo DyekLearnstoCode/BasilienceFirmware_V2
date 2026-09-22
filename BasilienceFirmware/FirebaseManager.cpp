@@ -987,7 +987,7 @@ void FirebaseManager::runOneOptionalFirebaseJob(
     // their own always-checked fast path directly in update(), immediately
     // behind heartbeat - see the comment there. Every remaining job below
     // shifted down by 2 accordingly; this list is otherwise unchanged.
-    constexpr uint8_t OPTIONAL_JOB_COUNT = 14;
+    constexpr uint8_t OPTIONAL_JOB_COUNT = 15;
 
     for (uint8_t checked = 0; checked < OPTIONAL_JOB_COUNT; checked++)
     {
@@ -1017,20 +1017,21 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         // never be starved by history replay.
         if (deferLowPriorityJobs &&
             (job == 4 || job == 5 || job == 6 || job == 7 || job == 8 ||
-             job == 9 || job == 10 || job == 11 || job == 12))
+             job == 9 || job == 10 || job == 11 || job == 12 || job == 14))
         {
             continue;
         }
 
         // Narrower manual-interaction deferral: telemetry (6), device info
-        // (7), diagnostic sensors (8), SMS recipients (9), notification (11)
-        // and fogging (12) ACK replay - the known-slow, purely-optional jobs.
-        // readSettings (4) and writeStatus (5) are deliberately exempt (see
-        // update()). Harvest schedule (10) is exempt only once a cached
-        // active schedule already exists - a device with none yet must still
-        // be able to learn of one while Manual Mode happens to be on.
+        // (7), diagnostic sensors (8), SMS recipients (9), notification (11),
+        // fogging (12), and the Test SMS command read (14) - the known-slow,
+        // purely-optional jobs. readSettings (4) and writeStatus (5) are
+        // deliberately exempt (see update()). Harvest schedule (10) is exempt
+        // only once a cached active schedule already exists - a device with
+        // none yet must still be able to learn of one while Manual Mode
+        // happens to be on.
         if (deferLowPriorityForManualInteraction &&
-            (job == 6 || job == 7 || job == 8 || job == 9 || job == 11 || job == 12 ||
+            (job == 6 || job == 7 || job == 8 || job == 9 || job == 11 || job == 12 || job == 14 ||
              (job == 10 && harvestScheduleCache.isActive())))
         {
             continue;
@@ -1040,7 +1041,7 @@ void FirebaseManager::runOneOptionalFirebaseJob(
         // above) - reset the grace-window clock so the NEXT manual-mode
         // check starts a fresh bounded deferral instead of compounding.
         if (job == 6 || job == 7 || job == 8 || job == 9 || job == 10 ||
-            job == 11 || job == 12)
+            job == 11 || job == 12 || job == 14)
         {
             lastLowPriorityCloudJobAt = millis();
         }
@@ -1107,6 +1108,10 @@ void FirebaseManager::runOneOptionalFirebaseJob(
 
             case 13:
                 readWaterLevelOverrideCommand();
+                return;
+
+            case 14:
+                readTestSmsCommand();
                 return;
         }
     }
@@ -5157,6 +5162,58 @@ void FirebaseManager::setIgnoreWaterLevelAutomation(bool enabled, bool publishAc
     {
         Firebase.RTDB.setBool(&fbdo, deviceRoot() + "/status/ignoreWaterLevelAutomation", enabled);
     }
+}
+
+// One-shot admin Test SMS request - /commands/testSms/{timestamp}, mirroring
+// the per-actuator freshness+delete pattern in consumeActuatorCommandSnapshot()
+// rather than the persisted-flag pattern above (this is a single fire-once
+// request, not a standing mode). lastTestSmsCommandTimestamp only lives in
+// RAM (a duplicate test SMS after a reboot mid-request is harmless - no
+// actuator, no dose, no automation is involved), and the command node is
+// deleted immediately after being handed to NotificationManager so a later
+// poll or a reconnect never replays it within the same boot.
+void FirebaseManager::readTestSmsCommand()
+{
+    static unsigned long lastRead = 0;
+    static unsigned long lastReadFailure = 0;
+    static bool readBackoffActive = false;
+
+    if (readBackoffActive &&
+        millis() - lastReadFailure < COMMAND_FAILURE_BACKOFF_INTERVAL)
+    {
+        return;
+    }
+    if (millis() - lastRead < 2000) return; // 2 seconds interval
+    lastRead = millis();
+
+    const bool readSucceeded = Firebase.RTDB.getJSON(&fbdo, deviceRoot() + "/commands/testSms");
+    recordFirebaseResult(readSucceeded);
+    if (!readSucceeded)
+    {
+        readBackoffActive = true;
+        lastReadFailure = millis();
+        return;
+    }
+    readBackoffActive = false;
+
+    FirebaseJsonData data;
+    FirebaseJson& json = fbdo.jsonObject();
+    if (!json.get(data, "timestamp") || !data.success) return;
+
+    const double rawTimestamp = data.doubleValue;
+    if (!isfinite(rawTimestamp) || rawTimestamp <= 0) return;
+    const uint64_t timestamp = static_cast<uint64_t>(rawTimestamp);
+
+    // Same equality-based dedup shape as isDuplicateRequest(), scoped to this
+    // one command only - a repeated read of the same still-present node
+    // (before the delete below lands, or a request that failed to delete)
+    // must not re-fire the SMS pipeline.
+    if (timestamp <= lastTestSmsCommandTimestamp) return;
+    lastTestSmsCommandTimestamp = timestamp;
+
+    notificationManager.requestTestSms();
+
+    Firebase.RTDB.deleteNode(&fbdo, deviceRoot() + "/commands/testSms");
 }
 
 void FirebaseManager::writeDiagnosticSensors()

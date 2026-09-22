@@ -53,12 +53,25 @@ void SmsRecipientCache::applySnapshot(const String canonicalPhones[], uint8_t in
         return;
     }
 
+    // Captured before the overwrite below, purely so a removal (fewer
+    // enabled/valid recipients than before) can be called out explicitly -
+    // the assignment/save themselves are unconditional either way.
+    const uint8_t previousCount = count;
+
     for (uint8_t i = 0; i < dedupedCount; i++) phones[i] = deduped[i];
     count = dedupedCount;
     saveToNvs();
 
-    Serial.print("[SMS] Recipients synced: ");
+    Serial.print("[SMS-RECIPIENTS] Synced: ");
     Serial.println(count);
+    Serial.println("[SMS-RECIPIENTS] Cache saved to NVS");
+
+    if (count < previousCount)
+    {
+        Serial.print("[SMS-RECIPIENTS] Cache updated: ");
+        Serial.print(count);
+        Serial.println(count == 1 ? " active recipient" : " active recipients");
+    }
 }
 
 uint8_t SmsRecipientCache::recipientCount() const

@@ -237,6 +237,16 @@ private:
     void readWaterLevelOverrideCommand();
     void setIgnoreWaterLevelAutomation(bool enabled, bool publishAcknowledgement = true);
 
+    // One-shot admin Test SMS trigger - reads /commands/testSms/{timestamp},
+    // hands off to notificationManager.requestTestSms() (the real SMS
+    // pipeline: durable queue -> recipient fan-out -> GsmManager), then
+    // deletes the command node so a later poll/reconnect never replays it.
+    // Mirrors consumeActuatorCommandSnapshot()'s own delete-after-consume
+    // pattern rather than a persisted enabled/disabled flag, since this is a
+    // one-shot request, not a standing mode.
+    void readTestSmsCommand();
+    uint64_t lastTestSmsCommandTimestamp = 0;
+
     void provisionDevice();
 
     // Reads the 6 raw STA MAC bytes via esp_read_mac(ESP_MAC_WIFI_STA),

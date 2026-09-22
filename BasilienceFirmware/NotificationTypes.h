@@ -18,7 +18,11 @@ enum class NotificationEventType : uint8_t
     SENSOR_FAULT,
     DEVICE_UNREACHABLE,
     HARVEST_DUE,
-    PROVISIONING_MODE
+    PROVISIONING_MODE,
+    // Admin-requested pipeline test (NotificationManager::requestTestSms()) -
+    // exercises the real queue/recipient-fan-out/GsmManager path without
+    // fabricating a sensor condition. Never raised by AlertManager.
+    TEST_SMS
 };
 
 // Prefixed (SEV_*) because Arduino.h's esp32-hal-gpio.h #defines bare LOW/HIGH
@@ -113,6 +117,7 @@ inline const char* notificationEventTypeName(NotificationEventType type)
         case NotificationEventType::DEVICE_UNREACHABLE: return "DEVICE_UNREACHABLE";
         case NotificationEventType::HARVEST_DUE: return "HARVEST_DUE";
         case NotificationEventType::PROVISIONING_MODE: return "PROVISIONING_MODE";
+        case NotificationEventType::TEST_SMS: return "TEST_SMS";
     }
     return "EVENT";
 }

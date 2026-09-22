@@ -40,6 +40,13 @@ private:
     unsigned long lastPrintTime;
 
     uint8_t currentPage;
+
+    // Minimal local/offline TEST_SMS trigger - see checkTestSmsCommand()'s
+    // own comment in DebugManager.cpp. Bounded, single-line accumulator;
+    // never grows past a few characters.
+    String serialLineBuffer;
+    void checkTestSmsCommand();
+
     void printSensors();
     void printActuators();
     void printHeader(const char* title);

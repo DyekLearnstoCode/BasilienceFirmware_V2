@@ -12,8 +12,51 @@ void DebugManager::begin()
     currentPage = 0;
 }
 
+// Minimal local/offline TEST_SMS trigger. No Serial command console/parser
+// exists anywhere in this firmware (checked before adding this - see the
+// task's own "inspect first" instruction), so this is the smallest possible
+// input hook rather than a new console framework: accumulate one line, and
+// if it is exactly "TEST_SMS" call the SAME NotificationManager::
+// requestTestSms() the Firebase-triggered path (FirebaseManager::
+// readTestSmsCommand()) calls - there is exactly one TEST_SMS
+// implementation regardless of which trigger fired it. Deliberately called
+// from the very top of update(), ahead of every DEBUG_ENABLED/Serial-Monitor-
+// Focus-Mode gate below - this is a command INPUT, not diagnostic output,
+// and must work identically whether debug printing is on/off or a
+// controller is isolated for bench testing. Fully local: Serial + the
+// NVS-backed SmsRecipientCache + GsmManager, no Wi-Fi/Firebase involved.
+void DebugManager::checkTestSmsCommand()
+{
+    while (Serial.available() > 0)
+    {
+        char c = (char)Serial.read();
+        if (c == '\r') continue;
+
+        if (c == '\n')
+        {
+            serialLineBuffer.trim();
+            if (serialLineBuffer == "TEST_SMS")
+            {
+                Serial.println("[SMS-TEST] Serial TEST_SMS command received");
+                notificationManager.requestTestSms();
+            }
+            serialLineBuffer = "";
+            continue;
+        }
+
+        // Bounded so unrelated Serial noise (or a line with no newline) can
+        // never grow this indefinitely.
+        if (serialLineBuffer.length() < 32)
+        {
+            serialLineBuffer += c;
+        }
+    }
+}
+
 void DebugManager::update()
 {
+    checkTestSmsCommand();
+
     if (!DEBUG_ENABLED)
         return;
 

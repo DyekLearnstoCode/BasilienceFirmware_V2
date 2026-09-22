@@ -1092,6 +1092,21 @@ void ActuatorManager::update()
                     Serial.print("[MANUAL] ");
                     Serial.print(actuatorLogName(a));
                     Serial.println(" manual hold expired; automation ownership restored");
+
+                    // Manual dosing safety ceiling (PH_UP_PUMP/PH_DOWN_PUMP/
+                    // GROW_PUMP/BLOOM_PUMP only): this is the SAME independent
+                    // esp_timer deadline armed at manual RUNNING start (see
+                    // manualDeadlineMs()) - already MANUAL_PUMP_RUNTIME (5s)
+                    // for these four - just given its own explicit, easy-to-
+                    // grep safety log distinct from the generic ownership-
+                    // restored line above. No new timer, no new state.
+                    if (a == PH_UP_PUMP || a == PH_DOWN_PUMP ||
+                        a == GROW_PUMP || a == BLOOM_PUMP)
+                    {
+                        Serial.print("[MANUAL-SAFETY] ");
+                        Serial.print(actuatorLogName(a));
+                        Serial.println(" auto-off after 5s");
+                    }
                 }
                 statusDirty = true;
             }

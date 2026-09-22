@@ -648,7 +648,7 @@ constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 // hold this ~10.6L working volume below 28C at all under worst-case ambient.
 // Flagged here, not solved, until that data exists.
 constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 5UL * 1000UL;
-constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 30UL * 1000UL;
+constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 20UL * 1000UL;
 constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 5UL * 1000UL;
 // Independent hardware-timer deadline for automatic Peltier during
 // COOL_SOAK = intended soak duration + this margin, mirroring

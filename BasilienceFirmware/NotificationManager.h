@@ -23,6 +23,16 @@ public:
     void begin();
     void update();
 
+    // Admin-requested test of the REAL SMS pipeline (queue -> recipient
+    // fan-out -> GsmManager -> SIM800L), triggered by FirebaseManager::
+    // readTestSmsCommand(). Never touches AlertManager/SafetyManager/
+    // automation and never fabricates a sensor condition - it only enqueues
+    // a TEST_SMS event through the same enqueueEvent()/updateSmsFanOut()
+    // path every real alert already uses. ONLINE/OFFLINE wording is derived
+    // fresh from systemState.wifiConnected/firebaseConnected at call time,
+    // never hardcoded.
+    void requestTestSms();
+
     // --- Cloud replay integration point, called from FirebaseManager's
     //     existing optional-job cursor (one job slot, one event at a time). ---
 
@@ -77,6 +87,29 @@ private:
     // touching AlertManager itself.
     AlertState lastObservedAlerts;
     bool alertBaselineCaptured = false;
+
+    // One-shot-per-incident SMS memory for the offline fallback (goal: an
+    // alert that became active while ONLINE, where the app already owns
+    // delivery, must still get exactly one SMS the moment cloud connectivity
+    // is later lost, and never more than one per continuous active streak).
+    // Set true the instant queueOfflineAlertFallback() actually enqueues for
+    // that type; reset back to false only when the underlying alert itself
+    // recovers (false), so a later true->false->true is a genuinely new,
+    // SMS-eligible incident again. Connectivity flapping (online<->offline)
+    // while the alert stays continuously active never touches these flags,
+    // so it can never cause a second SMS for the same incident.
+    bool lowWaterIncidentSmsSent = false;
+    bool waterTempIncidentSmsSent = false;
+    bool airTempIncidentSmsSent = false;
+    bool sensorFaultIncidentSmsSent = false;
+
+    // Shared by every rising-edge/offline-fallback SMS check in
+    // observeAlertTransitions() - see its own definition for the exact
+    // condition. `active` is this tick's current alert value (not an edge);
+    // `incidentSmsSent` is the caller-owned per-type flag above.
+    void queueOfflineAlertFallback(NotificationEventType type, NotificationSeverity severity,
+                                    const char* title, const char* message,
+                                    bool active, bool& incidentSmsSent);
 
     bool alertNotificationAllowed(NotificationEventType type) const;
 

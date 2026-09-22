@@ -86,47 +86,89 @@ void NotificationManager::observeAlertTransitions()
     // while online, /alerts already reaches Firestore directly via
     // onAlertUpdated (immediate FCM + popup + history) the instant
     // writeAlerts() publishes the same transition, so neither an SMS nor a
-    // cloud-replay queue entry is needed for these four types - queuing for
-    // cloud replay too produced a second, differently-worded Firestore
-    // history document under a different eventId scheme with nothing to
-    // deduplicate the two (see the task report's duplicate-history audit),
-    // and sending an SMS on top of an FCM/popup the farmer already got
-    // would just be noise. Both are therefore gated on the SAME condition -
-    // this device currently having no cloud connectivity of its own - matching
-    // the ownership DEVICE_UNREACHABLE/HARVEST_DUE already use below (backend
-    // owns online delivery for both of those too, via its own independent
-    // presence detection / hourly cron).
-    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+    // cloud-replay queue entry is needed for these four types while the
+    // cloud is reachable. queueOfflineAlertFallback() below re-evaluates
+    // that same "is the cloud currently reachable" condition on every tick
+    // (not just the alert's own rising edge), so an alert that first became
+    // active WHILE ONLINE - and therefore never queued an SMS - still gets
+    // exactly one fallback SMS the moment connectivity is later lost, without
+    // ever sending a second one for the same continuously-active incident.
+    queueOfflineAlertFallback(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
+        "Low Reservoir", "Water level dropped below the refill threshold.",
+        alertState.lowWater, lowWaterIncidentSmsSent);
 
-    if (alertState.lowWater && !lastObservedAlerts.lowWater && !cloudUp &&
-        alertNotificationAllowed(NotificationEventType::LOW_WATER))
-    {
-        enqueueEvent(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
-                     "Low Reservoir", "Water level dropped below the refill threshold.",
-                     String(millis()), true, true);
-    }
-    if (alertState.waterTempOutOfRange && !lastObservedAlerts.waterTempOutOfRange && !cloudUp &&
-        alertNotificationAllowed(NotificationEventType::HIGH_WATER_TEMP))
-    {
-        enqueueEvent(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
-                     "High Water Temperature", "Water temperature exceeded the configured limit.",
-                     String(millis()), true, true);
-    }
-    if (alertState.highTemperature && !lastObservedAlerts.highTemperature && !cloudUp &&
-        alertNotificationAllowed(NotificationEventType::HIGH_AIR_TEMP))
-    {
-        enqueueEvent(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
-                     "High Air Temperature", "Air temperature exceeded the configured limit.",
-                     String(millis()), true, true);
-    }
-    if (alertState.sensorFault && !lastObservedAlerts.sensorFault && !cloudUp)
-    {
-        enqueueEvent(NotificationEventType::SENSOR_FAULT, NotificationSeverity::SEV_CRITICAL,
-                     "Sensor Fault", "One or more sensors are reporting invalid readings.",
-                     String(millis()), true, true);
-    }
+    queueOfflineAlertFallback(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
+        "High Water Temperature", "Water temperature exceeded the configured limit.",
+        alertState.waterTempOutOfRange, waterTempIncidentSmsSent);
+
+    queueOfflineAlertFallback(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
+        "High Air Temperature", "Air temperature exceeded the configured limit.",
+        alertState.highTemperature, airTempIncidentSmsSent);
+
+    queueOfflineAlertFallback(NotificationEventType::SENSOR_FAULT, NotificationSeverity::SEV_CRITICAL,
+        "Sensor Fault", "One or more sensors are reporting invalid readings.",
+        alertState.sensorFault, sensorFaultIncidentSmsSent);
 
     lastObservedAlerts = alertState;
+}
+
+// See the header's own comment on lowWaterIncidentSmsSent et al. `active` is
+// this tick's current alert value, not an edge - the incident flag itself is
+// what makes this fire at most once per continuous active streak, whether
+// the alert became active while already offline (the previous rising-edge-
+// only behavior) or was already active online and the cloud dropped later
+// (the new fallback behavior). Recovery (`!active`) always rearms the flag
+// regardless of connectivity, so a later true->false->true is a new,
+// SMS-eligible incident.
+void NotificationManager::queueOfflineAlertFallback(NotificationEventType type, NotificationSeverity severity,
+                                                     const char* title, const char* message,
+                                                     bool active, bool& incidentSmsSent)
+{
+    if (!active)
+    {
+        incidentSmsSent = false;
+        return;
+    }
+
+    if (incidentSmsSent) return;
+
+    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+    if (cloudUp) return;
+
+    if (!alertNotificationAllowed(type)) return;
+
+    Serial.print("[SMS-FALLBACK] ");
+    Serial.print(notificationEventTypeName(type));
+    Serial.println(" incident requires SMS fallback");
+
+    enqueueEvent(type, severity, title, message, String(millis()), true, true);
+    incidentSmsSent = true;
+}
+
+// Admin-requested pipeline test - see the header's own comment. Deliberately
+// does not touch AlertManager/SafetyManager/automation and starts no state
+// machine; it only builds one event and hands it to the SAME enqueueEvent()
+// every real alert uses, so delivery goes through the identical durable
+// queue / recipient fan-out / GsmManager path.
+void NotificationManager::requestTestSms()
+{
+    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+
+    Serial.println("[SMS-TEST] Test SMS requested");
+    Serial.print("[SMS-TEST] Device status: ");
+    Serial.println(cloudUp ? "ONLINE" : "OFFLINE");
+    Serial.print("[SMS-TEST] Cached recipients: ");
+    Serial.println(smsRecipientCache.recipientCount());
+
+    const char* message = cloudUp
+        ? "The Basilience device is ONLINE. This is a test of the SMS notification system."
+        : "The Basilience device is OFFLINE. This is a test of the SMS notification system.";
+
+    // queuedForCloud=false: a manual pipeline test has no matching Firestore
+    // history contract (unlike the four real alert types above) - SMS-only,
+    // same treatment as DEVICE_UNREACHABLE/PROVISIONING_MODE/HARVEST_DUE.
+    enqueueEvent(NotificationEventType::TEST_SMS, NotificationSeverity::SEV_LOW,
+                 "Test SMS", message, String(millis()), true, false);
 }
 
 bool NotificationManager::alertNotificationAllowed(NotificationEventType type) const
@@ -592,7 +634,16 @@ void NotificationManager::finishSmsFanOut()
         if (event.recipientState[i] != (uint8_t)RecipientSmsState::NOT_ATTEMPTED) anyAttempted = true;
     }
 
-    if (total == 0 || !anyAttempted) event.smsStatus = SmsDeliveryStatus::FAILED;
+    if (total == 0)
+    {
+        // Explicit, distinct outcome from "recipients existed but delivery
+        // failed" below - never silently claimed as DELIVERED/PARTIAL.
+        Serial.print("[SMS] No recipients cached - ");
+        Serial.print(event.eventId);
+        Serial.println(" cannot be delivered");
+        event.smsStatus = SmsDeliveryStatus::FAILED;
+    }
+    else if (!anyAttempted) event.smsStatus = SmsDeliveryStatus::FAILED;
     else if (sent == total) event.smsStatus = SmsDeliveryStatus::DELIVERED;
     else if (sent > 0) event.smsStatus = SmsDeliveryStatus::PARTIAL;
     else event.smsStatus = SmsDeliveryStatus::FAILED;
