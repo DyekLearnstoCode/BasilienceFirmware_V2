@@ -22,6 +22,7 @@ One rule applies everywhere in this document and is worth stating once at the to
 | A dose just finished, even if the reading already looks fine | Refuses to start another correction for a short cooldown, since a probe can look settled before the dosed chemical has actually mixed in | Nothing new happens for a moment even if the reading still looks off | 1 minute minimum between doses |
 | EC needs to be diluted (water added) but the reservoir is already at its full working capacity | Refuses to add more water and locks the EC system for manual attention, rather than overflowing the tank | An alert appears, and EC dosing needs "Reset Safety" before it will try again | Immediate, no waiting period |
 | Water level drops too low while a pH or EC correction would otherwise be needed | Refuses to dose at all until the water level recovers or a refill happens | The correction simply doesn't start, no new alert beyond the existing low-water one | Ongoing until water level recovers |
+| Water level drops too low in the middle of a correction | Stops the correction (pumps off), lets the refill run, and re-evaluates pH/EC afterwards. This does not lock pH/EC | The correction ends; no "Reset Safety" needed | Immediate |
 
 ## 2. Automatic Refill
 
@@ -59,6 +60,8 @@ One rule applies everywhere in this document and is worth stating once at the to
 | A misting burst just ended | Keeps the fan running a little longer at full strength right after, to push the mist toward the plants before resting | Fan briefly stays on after the fogger turns off | 30 seconds |
 | Water level drops too low | Fogging stops until the water level recovers | Fogger and fan turn off | Resumes automatically once water level is safe again |
 | The air temperature/humidity sensor becomes unavailable | Falls back to the everyday (not hot, not cold) schedule instead of guessing, since the sensor can't currently confirm hot or cold conditions | No alert just for this, fogging continues on the fallback schedule | Ongoing until the sensor recovers |
+| pH or EC is outside its range, a pH/EC probe fails, or a pH/EC correction has locked | Keeps misting on the normal schedule. Only dosing is blocked, and the pH/EC alert or lock still appears | Fogger keeps cycling; pH/EC shows its alert or No Data | Ongoing |
+| A pH or EC correction is actively dosing, or the just-dosed water is still mixing | Pauses misting until the mixing window ends, then resumes | Fogger and fan pause briefly | Dose plus about 90 seconds |
 
 ## 5. Connectivity Loss (Wi-Fi / Cloud)
 

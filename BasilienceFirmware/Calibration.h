@@ -45,26 +45,20 @@ constexpr int ADC_RESOLUTION = 4095;
 //
 // Both points below were captured with the EC module wired through the
 // sensor expansion board - the actual production signal path, not a probe
-// connected straight to the ESP32's GPIO34. That distinction matters: during
-// this calibration task, the same solutions read very differently depending
-// on which path was used (e.g. the 1.4 mS/cm solution read ~1.73V direct to
-// the ESP32, but consistently ~2.0-2.14V through the expansion board), while
-// direct-to-ESP32 readings stayed put across power sources and sessions.
-// The expansion board itself is doing this, not probe contamination, not
-// electrode drift, not the power source - confirmed by deliberately
-// swapping between direct-to-ESP32 and through-the-expansion-board wiring
-// and seeing the reading track the wiring path, not the solution or supply.
-// Since the real device always reads EC through the expansion board, these
-// two points are the correct ones to calibrate against, even though they
-// don't match what a probe wired straight to the ESP32 would read.
+// straight to the ESP32's GPIO34. That distinction matters: the same
+// solutions read very differently by path (e.g. the 1.4 mS/cm solution read
+// ~1.73V direct to the ESP32, but consistently ~2.0-2.14V through the
+// expansion board), confirmed by deliberately swapping wiring and watching
+// the reading track the path, not the solution or supply. Since the real
+// device always reads EC through the expansion board, these are the correct
+// points to calibrate against, even though they don't match a direct-wired
+// probe.
 //
 // Point 1 - CONFIRMED on real hardware (EC calibration redesign task): probe
 // dipped in a 12.88 mS/cm reference solution, EC module powered from 5V,
-// through the expansion board, ESP32 reading GPIO34. Landed on ~2.44V every
-// time it was captured this session, regardless of power source - the
-// stable anchor of the two. Re-captured at 2.443V in a later session -
-// updated below; still the same solution/wiring path, within normal
-// session-to-session variation of the original ~2.44V reading.
+// through the expansion board, ESP32 reading GPIO34. Landed on ~2.44V
+// consistently - the stable anchor of the two. Re-captured at 2.443V in a
+// later session, within normal session-to-session variation.
 constexpr float EC_CAL_1_VOLTAGE = 2.443f;   // volts
 constexpr float EC_CAL_1_EC      = 12.88f;   // mS/cm
 
@@ -72,21 +66,16 @@ constexpr float EC_CAL_1_EC      = 12.88f;   // mS/cm
 // dipped in a 1.4 mS/cm reference solution, deliberately chosen near the
 // real 1.2-2.0 mS/cm cultivation range (EC_TARGET_MIN/EC_TARGET_MAX,
 // Config.h) rather than another high-concentration point, since that is
-// where dosing decisions actually operate. Took several recaptures within
-// the original session (1.734V direct-to-ESP32, then 2.007V/2.122V/2.142V
-// through the expansion board) before the expansion-board wiring path was
-// identified as the actual variable. Re-captured again in a later session at
-// 2.205V through the expansion board - updated below; slightly widens the
-// gap from Point 1 versus the original 2.142V capture, so the swing-per-mV
-// concern noted below is somewhat less pronounced than originally measured,
-// though still tighter than the very first 1.734V/12.88 pairing. Because
-// these two points are still much closer together in voltage than that
-// original pairing, the fitted line is meaningfully steeper than a
-// full-range calibration would give - ordinary ADC noise will show up as a
-// larger apparent swing in reported EC within the real cultivation range
-// than it would with two more widely-separated anchors. Worth revisiting if
-// that turns out to matter in practice (e.g. a lower-concentration second
-// reference solution instead).
+// where dosing decisions actually operate. Several recaptures (1.734V
+// direct-to-ESP32, then 2.007V/2.122V/2.142V through the expansion board)
+// before the expansion-board wiring path was identified as the actual
+// variable; re-captured again at 2.205V through the expansion board -
+// updated below. These two points are still much closer together in
+// voltage than a full-range calibration would give, so the fitted line is
+// meaningfully steeper - ordinary ADC noise shows up as a larger apparent
+// swing in reported EC within the real cultivation range than with two more
+// widely-separated anchors. Worth revisiting if that matters in practice
+// (e.g. a lower-concentration second reference solution).
 constexpr float EC_CAL_2_VOLTAGE = 2.205f;   // volts
 constexpr float EC_CAL_2_EC      = 1.40f;    // mS/cm
 

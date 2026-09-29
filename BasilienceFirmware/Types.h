@@ -18,11 +18,11 @@ struct SensorData
     // display continuously: SensorManager::readDHT() keeps holding them at
     // that last accepted value through a confirmed-unavailable streak
     // instead of collapsing to NaN, exactly like waterLevelCm/waterTemp
-    // already never invent a fake reading but do hold the last real one.
-    // dhtAvailable/dhtStale (below) are what distinguish "this number is a
-    // fresh measurement" from "this number is a stale hold-over" - a control/
-    // alert consumer must gate on dhtAvailable, never on isfinite() alone,
-    // since isfinite() no longer implies freshness.
+    // never invent a fake reading but do hold the last real one.
+    // dhtAvailable/dhtStale (below) distinguish "this number is a fresh
+    // measurement" from "this number is a stale hold-over" - a
+    // control/alert consumer must gate on dhtAvailable, never isfinite()
+    // alone, since isfinite() no longer implies freshness.
     float temperature = NAN;
     float humidity    = NAN;
     float waterTemp   = NAN;
@@ -35,8 +35,8 @@ struct SensorData
     bool dhtAvailable = false;
 
     // True only when dhtAvailable is false AND temperature/humidity hold a
-    // genuine last-good value from before the outage (i.e. NOT the "never
-    // had a valid reading since boot" case, which must display as plainly
+    // genuine last-good value from before the outage (NOT the "never had a
+    // valid reading since boot" case, which must display as plainly
     // unavailable rather than inventing a fake stale reading - see
     // temperature/humidity's own comment above). isfinite(temperature) is
     // the tell: dhtStale is true only when there is something real to be
@@ -57,8 +57,8 @@ struct SensorData
     // chemistry-range judgment (see EC_FAULT_RAIL_LOW_MV/HIGH_MV's own
     // comment). While true, ec/tds above are forced to NaN and the EC
     // stability window is held reset - never conflate this with ec merely
-    // being outside minEC/maxEC, which is a normal, valid, in-range-signal
-    // condition automation is expected to correct via dosing.
+    // being outside minEC/maxEC, a normal, valid, in-range-signal condition
+    // automation is expected to correct via dosing.
     bool ecFault = false;
 
     // True once SensorManager::readEC()'s SEPARATE calibration-plausibility
@@ -81,7 +81,7 @@ struct SensorData
     // dhtAvailable is, rather than making every consumer isfinite()-check
     // itself). False while ecFault is true, while the post-(re)connect
     // PH_EC_ANALOG_SETTLE_TIME window is running, or before the stability
-    // window has ever confirmed a first reading.
+    // window has confirmed a first reading.
     bool ecAvailable = false;
 
     // pH
@@ -98,26 +98,26 @@ struct SensorData
     // While true, ph above is forced to NaN and the pH stability window/step
     // filter baseline are held reset, so recovery must fully re-earn trust
     // through the normal pipeline (see PH_FAULT_RECOVERY_COUNT's own
-    // comment) - never conflate this with ph merely being outside minPH/
-    // maxPH, which is a normal, valid, in-range-signal condition automation
-    // is expected to correct via dosing.
+    // comment) - never conflate this with ph merely being outside
+    // minPH/maxPH, a normal, valid, in-range-signal condition automation is
+    // expected to correct via dosing.
     bool phFault = false;
 
     // True exactly when ph above is a currently-trusted, non-NaN reading -
     // same reasoning as ecAvailable above.
     bool phAvailable = false;
 
-    // True while the pH temporal step filter has an unconfirmed
-    // confirmation streak in progress - either the very first baseline
-    // (boot/reacquisition) or a later large jump (quick-response
-    // refinement task; see SensorManager::isPhConfirming()). ph above still
-    // holds the last TRUSTED value the whole time (never NaN'd out just
-    // because a new candidate is being confirmed, never replaced by the
-    // unconfirmed candidate itself) - this flag is what lets a consumer
-    // (Android) show "confirming a new reading" instead of silently
-    // presenting a possibly-stale value as fully current. Purely a
-    // display/status signal - automatic dosing is independently blocked by
-    // the existing stability-window gate regardless of this flag.
+    // True while the pH temporal step filter has an unconfirmed confirmation
+    // streak in progress - either the very first baseline (boot/
+    // reacquisition) or a later large jump (quick-response refinement task;
+    // see SensorManager::isPhConfirming()). ph above still holds the last
+    // TRUSTED value the whole time (never NaN'd out just because a new
+    // candidate is being confirmed, never replaced by the unconfirmed
+    // candidate itself) - this flag lets a consumer (Android) show
+    // "confirming a new reading" instead of silently presenting a
+    // possibly-stale value as fully current. Purely a display/status signal
+    // - automatic dosing is independently blocked by the existing
+    // stability-window gate regardless of this flag.
     bool phConfirming = false;
 
     // Water Level (water-depth model - see Config.h's "Water Reservoir
@@ -127,7 +127,7 @@ struct SensorData
     // Actual measured water DEPTH in centimeters. AUTHORITATIVE for
     // automation - refill/low-water control compares this directly, never
     // the derived percentage. Clamped only at the lower bound (0) - a
-    // genuine overfill above MAX_WORKING_WATER_CM (6.0) is reported as its
+    // genuine overfill above MAX_WORKING_WATER_CM (20.0) is reported as its
     // real depth, never capped; only waterLevel (the derived percentage
     // below) clamps at 100%. NaN exactly when waterLevel is NaN (both set
     // together in readWaterLevel()).
@@ -139,17 +139,15 @@ struct SensorData
     float waterVolumeLiters = NAN;
 
     // Refill threshold confirmation (see the automation resilience pass
-    // follow-up report). waterLevelCm is already the step-filtered
-    // accepted control value, but a small transient (e.g. one bad reading
-    // 0.20cm off) can still pass that filter's WATER_LEVEL_STEP_ACCEPT_CM
-    // band and momentarily cross REFILL_START_CM/REFILL_STOP_CM on its own.
-    // These flags require WATER_LEVEL_STEP_CONFIRM_COUNT consecutive
-    // ACCEPTED readings (SensorManager::readWaterLevel(),
-    // WATER_LEVEL_READ_INTERVAL_MS = 5s apart, not the ~300ms an earlier
-    // version of this comment incorrectly stated) on
-    // the correct side of the threshold before the crossing is trusted -
-    // REFILL START/COMPLETE must read these, never waterLevelCm compared
-    // against the threshold directly.
+    // follow-up report). waterLevelCm is already the step-filtered accepted
+    // control value, but a small transient (e.g. one bad reading 0.20cm off)
+    // can still pass that filter's WATER_LEVEL_STEP_ACCEPT_CM band and
+    // momentarily cross REFILL_START_CM/REFILL_STOP_CM on its own. These
+    // flags require WATER_LEVEL_STEP_CONFIRM_COUNT consecutive ACCEPTED
+    // readings (SensorManager::readWaterLevel(), WATER_LEVEL_READ_INTERVAL_MS
+    // = 5s apart) on the correct side of the threshold before the crossing
+    // is trusted - REFILL START/COMPLETE must read these, never waterLevelCm
+    // compared against the threshold directly.
     bool refillStartConfirmed = false;
     bool refillStopConfirmed = false;
 
@@ -191,15 +189,16 @@ enum SystemMode
     SAFETY_LOCK
 };
 
-// Pulse-cooling state machine (replaces continuous-circulation cooling -
-// see AutomationManager::updateCoolingPulseStateMachine()). Deliberately NOT
-// a SystemMode value: cooling has always run independently of the reservoir-
-// wide FSM above (coolingDemandActive/manualCoolingDemandActive), and staying
-// that way keeps this entirely out of pH/EC/refill's currentMode-based mutual
-// exclusion instead of risking new interactions with it. Read directly from
-// systemState (not just AutomationManager-private) because
-// ActuatorManager::validateCommand()'s PELTIER case and the automatic
-// independent-deadline tables both need to know the current state too.
+// Pulse-cooling state machine (replaces continuous-circulation cooling - see
+// AutomationManager::updateCoolingPulseStateMachine()). Deliberately NOT a
+// SystemMode value: cooling has always run independently of the
+// reservoir-wide FSM above (coolingDemandActive/manualCoolingDemandActive),
+// and staying that way keeps this entirely out of pH/EC/refill's
+// currentMode-based mutual exclusion instead of risking new interactions
+// with it. Read directly from systemState (not just AutomationManager-
+// private) because ActuatorManager::validateCommand()'s PELTIER case and
+// the automatic independent-deadline tables both need to know the current
+// state too.
 enum class CoolingPulseState : uint8_t
 {
     IDLE,
@@ -553,18 +552,20 @@ struct SystemState
     // Consecutive automatic-refill attempts (AutomationManager::
     // handleBoundedAutomaticRefill()) that ran their full
     // AUTOMATIC_REFILL_RUN_TIME + settle cycle without the water level
-    // actually rising past sensor noise (WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM).
-    // Mirrors ecDilutionNoRiseStreak's exact same report-only design: reported
-    // as the refillIneffective alert once it reaches 2, never blocks or
-    // changes the existing MAX_REFILL_ATTEMPTS budget on its own.
+    // actually rising past sensor noise
+    // (WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM). Mirrors ecDilutionNoRiseStreak's
+    // exact same report-only design: reported as the refillIneffective alert
+    // once it reaches 2, never blocks or changes the existing
+    // MAX_REFILL_ATTEMPTS budget on its own.
     uint8_t refillNoRiseStreak = 0;
 
     // Seconds remaining in the current bounded-automatic-refill attempt's
-    // RUNNING or SETTLING phase (AutomationManager::handleBoundedAutomaticRefill()).
-    // Pinned to 0 for the whole duration of a manual/continuous refill
-    // (handleRefilling()), which has no fixed duration to count down - the
-    // app treats 0 as "no countdown available, show an indeterminate loader"
-    // rather than a real "0 seconds left."
+    // RUNNING or SETTLING phase
+    // (AutomationManager::handleBoundedAutomaticRefill()). Pinned to 0 for
+    // the whole duration of a manual/continuous refill (handleRefilling()),
+    // which has no fixed duration to count down - the app treats 0 as "no
+    // countdown available, show an indeterminate loader" rather than a real
+    // "0 seconds left."
     uint16_t refillSecondsRemaining = 0;
 
     // Pulse-cooling task: current phase of the FILL/COOL_SOAK/FLUSH cycle.
@@ -583,10 +584,10 @@ struct SystemState
 
     // Developer testing override: bypasses ONLY the automatic
     // water-level/refill gate (AutomationManager's handleNormal(),
-    // handleRefilling()) so pH/EC/fogging/
-    // cooling automation can be exercised on hardware sitting below
-    // criticalLowWaterCm. The water-level sensor itself, its alerts, and
-    // manual refill are all untouched - see FirebaseManager::
+    // handleRefilling()) so pH/EC/fogging/cooling automation can be
+    // exercised on hardware sitting below criticalLowWaterCm. The
+    // water-level sensor itself, its alerts, and manual refill are all
+    // untouched - see FirebaseManager::
     // setIgnoreWaterLevelAutomation()/readWaterLevelOverrideCommand().
     // Deliberately not restored from NVS: resets to false on every reboot,
     // same as sensorTestEnabled above, so a developer testing session never
@@ -612,7 +613,7 @@ struct SystemState
     // True once the effective sensor source (mock vs. physical) has been
     // confirmed at least once from Firebase since boot. Shared between
     // FirebaseManager (which resolves it) and SensorManager/AlertManager
-    // (which must not act on physical readings until it is true) so a
+    // (which must not act on physical readings until it's true) so a
     // reboot/brownout can't let temporary physical readings drive automation
     // before a previously-enabled mock mode is restored.
     bool sensorSourceResolved = false;
@@ -620,15 +621,15 @@ struct SystemState
     // Coherent-snapshot readiness baseline (see the real-time sensor
     // presentation task report) - millis() of the most recent boot or
     // mock/physical source transition. 0 at true boot (millis() is already
-    // ~0 then, so "elapsed since 0" naturally satisfies
-    // SENSOR_SNAPSHOT_READY_DELAY_MS shortly after real power-on with no
-    // special-case needed). Reset by SensorManager::applyEffectiveSensors()
-    // on a genuine source transition, mirroring how phStabilityWindow/
-    // ecStabilityWindow/the pH temporal filter are reset at the same
-    // instant - published as /sensors/sensorState/{stabilizing,ready} by
+    // ~0 then, so "elapsed since 0" naturally satisfies the readiness delay
+    // shortly after real power-on with no special-case needed). Reset by
+    // SensorManager::applyEffectiveSensors() on a genuine source transition,
+    // mirroring how phStabilityWindow/ecStabilityWindow/the pH temporal
+    // filter are reset at the same instant - published as
+    // /sensors/sensorState/{stabilizing,ready} by
     // FirebaseManager::writeSensors() so Android knows when a coherent
     // initial snapshot exists, without requiring every sensor to be fully
-    // settled (see SENSOR_SNAPSHOT_READY_DELAY_MS's own comment).
+    // settled.
     unsigned long sensorSnapshotBaselineAt = 0;
 
     // Armed by AutomationManager::completeCurrentOperation() the instant an
@@ -683,21 +684,22 @@ struct SystemState
     // EC_STABILIZATION_TIME) and purely watching, not actively dosing and
     // not waiting for a fresh dose to mix in yet. Lets
     // SafetyManager::canFog() allow fogging to resume during that window -
-    // canFog()'s own pH/EC range checks already confirm the reading is
-    // actually safe; this only says "and it is current enough to trust."
-    // Set fresh every tick (true inside the watch block, false via
-    // changeState() on entering DOSING_PH/STABILIZING_PH) rather than
-    // relying on scattered resets, so it can never linger stale.
+    // this only says the just-dosed solution has finished mixing (canFog()
+    // no longer checks whether the pH/EC reading itself is in range). Set
+    // fresh every tick (true inside the watch block, false via changeState()
+    // on entering DOSING_PH/STABILIZING_PH) rather than relying on
+    // scattered resets, so it can never linger stale.
     bool phWatchPhaseActive = false;
     bool ecWatchPhaseActive = false;
 
     // Seconds remaining in the current STABILIZING_PH/STABILIZING_EC silent
     // settle window (PH_STABILIZATION_TIME/EC_STABILIZATION_TIME), i.e. time
-    // left before phWatchPhaseActive/ecWatchPhaseActive turns true. Recomputed
-    // fresh every tick by handleStabilizingPH()/handleStabilizingEC() - never
-    // meaningful outside those states, so nothing resets it separately. Lets
-    // the app show a countdown instead of just an opaque "stabilizing" spinner
-    // while the reading is known to be untrustworthy.
+    // left before phWatchPhaseActive/ecWatchPhaseActive turns true.
+    // Recomputed fresh every tick by
+    // handleStabilizingPH()/handleStabilizingEC() - never meaningful outside
+    // those states, so nothing resets it separately. Lets the app show a
+    // countdown instead of just an opaque "stabilizing" spinner while the
+    // reading is known to be untrustworthy.
     uint16_t phStabilizeSecondsRemaining = 0;
     uint16_t ecStabilizeSecondsRemaining = 0;
 
@@ -714,13 +716,13 @@ struct SystemState
 
     // Trend tracking for handleStabilizingPH() - lets it tell "still
     // improving on its own," "stalled," and "reversing" apart instead of
-    // blindly redosing on a timer. phLastTrendImproving gates whether a
-    // NEW redose fires while the correction is still under budget (a
-    // reversal redoses immediately; "improving"/no-progress do not). It no
-    // longer has any bearing on the PH_EC_CORRECTION_STALL_TIMEOUT_MS
-    // deadline verdict itself (correction-budget limbo fix) - that deadline
-    // is a hard episode ceiling regardless of this flag's value; see
-    // Config.h's own comment on PH_EC_CORRECTION_STALL_TIMEOUT_MS.
+    // blindly redosing on a timer. phLastTrendImproving gates whether a NEW
+    // redose fires while the correction is still under budget (a reversal
+    // redoses immediately; "improving"/no-progress do not). It no longer has
+    // any bearing on the PH_EC_CORRECTION_STALL_TIMEOUT_MS deadline verdict
+    // itself (correction-budget limbo fix) - that deadline is a hard episode
+    // ceiling regardless of this flag's value; see Config.h's own comment on
+    // PH_EC_CORRECTION_STALL_TIMEOUT_MS.
     float phTrendReferenceValue = NAN;
     unsigned long phLastTrendCheckAt = 0;
     bool phLastTrendImproving = true;
@@ -745,16 +747,15 @@ struct SystemState
     float phLastPublishedValue = NAN;
 
     // millis() a pH-Up/pH-Down pump last actually finished running, from
-    // EITHER source (manual or automatic) - see
-    // ActuatorManager::update()'s STOPPING case, the single funnel every
-    // pump-off transition passes through. 0 means "never dosed this boot,"
-    // a sentinel rather than a real timestamp so the cooldown below never
-    // blocks the very first correction. Consumed by
-    // AutomationManager::canStartNewPHCorrection() as PH_DOSE_COOLDOWN - a
-    // real minimum wait, not just the stability window's own "has the
-    // reading stopped moving" check, since a probe can settle into a
-    // misleadingly steady reading before the dosed chemical has actually
-    // finished mixing into the reservoir.
+    // EITHER source (manual or automatic) - see ActuatorManager::update()'s
+    // STOPPING case, the single funnel every pump-off transition passes
+    // through. 0 means "never dosed this boot," a sentinel rather than a
+    // real timestamp so the cooldown below never blocks the very first
+    // correction. Consumed by AutomationManager::canStartNewPHCorrection()
+    // as PH_DOSE_COOLDOWN - a real minimum wait, not just the stability
+    // window's own "has the reading stopped moving" check, since a probe
+    // can settle into a misleadingly steady reading before the dosed
+    // chemical has actually finished mixing into the reservoir.
     unsigned long lastPhDoseEndedAt = 0;
 
     float minPH = MIN_PH;
@@ -773,20 +774,21 @@ struct SystemState
 
     uint8_t ecAttempts = 0;
 
-    // Water-level baseline captured at the start of each automatic EC-dilution
-    // interval (NAN whenever no dilution interval is currently running) - lets
-    // handleStabilizingEC() confirm the solenoid actually raised the reservoir
-    // level, not just that the EC reading moved, before crediting the interval
-    // as real progress. Re-captured fresh at every DOSING_EC entry, so a stale
-    // value from an earlier episode never leaks into the next one's check.
+    // Water-level baseline captured at the start of each automatic
+    // EC-dilution interval (NAN whenever no dilution interval is currently
+    // running) - lets handleStabilizingEC() confirm the solenoid actually
+    // raised the reservoir level, not just that the EC reading moved, before
+    // crediting the interval as real progress. Re-captured fresh at every
+    // DOSING_EC entry, so a stale value from an earlier episode never leaks
+    // into the next one's check.
     float ecDiluteIntervalStartLevel = NAN;
 
     // Consecutive automatic dilution intervals that ran their full duration
     // without the water level rising past sensor noise
     // (WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM). Reported once it reaches 2 as
     // the ecDilutionIneffective alert - chosen to report only, not block,
-    // since the reservoir's fill hose/pump has no fixed expected flow rate to
-    // validate against, only "did the level move at all."
+    // since the reservoir's fill hose/pump has no fixed expected flow rate
+    // to validate against, only "did the level move at all."
     uint8_t ecDilutionNoRiseStreak = 0;
 
     // Mirrors the phTrendReferenceValue/phLastTrendCheckAt/
@@ -837,7 +839,7 @@ struct SystemState
     // AutomationManager::getCurrentMinutes()/updateGrowLightSchedule() - see
     // their own comments for the strict activation condition (both
     // automationTestSubsystem == GROW_LIGHT and this flag must be true).
-    // Minutes since midnight, clamped to 0..1439 on receipt from Firebase.
+    // Minutes since midnight, clamped 0..1439 on receipt from Firebase.
     bool mockGrowLightTimeEnabled = false;
     uint16_t mockGrowLightMinutes = 0;
 
@@ -874,9 +876,9 @@ struct SystemState
     // Deliberately NOT reused as the authoritative field: a stale persisted
     // value under this same key (NVS "wlEmptyCm" / RTDB
     // waterLevelEmptyDistanceCm) is exactly what let runtime keep computing
-    // depth against 30.00cm long after the compiled default was corrected to
-    // 28.67cm - reusing this key would let that same stale value silently
-    // survive again.
+    // depth against 30.00cm long after the compiled default was corrected
+    // to 28.67cm - reusing this key would let that same stale value
+    // silently survive again.
     float waterLevelEmptyDistanceCm =
         WATER_LEVEL_EMPTY_DISTANCE_CM;
 
@@ -958,13 +960,13 @@ struct SystemState
     // manual Blower speed commands are unaffected by this field entirely.
     uint8_t blowerSpeedPercent = BLOWER_SPEED_DEFAULT_PERCENT;
 
-    // Config/settings schema migration bookkeeping - see CONFIG_SCHEMA_VERSION
-    // in Config.h. True from boot (set in FirebaseManager::
-    // loadPersistedSettings() whenever the persisted NVS "cfgVersion" is
-    // behind CONFIG_SCHEMA_VERSION) until this device's corrected
-    // maxAirTemp/blowerSpeedPercent values have been successfully PUSHED to
-    // Firebase at least once (FirebaseManager::readSettings()), at which
-    // point cfgVersion is persisted and this never fires again. Local
+    // Config/settings schema migration bookkeeping - see
+    // CONFIG_SCHEMA_VERSION in Config.h. True from boot (set in
+    // FirebaseManager::loadPersistedSettings() whenever the persisted NVS
+    // "cfgVersion" is behind CONFIG_SCHEMA_VERSION) until this device's
+    // corrected maxAirTemp/blowerSpeedPercent values have been successfully
+    // PUSHED to Firebase at least once (FirebaseManager::readSettings()), at
+    // which point cfgVersion is persisted and this never fires again. Local
     // values are corrected immediately regardless of this flag - it only
     // gates the one-time Firebase-side reconciliation, which needs
     // connectivity this field's own local correction does not.
@@ -985,15 +987,15 @@ struct AlertState
     // notification/status severity signal: the <=2.0cm operational block
     // (pH/EC dosing, fogging, cooling) is already fully enforced by lowWater
     // via SafetyManager/ActuatorManager, so this flag drives no additional
-    // actuator gating of its own.
+    // actuator gating.
     bool criticalLowWater = false;
 
     // Report-only: automatic refill has run for 2 consecutive attempts
     // without the reservoir's water level actually rising (see
-    // SystemState::refillNoRiseStreak). Suggests the refill water source/
-    // pump/hose isn't delivering water even though the solenoid command is
-    // being sent. Never blocks or changes the existing MAX_REFILL_ATTEMPTS
-    // budget on its own - mirrors ecDilutionIneffective's exact same design.
+    // SystemState::refillNoRiseStreak). Suggests the refill water
+    // source/pump/hose isn't delivering water even though the solenoid
+    // command is being sent. Never blocks or changes the existing
+    // MAX_REFILL_ATTEMPTS budget - mirrors ecDilutionIneffective's design.
     bool refillIneffective = false;
 
     bool highTemperature = false;
@@ -1008,8 +1010,8 @@ struct AlertState
     // without the reservoir's water level actually rising (see
     // SystemState::ecDilutionNoRiseStreak). Suggests the dilution water
     // source/pump/hose isn't delivering water even though the solenoid
-    // command is being sent. Never blocks or locks EC correction on its own -
-    // the existing EC correction budget/attempts logic is unaffected.
+    // command is being sent. Never blocks or locks EC correction - the
+    // existing EC correction budget/attempts logic is unaffected.
     bool ecDilutionIneffective = false;
 
     bool phOutOfRange = false;

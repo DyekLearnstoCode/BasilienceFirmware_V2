@@ -23,15 +23,15 @@ void FoggingEventQueue::begin()
     Serial.print(" pending event(s), bootId=");
     Serial.println(bootId);
 
-    // Reboot-recovery: the persisted "was the fogger last confirmed ON"
-    // flag survived across this reboot, but ActuatorManager::begin() (which
-    // already ran before this call - see setup()) always initializes every
-    // actuator, including FOGGER, to physically OFF. If the last thing this
-    // queue recorded was ON, that ON session never got a matching OFF -
-    // either from a clean shutdown or from ActuatorManager's own STOPPING
-    // path - so one is appended now. Boot/recovery time only, per the task:
-    // the exact physical stop time (somewhere between the crash/power-loss
-    // and this boot) is unknowable and must not be fabricated.
+    // Reboot-recovery: the persisted "was the fogger last confirmed ON" flag
+    // survived across this reboot, but ActuatorManager::begin() (already run
+    // before this call - see setup()) always initializes every actuator,
+    // including FOGGER, to physically OFF. If the last thing this queue
+    // recorded was ON, that ON session never got a matching OFF - either
+    // from a clean shutdown or ActuatorManager's own STOPPING path - so one
+    // is appended now. Boot/recovery time only: the exact physical stop time
+    // (somewhere between the crash/power-loss and this boot) is unknowable
+    // and must not be fabricated.
     if (lastRunning)
     {
         Serial.println("[FOGQ] Reboot recovery: last known state was ON - recording closeout OFF");

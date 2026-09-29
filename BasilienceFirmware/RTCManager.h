@@ -11,20 +11,18 @@
 // UTC):
 //
 //   getHour()/getMinute()/getSecond()/getYear()/getMonth()/getDay()
-//     = the DS3231's raw stored calendar fields, which this firmware's
-//       chosen convention defines as Asia/Manila LOCAL civil time
-//       (UTC+08:00, no DST). Grow-light scheduling and any other
-//       local-wall-clock consumer must use these.
+//     = the DS3231's raw stored calendar fields, which this firmware defines
+//       as Asia/Manila LOCAL civil time (UTC+08:00, no DST). Grow-light
+//       scheduling and any other local-wall-clock consumer must use these.
 //
 //   getEpochTime()
-//     = the TRUE absolute UTC Unix epoch for that same instant - i.e. the
+//     = the TRUE absolute UTC Unix epoch for that same instant - the
 //       DS3231's local reading corrected by the fixed -8h offset. Every
-//       consumer that stores or transmits a timestamp meant to represent
-//       "when this actually happened" (fogging/notification event history,
-//       harvest-due comparison against a Firestore-sourced UTC epoch,
-//       /status/rtc's epochUtc field) must use this, never unixtime() or
-//       the local field getters, or the stored time will read 8 hours in
-//       the future relative to the real instant.
+//       consumer that stores or transmits a timestamp meaning "when this
+//       actually happened" (fogging/notification event history, harvest-due
+//       comparison against a Firestore-sourced UTC epoch, /status/rtc's
+//       epochUtc field) must use this, never unixtime() or the local field
+//       getters, or the stored time will read 8 hours in the future.
 // ============================================================================
 class RTCManager
 {
@@ -61,9 +59,9 @@ public:
     // registers still hold their power-on-reset/uninitialized values (BCD
     // registers defaulting to 0 decode as month=0, day=0, year=2000 in
     // RTClib - OSF only flags a detected oscillator stop, not "never set").
-    // That is exactly what a real unit showed: connected=true,
-    // lostPower=false, calendar=2000-00-00. hasValidTime() now additionally
-    // requires the stored calendar to be semantically plausible - see
+    // A real unit showed exactly that: connected=true, lostPower=false,
+    // calendar=2000-00-00. hasValidTime() now additionally requires the
+    // stored calendar to be semantically plausible - see
     // hasPlausibleCalendarTime() below. No caller needs to reproduce these
     // checks itself; they all already just call hasValidTime().
     bool hasValidTime();
@@ -73,10 +71,9 @@ public:
     // failed (lostPower vs. an implausible calendar) - never call this
     // instead of hasValidTime() for control-flow decisions elsewhere.
     // Requires: year in [2025, 2100] (a Basilience-specific plausibility
-    // floor, not a generic calendar-math limit - rejects a chip's
-    // uninitialized/reset default the same way it would reject any other
-    // implausibly old value), month 1-12, day valid for that specific
-    // month/year (leap years handled), hour 0-23, minute/second 0-59.
+    // floor, rejecting a chip's uninitialized/reset default like any other
+    // implausibly old value), month 1-12, day valid for that month/year
+    // (leap years handled), hour 0-23, minute/second 0-59.
     bool hasPlausibleCalendarTime();
 
     // TRUE ABSOLUTE UTC Unix epoch seconds - see the class-level contract
@@ -116,13 +113,12 @@ private:
 
     // Non-blocking NTP polling state (critical verification report,
     // Priority 2). attemptNetworkTimeSync() used to call the ESP32 core's
-    // getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS), which internally loops
-    // on time()/delay(10) for up to NTP_SYNC_TIMEOUT_MS itself - i.e. it
-    // blocked the calling loop() iteration for that entire duration. These
-    // two fields let update() poll the exact same success condition
-    // (see pollNetworkTimeSync() in the .cpp) once per call instead, so the
-    // same bounded wait is spread across many fast loop() iterations rather
-    // than consumed inside one blocking call.
+    // getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS), which internally loops on
+    // time()/delay(10) for up to NTP_SYNC_TIMEOUT_MS itself - blocking the
+    // calling loop() iteration for that entire duration. These two fields
+    // let update() poll the same success condition (pollNetworkTimeSync() in
+    // the .cpp) once per call instead, spreading the bounded wait across
+    // many fast loop() iterations rather than one blocking call.
     bool ntpSyncInProgress = false;
     unsigned long ntpSyncStartedAt = 0;
 

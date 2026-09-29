@@ -17,11 +17,12 @@ public:
         MANUAL
     };
 
-    // Explicit STA connection state. Previously this was implied by a pair of
+    // Explicit STA connection state. Previously implied by a pair of
     // booleans, which made it possible to re-issue WiFi.begin()/WiFi.mode()
-    // while a previous association attempt was still in flight - the condition
-    // that produces "wifi:sta is connecting, cannot set config". With the state
-    // named, CONNECTING is a period during which the radio is only polled.
+    // while a previous association attempt was still in flight - the
+    // condition that produces "wifi:sta is connecting, cannot set config".
+    // With the state named, CONNECTING is a period during which the radio is
+    // only polled.
     enum class WifiState
     {
         IDLE,
@@ -90,9 +91,9 @@ private:
 
     // Starts a non-blocking attempt to join newly submitted /setup
     // credentials while Basilience-Setup stays up (WIFI_AP_STA), so a phone
-    // still connected to it can poll /status for the real outcome instead
-    // of only finding out once this device reconnects to Firebase on the
-    // new network. Called from the /setup handler in place of the previous
+    // still connected to it can poll /status for the real outcome instead of
+    // only finding out once this device reconnects to Firebase on the new
+    // network. Called from the /setup handler in place of the previous
     // ESP.restart().
     void beginManualReconnectAttempt(const String& newSsid, const String& newPassword);
 

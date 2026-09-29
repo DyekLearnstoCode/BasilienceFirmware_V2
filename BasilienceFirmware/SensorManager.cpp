@@ -19,7 +19,7 @@ SensorManager::SensorManager()
       // which never corrected for the ESP32 ADC's known nonlinearity) to
       // MILLIVOLTS (analogReadMilliVolts(), the SoC's own factory-calibrated
       // reading) - the same real-hardware fix phSampler below already has.
-      // Sample count/interval/median filtering are unchanged; only the
+      // Sample count/interval/median filtering unchanged; only the
       // per-sample read mode differs.
       ecSampler(
           EC_PIN,
@@ -41,6 +41,15 @@ void SensorManager::begin()
     dht.begin();
 
     waterSensor.begin();
+
+    // Runtime reliability fix (R2): request-only mode. requestTemperatures()
+    // now returns immediately after issuing the start-convert command
+    // instead of blocking this task for the device's conversion time
+    // (~750ms at the default 12-bit resolution used here) - see
+    // readWaterTemperature()'s own comment for the resulting two-phase
+    // acquisition. Resolution itself is unchanged (still the
+    // DallasTemperature default, 12-bit) - only the wait behavior differs.
+    waterSensor.setWaitForConversion(false);
 
     Serial.print("[DS18B20] GPIO: ");
     Serial.println(WATER_TEMP_PIN);
@@ -76,13 +85,14 @@ void SensorManager::begin()
     // SensorData's default waterLevel=0 is deliberately a valid real-world
     // reading (empty tank), unlike every other field here which defaults to
     // NaN - so it's the one field where "never sampled yet" and "genuinely
-    // measured empty" are otherwise indistinguishable. Before readWaterLevel()
-    // has ever completed a successful measurement (or reached its own
-    // confirmed-unavailable threshold), physicalSensors.waterLevel must not
-    // read as a plausible 0% to validWaterLevel()/isfinite() and unlock
-    // refill/fog/dosing/cooling on a placeholder. This does not touch what a
-    // REAL measured 0% means afterward - readWaterLevel()'s success path
-    // unconditionally overwrites this with the actual computed percentage.
+    // measured empty" are otherwise indistinguishable. Before
+    // readWaterLevel() has completed a successful measurement (or reached
+    // its own confirmed-unavailable threshold), physicalSensors.waterLevel
+    // must not read as a plausible 0% to validWaterLevel()/isfinite() and
+    // unlock refill/fog/dosing/cooling on a placeholder. This doesn't touch
+    // what a REAL measured 0% means afterward - readWaterLevel()'s success
+    // path unconditionally overwrites this with the actual computed
+    // percentage.
     physicalSensors.waterLevel = NAN;
 
     resolveLocalSensorSource();
@@ -90,15 +100,16 @@ void SensorManager::begin()
 
 // Decides the effective sensor source locally, at boot, without any network.
 //
-// Firebase used to be the only thing that could ever set sensorSourceResolved,
-// so a unit that cold-booted with no Wi-Fi held every effective reading at NaN
-// forever and local automation never engaged. The mock flag is now persisted
-// in NVS, which means the same integrity guarantee (a previously-enabled mock
-// session must not be silently replaced by physical readings after a reboot)
-// can be honoured from local storage instead of from the cloud.
+// Firebase used to be the only thing that could ever set
+// sensorSourceResolved, so a unit that cold-booted with no Wi-Fi held every
+// effective reading at NaN forever and local automation never engaged. The
+// mock flag is now persisted in NVS, so the same integrity guarantee (a
+// previously-enabled mock session must not be silently replaced by physical
+// readings after a reboot) can be honoured from local storage instead of
+// the cloud.
 //
 // PHYSICAL is the safe default: an unknown or never-written flag resolves to
-// real sensors, never to simulated ones.
+// real sensors, never simulated ones.
 void SensorManager::resolveLocalSensorSource()
 {
     bool mockEnabled = false;
@@ -119,10 +130,11 @@ void SensorManager::resolveLocalSensorSource()
 
     if (mockEnabled)
     {
-        // Mock readings are never persisted, so a mock session that survives a
-        // reboot starts with no values, and physical readings must never
-        // backfill mock mode. Rather than idle forever if the payload never
-        // arrives, arm a bounded wait that reverts to physical sensors.
+        // Mock readings are never persisted, so a mock session that
+        // survives a reboot starts with no values, and physical readings
+        // must never backfill mock mode. Rather than idle forever if the
+        // payload never arrives, arm a bounded wait that reverts to
+        // physical sensors.
         mockBootWaitingForPayload = true;
         mockBootWaitStartedAt = millis();
 
@@ -193,6 +205,12 @@ void SensorManager::updateMockBootWait()
 
 void SensorManager::notifyMockPayloadReceived()
 {
+    // Unconditional - this is the freshness heartbeat applyEffectiveSensors()
+    // relies on for the ENTIRE mock session, not just its first payload (M8
+    // fix). Must run before the early return below, which only concerns the
+    // separate one-time boot-wait confirmation.
+    lastMockPayloadAt = millis();
+
     if (!mockBootWaitingForPayload) return;
 
     mockBootWaitingForPayload = false;
@@ -205,10 +223,10 @@ void SensorManager::cancelMockBootWait()
 }
 
 // sensorState.ready refinement - see the declarations' own comment in
-// SensorManager.h. Read physicalSensors directly (not sensors/publishedSensors)
-// since physical sampling runs unconditionally every tick regardless of mock
-// mode, so a real hardware fault is still confirmed here even while mock data
-// is what's actually being published.
+// SensorManager.h. Read physicalSensors directly (not
+// sensors/publishedSensors) since physical sampling runs unconditionally
+// every tick regardless of mock mode, so a real hardware fault is still
+// confirmed here even while mock data is what's actually being published.
 bool SensorManager::isDhtStateKnown() const
 {
     return physicalSensors.dhtAvailable || dhtFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD;
@@ -232,13 +250,13 @@ bool SensorManager::isEcStateKnown() const
 // Feeds one new already-filtered pH/EC candidate (physicalSensors.ph/.ec)
 // into its sliding stability window, rate-limited to one sample roughly
 // every `intervalMs` (STABILITY_SAMPLE_INTERVAL_MS for EC,
-// PH_STABILITY_SAMPLE_INTERVAL_MS for pH - see either constant's own comment
-// for why - candidate values change every loop() tick but are heavily
-// autocorrelated faster than that). Once the window holds
-// STABILITY_SAMPLE_WINDOW samples, accepts a new window.lastStable/updates
-// window.currentlyStable only when they all agree within `tolerance`;
-// otherwise leaves lastStable in place (still what sensors.ph/ec serve) but
-// clears currentlyStable (what gates a NEW correction - see
+// PH_STABILITY_SAMPLE_INTERVAL_MS for pH - candidate values change every
+// loop() tick but are heavily autocorrelated faster than that). Once the
+// window holds STABILITY_SAMPLE_WINDOW samples, accepts a new
+// window.lastStable/updates window.currentlyStable only when they all agree
+// within `tolerance`; otherwise leaves lastStable in place (still what
+// sensors.ph/ec serve) but clears currentlyStable (what gates a NEW
+// correction - see
 // AutomationManager::canStartNewPHCorrection()/canStartNewECCorrection()).
 // Logs only on a genuine transition, never every sample.
 void SensorManager::updateStabilityWindow(StabilityWindow& window, float candidate, float tolerance, unsigned long intervalMs, const char* logTag, DebugCategory category, uint32_t& sampleVersion)
@@ -267,9 +285,9 @@ void SensorManager::updateStabilityWindow(StabilityWindow& window, float candida
     // falls back to lastAcceptedPhCandidate on a reconfirm tick - see
     // applyEffectiveSensors()'s own comment - or physicalSensors.ec, the
     // calibrated/temperature-compensated median). AlertManager's live
-    // telemetry (sensors.ph/sensors.ec) is completely unaffected by this -
-    // this only governs how often the alert layer's confirmation counters
-    // are allowed to advance.
+    // telemetry (sensors.ph/sensors.ec) is completely unaffected - this
+    // only governs how often the alert layer's confirmation counters are
+    // allowed to advance.
     sampleVersion++;
 
     window.samples[window.next] = candidate;
@@ -365,7 +383,7 @@ void SensorManager::updateStabilityWindow(StabilityWindow& window, float candida
 // physical stream (after mock mode, or the post-reconnect settle window)
 // requires a full fresh confirmation rather than evaluating stale
 // pre-interruption samples mixed with new ones. lastStable/hasStable are
-// also cleared: a reading from before the interruption is not something to
+// also cleared: a reading from before the interruption isn't something to
 // keep serving as "current" once physical sensing resumes - see
 // applyEffectiveSensors()'s call site for exactly when this fires.
 void SensorManager::resetStabilityWindow(StabilityWindow& window)
@@ -428,6 +446,21 @@ void SensorManager::updateDynamicMockSensors()
         : NAN;
 }
 
+// Effective-mock-source consistency fix: see the header's own comment on
+// lastLoggedEffectiveMockSource for why this needs its own 3-way edge
+// detection separate from lastEffectiveSourceWasMock. Deliberately rate-
+// limited to "on change only" (never a periodic reprint) - the existing
+// [MOCK] STALE/Active/Fresh-payload-resumed lines already cover periodic
+// status while a state persists; this one line is purely the transition
+// marker between MOCK/PHYSICAL/INVALID_TEST_HOLD.
+void SensorManager::logEffectiveSourceTransition(const char* label)
+{
+    if (lastLoggedEffectiveMockSource == label) return;
+    lastLoggedEffectiveMockSource = label;
+    Serial.print("[MOCK] Effective source: ");
+    Serial.println(label);
+}
+
 void SensorManager::applyEffectiveSensors()
 {
     // Evaluated before the source is selected below, so the tick that times
@@ -439,13 +472,13 @@ void SensorManager::applyEffectiveSensors()
     // false), so right after a reboot/brownout we don't yet know whether a
     // previously-enabled mock session should still own control. Until
     // FirebaseManager confirms the source at least once, hold every
-    // effective reading explicitly invalid instead of defaulting to physical
-    // - a plausible-looking physical reading at this point (e.g. an
-    // unsettled water level) must never trigger automation/alerts.
+    // effective reading explicitly invalid instead of defaulting to
+    // physical - a plausible-looking physical reading at this point (e.g.
+    // an unsettled water level) must never trigger automation/alerts.
     // Defensive only. resolveLocalSensorSource() resolves the source during
-    // begin(), before the first update(), so this no longer gates a cold boot
-    // on Firebase; it remains as a guard against any future path that clears
-    // the flag.
+    // begin(), before the first update(), so this no longer gates a cold
+    // boot on Firebase; it remains as a guard against any future path that
+    // clears the flag.
     if (!systemState.sensorSourceResolved)
     {
         sensors = SensorData();
@@ -459,26 +492,27 @@ void SensorManager::applyEffectiveSensors()
         return;
     }
 
-    // A persisted-MOCK boot has no mock readings of its own yet - mock values
-    // are never persisted, so systemState.mockSensors is still the plain
-    // default-constructed SensorData() at this point. That default is a
-    // legitimate "no data" placeholder everywhere except waterLevel, which
-    // defaults to 0 because 0 IS a valid real-sensor reading (empty tank -
-    // see SensorData's own comment). Left alone here, that placeholder 0
-    // reads as a genuine "tank empty" to every isfinite()-based safety check
-    // (validWaterLevel() et al.), which is exactly what let automatic REFILL
-    // fire the solenoid off boot-restored mock state before any payload had
-    // ever arrived. Hold every effective field explicitly invalid - same
-    // technique as the sensorSourceResolved guard above - until either a
-    // fresh, validated payload arrives (notifyMockPayloadReceived(), which
-    // FirebaseManager::readMockSensors() only calls after pH/EC and the rest
-    // have all parsed successfully) or updateMockBootWait() above reverts to
-    // PHYSICAL after its own timeout. Local safety shutdowns are untouched:
-    // they command actuators OFF unconditionally and never gate on `sensors`
-    // validity, so this only withholds permission to act, never the ability
-    // to stand down. RTC/cycle restoration and grow-light scheduling are
-    // unaffected too - grow light is driven purely by RTC time, not by any
-    // field in `sensors`.
+    // A persisted-MOCK boot has no mock readings of its own yet - mock
+    // values are never persisted, so systemState.mockSensors is still the
+    // plain default-constructed SensorData() at this point. That default is
+    // a legitimate "no data" placeholder everywhere except waterLevel,
+    // which defaults to 0 because 0 IS a valid real-sensor reading (empty
+    // tank - see SensorData's own comment). Left alone here, that
+    // placeholder 0 reads as a genuine "tank empty" to every
+    // isfinite()-based safety check (validWaterLevel() et al.), exactly
+    // what let automatic REFILL fire the solenoid off boot-restored mock
+    // state before any payload had ever arrived. Hold every effective field
+    // explicitly invalid - same technique as the sensorSourceResolved guard
+    // above - until either a fresh, validated payload arrives
+    // (notifyMockPayloadReceived(), which
+    // FirebaseManager::readMockSensors() only calls after pH/EC and the
+    // rest have all parsed successfully) or updateMockBootWait() above
+    // reverts to PHYSICAL after its own timeout. Local safety shutdowns are
+    // untouched: they command actuators OFF unconditionally and never gate
+    // on `sensors` validity, so this only withholds permission to act,
+    // never the ability to stand down. RTC/cycle restoration and
+    // grow-light scheduling are unaffected too - grow light is driven
+    // purely by RTC time, not by any field in `sensors`.
     if (systemState.mockSensorsEnabled && mockBootWaitingForPayload)
     {
         sensors = SensorData();
@@ -493,24 +527,124 @@ void SensorManager::applyEffectiveSensors()
     }
     mockBootWaitHeldLogged = false;
 
-    // Automation, alerts, safety, and Firebase publication all consume this one
-    // effective dataset. Physical sampling remains active in physicalSensors
-    // regardless of mock mode (Developer Sensor Test reads it directly), but
-    // it must never backfill a field the mock command left unset. Mock mode
-    // is meant to be a fully controlled simulated environment - a field the
-    // mock payload didn't include stays invalid (NaN) rather than silently
-    // reverting to a real, possibly noisy physical reading.
-    if (systemState.mockSensorsEnabled)
+    // --------------------------------------------------------
+    // MOCK PAYLOAD FRESHNESS  (M8 fix)
+    // --------------------------------------------------------
+    //
+    // mockBootWaitingForPayload/MOCK_BOOT_PAYLOAD_TIMEOUT above only guard
+    // the FIRST payload after a boot-restored mock session -
+    // notifyMockPayloadReceived() clears that flag the instant it fires
+    // once, and neither is ever re-armed for the rest of the session.
+    // Before this fix, nothing re-checked freshness after that: enable
+    // mock, receive a payload, then lose Wi-Fi mid-session, and
+    // systemState.mockSensors (static mode) or mockSensorBases (dynamic
+    // mode's local random walk continues from a frozen base - see
+    // updateDynamicMockSensors()) stayed exactly as they were the instant
+    // connectivity dropped, with this function copying that into `sensors`
+    // unconditionally on every tick and automation
+    // (canStartNewPHCorrection()/canStartNewECCorrection(), refill
+    // diagnostics, the STARTUP sensorsReady bypass in
+    // AutomationManager.cpp) continuing to trust it indefinitely -
+    // confirmed by lastMockPayloadAt never being consulted anywhere before
+    // this block existed.
+    //
+    // mockDataFresh is deliberately LOCAL, non-persisted state - it never
+    // touches systemState.mockSensorsEnabled, NVS, or the
+    // devCommandsCleared/F2 reconnect-revalidation gate readMockSensors()
+    // already applies to enabling mock in the first place. A stale
+    // fallback here is purely "don't trust this tick's mock data"; the
+    // moment a fresh payload is confirmed again (still requires the
+    // existing F2 clear on reconnect, unchanged), this reverts
+    // automatically.
+    const bool mockDataFresh = systemState.mockSensorsEnabled &&
+        (millis() - lastMockPayloadAt < MOCK_PAYLOAD_STALE_TIMEOUT_MS);
+
+    if (systemState.mockSensorsEnabled && !mockDataFresh)
+    {
+        if (systemState.automationTestSubsystem != AutomationTestSubsystem::NONE)
+        {
+            // Isolated Automation Test Mode: silently falling back to
+            // physical readings here could drive the ONE isolated
+            // controller under test with real hardware the developer never
+            // intended it to react to. Hold instead - same "explicitly
+            // invalid" technique as the sensorSourceResolved/
+            // mockBootWaitingForPayload guards above, so every
+            // isfinite()-gated automation check already in
+            // AutomationManager naturally stands down with no changes
+            // needed there. Its own dedicated periodic line (not the
+            // generic age= one below) is the only diagnostic while held,
+            // since age alone doesn't tell the developer their isolated
+            // test is paused.
+            if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
+            {
+                lastMockStatusLogAt = millis();
+                Serial.println("[MOCK] STALE | test automation held");
+            }
+            mockStaleLogged = true;
+
+            sensors = SensorData();
+            sensors.waterLevel = NAN;
+            lastEffectiveSourceWasMock = false;
+            logEffectiveSourceTransition("INVALID_TEST_HOLD");
+            return;
+        }
+
+        if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
+        {
+            lastMockStatusLogAt = millis();
+            Serial.print("[MOCK] STALE | age=");
+            Serial.print((millis() - lastMockPayloadAt) / 1000);
+            Serial.println("s");
+        }
+
+        if (!mockStaleLogged)
+        {
+            Serial.println("[MOCK] Falling back to physical sensors");
+            mockStaleLogged = true;
+        }
+        // Falls through to the PHYSICAL branch below - mockSensorsEnabled
+        // stays true throughout (see this block's own comment); mockDataFresh
+        // being false is what actually routes execution there.
+    }
+    else if (mockStaleLogged)
+    {
+        Serial.println("[MOCK] Fresh payload resumed");
+        mockStaleLogged = false;
+    }
+
+    // Automation, alerts, safety, and Firebase publication all consume this
+    // one effective dataset. Physical sampling remains active in
+    // physicalSensors regardless of mock mode (Developer Sensor Test reads
+    // it directly), but it must never backfill a field the mock command
+    // left unset. Mock mode is meant to be a fully controlled simulated
+    // environment - a field the mock payload didn't include stays invalid
+    // (NaN) rather than silently reverting to a real, possibly noisy
+    // physical reading.
+    if (mockDataFresh)
     {
         // Mirrors the mock->physical transition reset below: a stability
         // window carrying samples accumulated while sourcing PHYSICAL data
         // must not keep blending those in once mock becomes authoritative,
         // for the same reason (a candidate from the old source is not
-        // trusted evidence about the new one).
-        if (!lastReportedMockSource)
+        // trusted evidence about the new one). Keyed on the EFFECTIVE
+        // source (lastEffectiveSourceWasMock), not the raw enabled flag, so
+        // a staleness fallback and recovery is treated as a real
+        // transition too, exactly like an intentional mock disable/enable
+        // would be.
+        if (!lastEffectiveSourceWasMock)
         {
             resetStabilityWindow(phStabilityWindow);
             resetStabilityWindow(ecStabilityWindow);
+        }
+        lastEffectiveSourceWasMock = true;
+        logEffectiveSourceTransition("MOCK");
+
+        if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
+        {
+            lastMockStatusLogAt = millis();
+            Serial.print("[MOCK] Active | payload age=");
+            Serial.print((millis() - lastMockPayloadAt) / 1000);
+            Serial.println("s");
         }
 
         updateDynamicMockSensors();
@@ -518,22 +652,22 @@ void SensorManager::applyEffectiveSensors()
         sensors.tds = isnan(sensors.ec) ? NAN : sensors.ec * 500.0f;
         // Mock is a fully controlled dataset - a field the payload didn't
         // set stays NaN (same rule as every other mock field, see this
-        // block's own comment below), and there is no "stale" concept for a
-        // value the developer is directly supplying: it is either present
+        // block's own comment below), and there's no "stale" concept for a
+        // value the developer is directly supplying: it's either present
         // (available) or absent (unavailable), never a held-over reading.
         sensors.dhtAvailable = isfinite(sensors.temperature) && isfinite(sensors.humidity);
         sensors.dhtStale = false;
         // Same reasoning for the refill threshold confirmation (resilience
         // pass follow-up): mock is a fully controlled value, not a real
-        // HC-SR04 stream to reacquire/confirm against, so it is trusted
+        // HC-SR04 stream to reacquire/confirm against, so it's trusted
         // directly rather than waiting on 3 mock ticks.
         sensors.refillStartConfirmed = isfinite(sensors.waterLevelCm) &&
             sensors.waterLevelCm <= systemState.refillStartLevelCm;
         sensors.refillStopConfirmed = isfinite(sensors.waterLevelCm) &&
             sensors.waterLevelCm >= systemState.refillStopLevelCm;
         // Same reasoning for phConfirming (quick-response refinement task) -
-        // a mock pH value is never mid-confirmation, it is simply present
-        // or absent (NaN), same as every other mock field.
+        // a mock pH value is never mid-confirmation, it's simply present or
+        // absent (NaN), same as every other mock field.
         sensors.phConfirming = false;
         // pH/EC hardware-fault detection only ever inspects the REAL analog
         // signal (readPH()/readEC() keep sampling physical hardware in the
@@ -555,15 +689,16 @@ void SensorManager::applyEffectiveSensors()
         // incremented on the physical-sensor path (the else branch below,
         // via updateStabilityWindow()). While mock is enabled that branch
         // never runs, so the version numbers froze - AlertManager's
-        // newObservation() then always returned false, abnormalPendingCount/
-        // recoveryPendingCount could never advance, and phLow/phHigh/ecLow/
-        // ecHigh could get stuck in whatever state they were in when mock
-        // was turned on, regardless of how far the mock value moved back
-        // into range. Feeding the effective mock reading through the same
-        // stability windows here keeps both AlertManager's recovery
-        // confirmation AND isPhCurrentlyStable()/isEcCurrentlyStable()
-        // (automation trust) working the same way mock does for every
-        // other field - a fully controlled dataset, not a frozen one.
+        // newObservation() then always returned false,
+        // abnormalPendingCount/recoveryPendingCount could never advance,
+        // and phLow/phHigh/ecLow/ecHigh could get stuck in whatever state
+        // they were in when mock was turned on, regardless of how far the
+        // mock value moved back into range. Feeding the effective mock
+        // reading through the same stability windows here keeps both
+        // AlertManager's recovery confirmation AND
+        // isPhCurrentlyStable()/isEcCurrentlyStable() (automation trust)
+        // working the same way mock does for every other field - a fully
+        // controlled dataset, not a frozen one.
         updateStabilityWindow(phStabilityWindow, sensors.ph, PH_STABILITY_TOLERANCE,
             PH_STABILITY_SAMPLE_INTERVAL_MS, "[PH-STABLE]", DebugCategory::PH, phSampleVersion);
         updateStabilityWindow(ecStabilityWindow, sensors.ec, EC_STABILITY_TOLERANCE,
@@ -581,17 +716,25 @@ void SensorManager::applyEffectiveSensors()
     }
     else
     {
-        // The cloud/local switch away from mock happens between one tick's
-        // applyEffectiveSensors() call and the next - lastReportedMockSource
-        // still holds last tick's value here, so this fires exactly once on
-        // the transition, before it's overwritten below.
-        if (lastReportedMockSource)
+        // The switch away from EFFECTIVELY using mock (an intentional
+        // disable, OR a staleness fallback - see MOCK PAYLOAD FRESHNESS
+        // above) happens between one tick's applyEffectiveSensors() call
+        // and the next - lastEffectiveSourceWasMock still holds last
+        // tick's value here, so this fires exactly once on the transition,
+        // before it's overwritten below. Deliberately NOT
+        // lastReportedMockSource, which tracks the raw enabled/disabled
+        // flag and doesn't change during a staleness fallback
+        // (mockSensorsEnabled stays true) - using it here would re-fire
+        // this reset every single tick for as long as the fallback
+        // persists instead of once on the real transition.
+        if (lastEffectiveSourceWasMock)
         {
             physicalPhEcSettledAt = millis();
 
-            // A stability window accepted while sourcing mock/pre-interruption
-            // data must not be trusted as "current" the instant physical
-            // sensing resumes - see resetStabilityWindow()'s own comment.
+            // A stability window accepted while sourcing mock/pre-
+            // interruption data must not be trusted as "current" the
+            // instant physical sensing resumes - see
+            // resetStabilityWindow()'s own comment.
             resetStabilityWindow(phStabilityWindow);
             resetStabilityWindow(ecStabilityWindow);
 
@@ -615,16 +758,19 @@ void SensorManager::applyEffectiveSensors()
             // treating an old physical-source snapshot as still current.
             systemState.sensorSnapshotBaselineAt = millis();
         }
+        lastEffectiveSourceWasMock = false;
+        logEffectiveSourceTransition("PHYSICAL");
 
         sensors = physicalSensors;
 
         // pH/EC probes need time to electrically settle after physical
-        // sensors (re)become the active source - see PH_EC_ANALOG_SETTLE_TIME.
-        // Held NaN rather than published: a real-looking but still-drifting
-        // reading here would otherwise trip alerts and trigger dosing against
-        // a value the probe hasn't finished producing yet. The stability
-        // windows are deliberately not fed during this window either -
-        // electrically-unsettled candidates are not worth accumulating.
+        // sensors (re)become the active source - see
+        // PH_EC_ANALOG_SETTLE_TIME. Held NaN rather than published: a
+        // real-looking but still-drifting reading here would otherwise
+        // trip alerts and trigger dosing against a value the probe hasn't
+        // finished producing yet. The stability windows are deliberately
+        // not fed during this window either - electrically-unsettled
+        // candidates aren't worth accumulating.
         if (millis() - physicalPhEcSettledAt < PH_EC_ANALOG_SETTLE_TIME)
         {
             sensors.ph = NAN;
@@ -651,29 +797,29 @@ void SensorManager::applyEffectiveSensors()
             // gated on the separate phStabilityWindow/ecStabilityWindow
             // below - that window is AUTOMATION-TRUST only (see
             // isPhCurrentlyStable()/isEcCurrentlyStable(),
-            // canStartNewPHCorrection()/canStartNewECCorrection()). This is
-            // still the one dataset AutomationManager/AlertManager/
-            // SafetyManager/Firebase publication all read for the CURRENT
-            // reading; automation additionally and independently consults
-            // the stability window before acting on it.
+            // canStartNewPHCorrection()/canStartNewECCorrection()). Still
+            // the one dataset AutomationManager/AlertManager/SafetyManager/
+            // Firebase publication all read for the CURRENT reading;
+            // automation additionally and independently consults the
+            // stability window before acting on it.
             //
             // A stale accepted value (no new confirmation within
             // PH_EC_STABLE_TIMEOUT_MS) is not kept forever - it reverts to
             // NaN, which the existing validPH()/validEC() SENSOR_FAULT path
             // (SafetyManager.cpp) already treats exactly like any other
-            // invalid reading: abort/lock any in-progress correction, block a
-            // new one from starting. hasStable/lastStable themselves are left
-            // untouched by staleness (diagnostic history only), so this is a
-            // read-time check, not a mutation.
+            // invalid reading: abort/lock any in-progress correction, block
+            // a new one from starting. hasStable/lastStable themselves are
+            // left untouched by staleness (diagnostic history only), so
+            // this is a read-time check, not a mutation.
             // pH validity/stability hardening: updateStabilityWindow() itself
             // only ever rejects a non-finite candidate (isfinite() check) -
-            // it has no notion of what range is physically meaningful for
-            // the sensor it's filtering, since it's shared with EC (a
-            // different domain entirely, deliberately untouched here). A
-            // physical pH candidate that is finite but outside 0.0-14.0
-            // (e.g. from a probe reading near 0V/floating below its normal
-            // operating range) would otherwise still be accepted into the
-            // window and could become lastStable if it held steady for
+            // no notion of what range is physically meaningful for the
+            // sensor it's filtering, since it's shared with EC (a different
+            // domain entirely, deliberately untouched here). A physical pH
+            // candidate that is finite but outside 0.0-14.0 (e.g. from a
+            // probe reading near 0V/floating below its normal operating
+            // range) would otherwise still be accepted into the window and
+            // could become lastStable if it held steady for
             // STABILITY_SAMPLE_WINDOW samples - the confirmed root cause of
             // an observed lastStable=24.158. Rejected here (substituted with
             // NaN, which the window already correctly ignores) rather than
@@ -697,8 +843,7 @@ void SensorManager::applyEffectiveSensors()
             // PH_STABILITY_SAMPLE_INTERVAL_MS - that slower cadence is now
             // only the window's own), so a "3 consecutive candidates"
             // streak means 3 genuinely distinct ~300ms-apart observations,
-            // not 3 re-evaluations of one unchanged median within
-            // milliseconds.
+            // not 3 re-evaluations of one unchanged median within ms.
             const unsigned long nowForPhStep = millis();
             const bool phStepDue = lastPhStepEvalAt == 0 ||
                 nowForPhStep - lastPhStepEvalAt >= PH_STEP_SAMPLE_INTERVAL_MS;
@@ -778,7 +923,7 @@ void SensorManager::applyEffectiveSensors()
                         // with a stable ~3.98 candidatePH for 3+ minutes
                         // while sensors.ph stayed NaN the whole time. This
                         // still only updates the timestamp, never the
-                        // anchor's value, so it does not reintroduce the
+                        // anchor's value, so it doesn't reintroduce the
                         // ratcheting drift the comment above describes.
                         lastAcceptedPhCandidateAt = nowForPhStep;
                     }
@@ -841,11 +986,8 @@ void SensorManager::applyEffectiveSensors()
                 // fine the whole time. Falls back to re-offering the
                 // current trusted anchor on every phStepDue tick so the
                 // window keeps receiving live evidence the reading is
-                // still good, matching the class comment's stated intent
-                // ("that window is otherwise completely untouched and
-                // still independently decides whether the trusted stream
-                // itself is stable"). Same root cause as the telemetry-side
-                // fix above.
+                // still good, matching the class comment's stated intent.
+                // Same root cause as the telemetry-side fix above.
                 if (isnan(phCandidateForWindow) && !isnan(lastAcceptedPhCandidate))
                 {
                     phCandidateForWindow = lastAcceptedPhCandidate;
@@ -886,7 +1028,7 @@ void SensorManager::applyEffectiveSensors()
             // the entry-point range guard above, phStabilityWindow.lastStable
             // still gates AUTOMATION TRUST (isPhCurrentlyStable() ->
             // canStartNewPHCorrection()) via hasStable/currentlyStable - if
-            // it is ever found outside the physically valid 0.0-14.0 pH
+            // it's ever found outside the physically valid 0.0-14.0 pH
             // domain (should no longer be reachable via the entry guard, but
             // never trusted implicitly), the stability state is
             // invalidated/reset rather than exposed, same as a genuinely
@@ -935,14 +1077,14 @@ void SensorManager::applyEffectiveSensors()
             // first baseline (see lastAcceptedPhCandidate's own comment),
             // and held at the LAST trusted value (not the new unconfirmed
             // one, not NaN) for the entire duration a jump is pending - see
-            // phCandidateForWindow above, which is only ever set to a NEW
-            // value once the filter itself accepts one. Its own freshness
-            // clock (lastAcceptedPhCandidateAt) reuses the same
+            // phCandidateForWindow above, only ever set to a NEW value once
+            // the filter itself accepts one. Its own freshness clock
+            // (lastAcceptedPhCandidateAt) reuses the same
             // PH_EC_STABLE_TIMEOUT_MS bound the window uses, so a telemetry
             // value that stops reconfirming for that long still reverts to
             // NaN rather than displaying an arbitrarily old reading as
-            // current - the same safety property the window's own staleness
-            // check already provided.
+            // current - the same safety property the window's own
+            // staleness check already provided.
             const bool phTelemetryStale = !isnan(lastAcceptedPhCandidate) &&
                 (now - lastAcceptedPhCandidateAt > PH_EC_STABLE_TIMEOUT_MS);
             if (phTelemetryStale && !phTelemetryStaleLogged)
@@ -973,22 +1115,22 @@ void SensorManager::applyEffectiveSensors()
             // comment), matching sensors.ph's existing pattern above. EC has
             // no separate step-filter/fast-telemetry candidate the way pH
             // does (no equivalent noise-jump confirmation stage exists for
-            // EC in this firmware), so physicalSensors.ec - already
-            // calibrated and median-filtered, never raw ADC - is the
-            // correct SensorManager-owned layer to use directly. Previously
-            // this read ecStabilityWindow.lastStable, which meant Firebase/
+            // EC), so physicalSensors.ec - already calibrated and
+            // median-filtered, never raw ADC - is the correct
+            // SensorManager-owned layer to use directly. Previously this
+            // read ecStabilityWindow.lastStable, which meant Firebase/
             // Android only ever saw a new EC value once every ~10s
             // (STABILITY_SAMPLE_WINDOW * STABILITY_SAMPLE_INTERVAL_MS), the
-            // same cadence automation itself uses to decide stability - the
-            // two concerns were not actually separated. ecStabilityWindow
-            // below is now automation-trust only (isEcCurrentlyStable()/
+            // same cadence automation uses to decide stability - the two
+            // concerns weren't actually separated. ecStabilityWindow below
+            // is now automation-trust only (isEcCurrentlyStable()/
             // canStartNewECCorrection()), exactly mirroring phStabilityWindow.
             // ecFault is handled by the existing override a few lines below
             // (mirrors how phFault is handled for sensors.ph, not checked
             // inline here either). Still gated on !ecStale (computed above
             // from ecStabilityWindow.lastStableAt, PH_EC_STABLE_TIMEOUT_MS =
-            // 180s) - that is a genuinely-dead/disconnected-probe detector,
-            // not the ~12s automation stability cadence: a probe that keeps
+            // 180s) - a genuinely-dead/disconnected-probe detector, not the
+            // ~12s automation stability cadence: a probe that keeps
             // producing plausible-but-never-stable readings (e.g. mid
             // correction) won't trip it, but one that stops corroborating
             // for a full 3 minutes will, same as phTelemetryStale does for
@@ -1001,8 +1143,8 @@ void SensorManager::applyEffectiveSensors()
             // handled by the override below) is unchanged and still,
             // separately, controls the PERSISTENT fault flag; this check
             // only ever stops a single bad reading from reaching EC Low,
-            // automation, or Firebase before the streak has had a chance to
-            // confirm anything.
+            // automation, or Firebase before the streak has had a chance
+            // to confirm anything.
             sensors.ec = (isfinite(physicalSensors.ec) && !ecStale && !ecImplausibleThisSample) ? physicalSensors.ec : NAN;
             // TDS is unaffected by pH/EC stability gating - it already has no
             // water-temperature dependency (kept from the prior pass) and is
@@ -1012,22 +1154,22 @@ void SensorManager::applyEffectiveSensors()
             // pH/EC hardware-fault override (Config.h's PH_FAULT_*/EC_FAULT_*
             // - see readPH()/readEC()'s own comments for how
             // physicalSensors.phFault/ecFault get set). Applied AFTER the
-            // stability-window logic above so a confirmed fault always wins,
-            // even if the window happened to be reporting a (now
+            // stability-window logic above so a confirmed fault always
+            // wins, even if the window happened to be reporting a (now
             // untrustworthy) stable value the instant the fault confirmed.
             // Forcing NaN here is what makes every EXISTING NaN-based
             // consumer (SafetyManager's validPH()/validEC(), AlertManager's
-            // sensorFault) correctly treat a confirmed fault as invalid with
-            // zero changes to that logic - the fault flag is the single
-            // source of truth, sensors.ph/ec merely reflect it. Also resets
-            // the step filter/stability window so recovery cannot simply
-            // resume from a value trusted before the fault - it must fully
-            // re-earn a fresh baseline AND fresh stability once the fault
-            // itself clears (PH_FAULT_RECOVERY_COUNT), matching the required
-            // recovery sequence: electrical signal plausible -> fault
-            // recovery confirmed -> normal stability criteria satisfied ->
-            // automation eligible again. Idempotent - safe to run every tick
-            // for as long as the fault persists.
+            // sensorFault) correctly treat a confirmed fault as invalid
+            // with zero changes to that logic - the fault flag is the
+            // single source of truth, sensors.ph/ec merely reflect it.
+            // Also resets the step filter/stability window so recovery
+            // cannot simply resume from a value trusted before the fault -
+            // it must fully re-earn a fresh baseline AND fresh stability
+            // once the fault itself clears (PH_FAULT_RECOVERY_COUNT),
+            // matching the required recovery sequence: electrical signal
+            // plausible -> fault recovery confirmed -> normal stability
+            // criteria satisfied -> automation eligible again. Idempotent -
+            // safe to run every tick for as long as the fault persists.
             if (physicalSensors.phFault)
             {
                 sensors.ph = NAN;
@@ -1048,8 +1190,8 @@ void SensorManager::applyEffectiveSensors()
             // OR'd together here (and in the published sensors.ecFault
             // below) rather than kept as two separately-published flags, so
             // every existing ecFault consumer (AlertManager, SafetyManager's
-            // validEC(), Firebase/Android) already treats either one exactly
-            // like a hardware fault with no separate wiring.
+            // validEC(), Firebase/Android) already treats either one
+            // exactly like a hardware fault with no separate wiring.
             if (physicalSensors.ecFault || physicalSensors.ecCalibrationFault)
             {
                 sensors.ec = NAN;
@@ -1134,10 +1276,10 @@ void SensorManager::readDHT()
     // hardware) still counted as a good read and was fed straight into
     // dhtTemperatureFiltered/dhtHumidityFiltered below, producing exactly
     // the decaying-toward-reality EMA pattern (80 -> 64 -> 52 -> 44...)
-    // reported from the bench. Paired acquisition (see this task's own
-    // "Important Pair Semantics"): temperature and humidity are one DHT22
-    // reading, so either channel out of range invalidates the whole cycle,
-    // exactly like the isnan()-only check already treated them as one unit.
+    // reported from the bench. Paired acquisition: temperature and humidity
+    // are one DHT22 reading, so either channel out of range invalidates the
+    // whole cycle, exactly like the isnan()-only check already treated
+    // them as one unit.
     const bool temperatureFinite = isfinite(temperature);
     const bool humidityFinite = isfinite(humidity);
     const bool temperatureInRange = temperatureFinite &&
@@ -1151,12 +1293,18 @@ void SensorManager::readDHT()
     // everywhere else - see DebugManager::shouldPrintDebug()'s own comment.
     // Purely a print gate; every failure/recovery streak and physicalSensors
     // update below is unconditional. Also suppressed outright while mock
-    // sensors are driving automation - the physical DHT's own raw readings
-    // (or lack of them) aren't relevant to what's actually being tested then,
-    // and this is exactly the noise a full mock-driven automation test wants
-    // filtered out.
+    // sensors are EFFECTIVELY driving automation - the physical DHT's raw
+    // readings (or lack of them) aren't relevant to what's actually being
+    // tested then. Effective-mock-source consistency fix: was the raw
+    // systemState.mockSensorsEnabled flag, which stays true through a
+    // stale-mock fallback to physical - during that fallback the physical
+    // DHT readings ARE what's actually driving automation again, so
+    // suppressing their diagnostics then would hide exactly the signal a
+    // physical-sensor data-gathering session needs.
+    // isUsingEffectiveMockSensors() correctly turns this back on the
+    // instant the fallback happens.
     const bool dbgDht = debugManager.shouldPrintDebug(DebugCategory::DHT)
-        && !systemState.mockSensorsEnabled;
+        && !isUsingEffectiveMockSensors();
 
     // [DHT-RAW] diagnostic: an invalid sample is always printed immediately
     // (already naturally rate-limited to once per DHT_READ_INTERVAL_MS, and
@@ -1224,7 +1372,7 @@ void SensorManager::readDHT()
                 // reading needlessly threw away display continuity and (via
                 // canFog()/canopy) blocked unrelated automation. The reading
                 // is held at its last accepted value; dhtAvailable/dhtStale
-                // are the explicit signal that it is no longer fresh -
+                // are the explicit signal it's no longer fresh -
                 // isfinite(temperature) alone no longer means "current".
                 physicalSensors.dhtAvailable = false;
                 physicalSensors.dhtStale = isfinite(physicalSensors.temperature);
@@ -1328,52 +1476,111 @@ void SensorManager::readDHT()
 
 void SensorManager::readWaterTemperature()
 {
-    // The DS18B20 conversion is a blocking OneWire transaction; running it
-    // every loop iteration both stalls loop() and increases how often it can
-    // collide with other blocking work (e.g. Firebase calls). Not due yet
-    // simply means physicalSensors.waterTemp keeps its last value - it must
-    // never be invalidated merely because a new read isn't scheduled.
-    if (millis() - lastWaterTempReadTime < WATER_TEMP_READ_INTERVAL_MS)
+    // Runtime reliability fix (R2): this function is now entered in one of
+    // two phases, never blocking either way.
+    //
+    // Phase 2 (finish): a conversion is already in flight
+    // (waterTempConversionPending) - check whether the device's own
+    // conversion time has elapsed yet. If not, do nothing this tick;
+    // physicalSensors.waterTemp keeps its last accepted value exactly as it
+    // already did for "not due yet" below. If it has, fall through to the
+    // unchanged read/validate/accept logic further down.
+    //
+    // Phase 1 (start): no conversion in flight - throttle starting a new
+    // one to WATER_TEMP_READ_INTERVAL_MS, exactly as the old single-phase
+    // version throttled its one blocking read. requestTemperatures() now
+    // returns immediately (see begin()'s setWaitForConversion(false)), so
+    // this phase never waits - it only issues the request and returns,
+    // deferring the actual read to a later tick's Phase 2. The one
+    // exception is "no device enumerated": there's nothing to convert, so
+    // that case falls straight through to the existing invalid-handling
+    // block in the same tick, exactly as before.
+    if (waterTempConversionPending)
     {
-        return;
-    }
-    lastWaterTempReadTime = millis();
-
-    // Serial Monitor Focus Mode: DS18B20/water-temperature diagnostics are
-    // the COOLING controller's own sensor input - see
-    // DebugManager::shouldPrintDebug()'s own comment. Purely a print gate;
-    // every failure/recovery streak and physicalSensors update below is
-    // unconditional. Also suppressed outright while mock sensors are
-    // driving automation, same reasoning as dbgDht above - the actual
-    // COOLING-INPUT/TEMP automation decision logs elsewhere are unaffected,
-    // only this raw-hardware diagnostic is filtered.
-    const bool dbgCooling = debugManager.shouldPrintDebug(DebugCategory::COOLING)
-        && !systemState.mockSensorsEnabled;
-
-    if (waterSensorDeviceCount == 0)
-    {
-        // Re-enumerate on the same throttled cadence as the read itself - no
-        // new timer, no delay(). Recovers automatically if the probe wasn't
-        // settled/responding yet at begin() (e.g. long cable run, power-up
-        // settling) and starts answering later.
-        waterSensor.begin();
-        waterSensorDeviceCount = waterSensor.getDeviceCount();
-
-        if (waterSensorDeviceCount > 0)
+        if (millis() - waterTempConversionStartedAt < waterTempConversionWaitMs)
         {
-            if (dbgCooling)
+            // Conversion still in progress - let the rest of loop() run.
+            return;
+        }
+        waterTempConversionPending = false;
+        // Falls through below to read and validate the now-ready scratchpad.
+    }
+    else
+    {
+        // Not due yet simply means physicalSensors.waterTemp keeps its last
+        // value - it must never be invalidated merely because a new read
+        // isn't scheduled.
+        if (millis() - lastWaterTempReadTime < WATER_TEMP_READ_INTERVAL_MS)
+        {
+            return;
+        }
+        lastWaterTempReadTime = millis();
+
+        // Serial Monitor Focus Mode: DS18B20/water-temperature diagnostics
+        // are the COOLING controller's own sensor input - see
+        // DebugManager::shouldPrintDebug()'s own comment. Purely a print
+        // gate; every failure/recovery streak and physicalSensors update
+        // below is unconditional. Also suppressed outright while mock
+        // sensors are EFFECTIVELY driving automation, same reasoning as
+        // dbgDht above - the actual COOLING-INPUT/TEMP automation decision
+        // logs elsewhere are unaffected, only this raw-hardware diagnostic
+        // is filtered.
+        const bool dbgCoolingStart = debugManager.shouldPrintDebug(DebugCategory::COOLING)
+            && !isUsingEffectiveMockSensors();
+
+        if (waterSensorDeviceCount == 0)
+        {
+            // Re-enumerate on the same throttled cadence as the read itself -
+            // no new timer, no delay(). Recovers automatically if the probe
+            // wasn't settled/responding yet at begin() (e.g. long cable run,
+            // power-up settling) and starts answering later.
+            waterSensor.begin();
+            waterSensorDeviceCount = waterSensor.getDeviceCount();
+
+            if (waterSensorDeviceCount > 0)
             {
-                Serial.print("[DS18B20] Device found on retry - count: ");
-                Serial.println(waterSensorDeviceCount);
+                if (dbgCoolingStart)
+                {
+                    Serial.print("[DS18B20] Device found on retry - count: ");
+                    Serial.println(waterSensorDeviceCount);
+                }
+                waterSensorAddressValid = waterSensor.getAddress(waterSensorAddress, 0);
             }
-            waterSensorAddressValid = waterSensor.getAddress(waterSensorAddress, 0);
+        }
+
+        if (waterSensorDeviceCount == 0)
+        {
+            // Nothing to convert - fall straight through to the existing
+            // invalid-handling block below with temp left at NAN, exactly
+            // like the previous single-phase behavior for this case.
+        }
+        else
+        {
+            // Fire-and-forget: returns immediately (setWaitForConversion(false)
+            // in begin()). No repeated conversion request while one is
+            // pending - this call site is only reached from the
+            // !waterTempConversionPending branch above.
+            waterSensor.requestTemperatures();
+            waterTempConversionPending = true;
+            waterTempConversionStartedAt = millis();
+            waterTempConversionWaitMs = waterSensor.millisToWaitForConversion();
+            return;
         }
     }
+
+    // Serial Monitor Focus Mode - recomputed here since Phase 2 (finishing a
+    // pending conversion) can run on a different tick than Phase 1 (which
+    // logged the enumeration-retry branch above, if any); same gate, same
+    // reasoning, just evaluated fresh for this tick's raw-value/failure
+    // log. Effective-mock-source consistency fix: was the raw flag - see
+    // dbgDht's own comment for why this must be the effective source
+    // instead.
+    const bool dbgCooling = debugManager.shouldPrintDebug(DebugCategory::COOLING)
+        && !isUsingEffectiveMockSensors();
 
     float temp = NAN;
     if (waterSensorDeviceCount > 0)
     {
-        waterSensor.requestTemperatures();
         temp = waterSensorAddressValid
             ? waterSensor.getTempC(waterSensorAddress)
             : waterSensor.getTempCByIndex(0);
@@ -1438,6 +1645,11 @@ void SensorManager::readWaterTemperature()
                 {
                     Serial.println("[DS18B20] confirmed unavailable");
                 }
+                if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                {
+                    debugManager.printLogPrefix("SENS");
+                    Serial.println("WaterTemp INVALID");
+                }
                 physicalSensors.waterTemp = NAN;
                 // Reset (not blended) so a later recovery starts fresh
                 // rather than smoothing its first accepted reading against
@@ -1452,6 +1664,13 @@ void SensorManager::readWaterTemperature()
         return;
     }
 
+    if (waterTempFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD && debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+    {
+        debugManager.printLogPrefix("SENS");
+        Serial.print("WaterTemp RECOVERED | ");
+        Serial.print(temp, 1);
+        Serial.println("C");
+    }
     if (waterTempFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD && dbgCooling)
     {
         Serial.print("[DS18B20] recovered: ");
@@ -1487,8 +1706,8 @@ void SensorManager::readWaterLevel()
     // while the fogger is on and hold the last accepted values - the
     // interval timer is deliberately not advanced here either, so the very
     // first tick after the fogger turns off takes a fresh reading
-    // immediately rather than waiting out the rest of WATER_LEVEL_READ_
-    // INTERVAL_MS.
+    // immediately rather than waiting out the rest of
+    // WATER_LEVEL_READ_INTERVAL_MS.
     if (actuatorManager.isOn(FOGGER))
     {
         physicalSensors.waterLevelHeldForFogger = true;
@@ -1538,6 +1757,11 @@ void SensorManager::readWaterLevel()
                 {
                     Serial.println("[SENSOR] Water level confirmed unavailable");
                 }
+                if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                {
+                    debugManager.printLogPrefix("SENS");
+                    Serial.println("WaterLevel INVALID");
+                }
                 physicalSensors.waterLevel = NAN;
                 physicalSensors.waterLevelCm = NAN;
                 physicalSensors.waterVolumeLiters = NAN;
@@ -1547,11 +1771,10 @@ void SensorManager::readWaterLevel()
                 waterLevelHistoryCount = 0;
                 // A genuine sensor outage (timeout/negative pulseIn) is
                 // category A - invalid/unavailable - not the plausible-but-
-                // false echo category B the step filter exists for. Reset the
-                // accepted baseline so recovery must go through the same
-                // reacquisition sequence as boot (see readWaterLevel()'s own
-                // comment on the resilience follow-up pass) rather than
-                // trusting the first post-outage reading immediately.
+                // false echo category B the step filter exists for. Reset
+                // the accepted baseline so recovery must go through the
+                // same reacquisition sequence as boot rather than trusting
+                // the first post-outage reading immediately.
                 lastAcceptedWaterDepthCm = NAN;
                 waterLevelStepCandidateCm = NAN;
                 waterLevelStepCandidateCount = 0;
@@ -1564,9 +1787,22 @@ void SensorManager::readWaterLevel()
         return;
     }
 
-    if (waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD && dbgWater)
+    if (waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
     {
-        Serial.println("[SENSOR] Water level recovered");
+        if (dbgWater)
+        {
+            Serial.println("[SENSOR] Water level recovered");
+        }
+        if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+        {
+            // No depth value here deliberately: this function's step/median
+            // confirmation logic accepts a trusted depth through several
+            // different paths further below, so the freshly-recovered value
+            // is not yet final at this point - printing one here risks
+            // showing a not-yet-confirmed number.
+            debugManager.printLogPrefix("SENS");
+            Serial.println("WaterLevel RECOVERED");
+        }
     }
     waterLevelFailureStreak = 0;
 
@@ -1609,65 +1845,61 @@ void SensorManager::readWaterLevel()
     // calibration input - the sensor-to-reservoir-bottom distance, which
     // genuinely varies with mounting height per installation - not a fixed
     // constant like the reservoir's own dimensions below it. Deliberately
-    // NOT the legacy waterLevelEmptyDistanceCm field - see the automation
-    // resilience pass report and systemState.sensorToBottomCm's own comment
-    // in Types.h for why that field can carry a stale persisted value.
+    // NOT the legacy waterLevelEmptyDistanceCm field - see
+    // systemState.sensorToBottomCm's own comment in Types.h for why that
+    // field can carry a stale persisted value.
     const float sensorToBottomCm = systemState.sensorToBottomCm;
 
-    // Only the LOWER bound is clamped here: a negative depth is a sensor/
-    // geometry artifact, never physically real. The upper bound is
+    // Only the LOWER bound is clamped here: a negative depth is a
+    // sensor/geometry artifact, never physically real. The upper bound is
     // deliberately NOT clamped to MAX_WORKING_WATER_CM - a genuine overfill
     // (depth above the normal working level) must still report its real
-    // measured depth, e.g. 7.0cm stays 7.0cm; see the static automation
-    // integration audit. Only the DERIVED working percentage below clamps
-    // at 100%. This is the CANDIDATE depth for the step-confirmation filter
-    // below - not yet the accepted control value.
+    // measured depth, e.g. 7.0cm stays 7.0cm. Only the DERIVED working
+    // percentage below clamps at 100%. This is the CANDIDATE depth for the
+    // step-confirmation filter below - not yet the accepted control value.
     float candidateDepthCm = sensorToBottomCm - filteredDistance;
     if (candidateDepthCm < 0.0f)
     {
         candidateDepthCm = 0.0f;
     }
 
-    // Temporal plausibility filter (see Config.h's WATER_LEVEL_STEP_* and
-    // this task's automation resilience pass report). The median-of-5 above
-    // already rejects a single outlier echo, but a short RUN of consecutive
-    // bad echoes can shift the median itself - the observed
-    // 4.03->1.70->4.03cm pattern with no real water movement. A candidate
-    // within WATER_LEVEL_STEP_ACCEPT_CM of the last accepted depth is normal
-    // sensor noise/real gradual change and is accepted immediately. A larger
-    // jump is held as a pending "step candidate" and the previous accepted
-    // depth is kept as the control value until WATER_LEVEL_STEP_CONFIRM_COUNT
-    // consecutive candidates mutually agree within
-    // WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM - only then does the new level
-    // become authoritative. A lone false echo never accumulates enough
-    // agreeing candidates and is permanently rejected; a genuine drain/fill
-    // still confirms within a few WATER_LEVEL_READ_INTERVAL_MS (5s) read
-    // cycles - up to ~10s worst case for 3 agreeing candidates, not the
-    // ~300ms figure an earlier version of this comment incorrectly used
-    // (that cadence belongs to pH's own, separate PH_STEP_SAMPLE_INTERVAL_MS).
+    // Temporal plausibility filter (see Config.h's WATER_LEVEL_STEP_*). The
+    // median-of-5 above already rejects a single outlier echo, but a short
+    // RUN of consecutive bad echoes can shift the median itself - the
+    // observed 4.03->1.70->4.03cm pattern with no real water movement. A
+    // candidate within WATER_LEVEL_STEP_ACCEPT_CM of the last accepted
+    // depth is normal sensor noise/real gradual change and is accepted
+    // immediately. A larger jump is held as a pending "step candidate" and
+    // the previous accepted depth is kept as the control value until
+    // WATER_LEVEL_STEP_CONFIRM_COUNT consecutive candidates mutually agree
+    // within WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM - only then does the new
+    // level become authoritative. A lone false echo never accumulates
+    // enough agreeing candidates and is permanently rejected; a genuine
+    // drain/fill still confirms within a few WATER_LEVEL_READ_INTERVAL_MS
+    // (5s) read cycles - up to ~10s worst case for 3 agreeing candidates.
     if (isnan(lastAcceptedWaterDepthCm))
     {
-        // Reacquisition after boot or a confirmed sensor outage (resilience
-        // pass follow-up): there is no accepted baseline to compare a small
-        // change against, but the very first post-outage candidate must
-        // still not be trusted blindly - it can just as easily be a single
-        // bad echo as any other reading. Reuse the same step-candidate
-        // agreement mechanism as a large jump below, gated on "no baseline
-        // yet" instead of "large delta from baseline": require
-        // WATER_LEVEL_STEP_CONFIRM_COUNT consecutive candidates that
-        // mutually agree within WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM before
-        // establishing a new baseline. Until then, physicalSensors.
-        // waterLevelCm/waterLevel/waterVolumeLiters are left untouched
-        // (still NaN from the outage, or NaN from boot) - never fabricated
-        // from an unconfirmed candidate, and never fabricated as 0cm - and
-        // the refill threshold counters below are never reached, so a
-        // refill can neither start nor complete from reacquisition data.
-        // Absolute physical plausibility gate - same MAX_WORKING_WATER_CM
-        // check the have-baseline branch below already applies to every
-        // candidate. Without this, a single physically impossible echo
-        // (e.g. the diagnosed 23.61cm reading on an empty reservoir) could
-        // still accumulate WATER_LEVEL_STEP_CONFIRM_COUNT agreeing repeats
-        // of ITSELF and become the initial trusted baseline outright, since
+        // Reacquisition after boot or a confirmed sensor outage: there is
+        // no accepted baseline to compare a small change against, but the
+        // very first post-outage candidate must still not be trusted
+        // blindly - it can just as easily be a single bad echo as any
+        // other reading. Reuse the same step-candidate agreement mechanism
+        // as a large jump below, gated on "no baseline yet" instead of
+        // "large delta from baseline": require WATER_LEVEL_STEP_CONFIRM_COUNT
+        // consecutive candidates that mutually agree within
+        // WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM before establishing a new
+        // baseline. Until then, physicalSensors.waterLevelCm/waterLevel/
+        // waterVolumeLiters are left untouched (still NaN from the outage,
+        // or NaN from boot) - never fabricated from an unconfirmed
+        // candidate, and never fabricated as 0cm - and the refill threshold
+        // counters below are never reached, so a refill can neither start
+        // nor complete from reacquisition data. Absolute physical
+        // plausibility gate - same MAX_WORKING_WATER_CM check the
+        // have-baseline branch below already applies to every candidate.
+        // Without this, a single physically impossible echo (e.g. the
+        // diagnosed 23.61cm reading on an empty reservoir) could still
+        // accumulate WATER_LEVEL_STEP_CONFIRM_COUNT agreeing repeats of
+        // ITSELF and become the initial trusted baseline outright, since
         // the reacquisition streak below only ever checked candidates
         // against each other, never against the physical working range.
         const bool withinPhysicalRange = candidateDepthCm <= MAX_WORKING_WATER_CM;
@@ -1701,9 +1933,9 @@ void SensorManager::readWaterLevel()
                 // Same outward outcome as every other confirmed sensor
                 // fault: publish unavailable rather than ever fabricating a
                 // level (never a fake 0% or 100%) from an out-of-range
-                // candidate. There is no trusted baseline to preserve here
-                // (that is exactly why we are in this branch), so unlike the
-                // have-baseline jump-fault path there is nothing else to
+                // candidate. There's no trusted baseline to preserve here
+                // (exactly why we're in this branch), so unlike the
+                // have-baseline jump-fault path there's nothing else to
                 // hold onto.
                 physicalSensors.waterLevel = NAN;
                 physicalSensors.waterLevelCm = NAN;
@@ -1790,12 +2022,12 @@ void SensorManager::readWaterLevel()
         // configured working range - independent of, and in addition to,
         // the relative delta-from-trusted check below. A candidate above
         // MAX_WORKING_WATER_CM must never become trusted regardless of what
-        // the delta says (candidateDepthCm itself is still computed without
-        // an upper clamp - see its own comment above - only its eligibility
-        // to become the TRUSTED value is gated here). This is what rejects
-        // the diagnosed 23.6cm reading outright, on its own absolute
-        // magnitude, not merely because it differs a lot from the previous
-        // ~3.5cm trusted depth.
+        // the delta says (candidateDepthCm itself is still computed
+        // without an upper clamp - see its own comment above - only its
+        // eligibility to become the TRUSTED value is gated here). This is
+        // what rejects the diagnosed 23.6cm reading outright, on its own
+        // absolute magnitude, not merely because it differs a lot from the
+        // previous ~3.5cm trusted depth.
         const bool withinPhysicalRange = candidateDepthCm <= MAX_WORKING_WATER_CM;
         const float jumpMagnitude = fabsf(candidateDepthCm - lastAcceptedWaterDepthCm);
         const bool jumpPlausible = withinPhysicalRange &&
@@ -1808,7 +2040,7 @@ void SensorManager::readWaterLevel()
             // a large delta) - never eligible for promotion no matter how
             // many times it repeats or how well repeats agree with each
             // other; abandon any in-progress quarantine streak rather than
-            // let it keep counting toward acceptance.
+            // keep counting toward acceptance.
             waterLevelStepCandidateCm = NAN;
             waterLevelStepCandidateCount = 0;
 
@@ -1832,30 +2064,30 @@ void SensorManager::readWaterLevel()
 
             if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
             {
-                // Persisted long enough to treat like the existing raw-
-                // read-failure fault path above (same outward outcome:
+                // Persisted long enough to treat like the existing
+                // raw-read-failure fault path above (same outward outcome:
                 // publish unavailable rather than holding a now-
                 // untrustworthy value forever) - but deliberately DOES NOT
                 // clear lastAcceptedWaterDepthCm the way that path does.
                 // Clearing it would drop straight into the reacquisition
                 // branch above (isnan(lastAcceptedWaterDepthCm)), whose own
                 // confirmation check has no magnitude/range gate at all -
-                // exactly the same repeated false echo that triggered this
-                // fault could then satisfy THAT weaker check next and become
-                // the new baseline, the failure mode this correction closes.
+                // the same repeated false echo that triggered this fault
+                // could then satisfy THAT weaker check next and become the
+                // new baseline, the failure mode this correction closes.
                 // The trusted depth is kept so every subsequent reading -
                 // including more of the same bad echo - keeps being
                 // evaluated against a real baseline by the checks above.
                 // waterLevelJumpFaultStreak is also deliberately NOT reset
-                // here (stays pinned at SENSOR_TRANSIENT_FAILURE_THRESHOLD,
-                // the increment above already caps it) - resetting it would
-                // let the very next implausible reading fall through to the
-                // "not yet confirmed" branch below and briefly republish the
-                // held value as live again before re-confirming, flapping
-                // available/unavailable every few ticks instead of staying
-                // sticky for as long as the implausible readings continue.
-                // Only a genuinely plausible reading (the jumpPlausible/
-                // small-change branches below and above) ever clears it.
+                // here (stays pinned at SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+                // - resetting it would let the very next implausible
+                // reading fall through to the "not yet confirmed" branch
+                // below and briefly republish the held value as live again
+                // before re-confirming, flapping available/unavailable
+                // every few ticks instead of staying sticky for as long as
+                // the implausible readings continue. Only a genuinely
+                // plausible reading (jumpPlausible/small-change branches)
+                // ever clears it.
                 if (dbgWater)
                 {
                     Serial.println("[SENSOR] Water level confirmed unavailable (implausible jump persisted); trusted depth preserved");
@@ -1880,15 +2112,15 @@ void SensorManager::readWaterLevel()
         {
             // Plausible large jump - quarantined, not immediately accepted.
             // Needs WATER_LEVEL_JUMP_CONFIRM_COUNT mutually-agreeing
-            // candidates (stronger than the ordinary WATER_LEVEL_STEP_
-            // CONFIRM_COUNT small-change confirmation) before ever
-            // replacing the trusted value. Deliberately does NOT clear
-            // waterLevelJumpFaultStreak just for entering quarantine
-            // (unlike the small-change branch above, which does) - if the
-            // sensor is already in a CONFIRMED jump-fault state, merely
-            // seeing one in-range-but-still-unconfirmed candidate is not
-            // itself a recovery; the fault clears only once a candidate is
-            // actually promoted below.
+            // candidates (stronger than the ordinary
+            // WATER_LEVEL_STEP_CONFIRM_COUNT small-change confirmation)
+            // before ever replacing the trusted value. Deliberately does
+            // NOT clear waterLevelJumpFaultStreak just for entering
+            // quarantine (unlike the small-change branch above, which
+            // does) - if the sensor is already in a CONFIRMED jump-fault
+            // state, merely seeing one in-range-but-still-unconfirmed
+            // candidate isn't itself a recovery; the fault clears only
+            // once a candidate is actually promoted below.
             const bool agreesWithPending = !isnan(waterLevelStepCandidateCm) &&
                 fabsf(candidateDepthCm - waterLevelStepCandidateCm) <= WATER_LEVEL_STEP_CONFIRM_TOLERANCE_CM;
 
@@ -1943,13 +2175,12 @@ void SensorManager::readWaterLevel()
                 if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
                 {
                     // Already in a CONFIRMED jump-fault state and this
-                    // candidate, though within physical range, has not yet
+                    // candidate, though within physical range, hasn't yet
                     // been promoted - keep publishing unavailable (same as
                     // the implausible-jump confirmed-fault branch above)
                     // rather than resuming display of the held trusted
-                    // value while the fault is still active. Does not touch
-                    // lastAcceptedWaterDepthCm (baseline preserved, same
-                    // reasoning as the implausible-jump fault above) or
+                    // value while the fault is still active. Doesn't touch
+                    // lastAcceptedWaterDepthCm (baseline preserved) or
                     // waterLevelJumpFaultStreak itself (stays pinned - only
                     // the ACCEPT branch above clears it). Skips the shared
                     // publish tail/waterLevelSampleVersion increment below,
@@ -1988,16 +2219,15 @@ void SensorManager::readWaterLevel()
     // pH reconfirm that doesn't change the accepted value.
     waterLevelSampleVersion++;
 
-    // Refill threshold confirmation (resilience pass follow-up): the step
-    // filter above already protects against a LARGE jump, but a small
-    // transient within WATER_LEVEL_STEP_ACCEPT_CM (e.g. one bad reading
-    // 0.20cm off) still becomes the accepted value immediately and can, on
-    // its own, momentarily cross REFILL_START_CM/REFILL_STOP_CM. Counted
-    // once per ACCEPTED reading here (WATER_LEVEL_READ_INTERVAL_MS = 5s
-    // cadence, not the ~300ms an earlier version of this comment incorrectly
-    // stated), not once per loop() tick, so 3 consecutive counts genuinely
-    // means 3 distinct HC-SR04 reads agreeing (up to ~10s worst case), not 3
-    // fast re-evaluations of one unchanged value.
+    // Refill threshold confirmation: the step filter above already protects
+    // against a LARGE jump, but a small transient within
+    // WATER_LEVEL_STEP_ACCEPT_CM (e.g. one bad reading 0.20cm off) still
+    // becomes the accepted value immediately and can, on its own,
+    // momentarily cross REFILL_START_CM/REFILL_STOP_CM. Counted once per
+    // ACCEPTED reading here (WATER_LEVEL_READ_INTERVAL_MS = 5s cadence),
+    // not once per loop() tick, so 3 consecutive counts genuinely means 3
+    // distinct HC-SR04 reads agreeing (up to ~10s worst case), not 3 fast
+    // re-evaluations of one unchanged value.
     if (acceptedDepthCm <= systemState.refillStartLevelCm)
     {
         if (refillStartConfirmCount < WATER_LEVEL_STEP_CONFIRM_COUNT) refillStartConfirmCount++;
@@ -2058,12 +2288,12 @@ void SensorManager::readWaterLevel()
     }
 
     // Throttled diagnostic - readWaterLevel() itself runs every 5s
-    // (WATER_LEVEL_READ_INTERVAL_MS; an earlier version of this comment
-    // incorrectly said 300ms), far more often than this needs to
+    // (WATER_LEVEL_READ_INTERVAL_MS), far more often than this needs to
     // print. See DHT_RAW_DIAGNOSTIC_INTERVAL_MS for the same pattern. Only
-    // the accepted-value summary is throttled - the [WATER-FILTER] reject/
-    // accept lines above already only print on a large-jump candidate tick,
-    // which is inherently rare, so they are never subject to this throttle.
+    // the accepted-value summary is throttled - the [WATER-FILTER]
+    // reject/accept lines above already only print on a large-jump
+    // candidate tick, which is inherently rare, so they're never subject
+    // to this throttle.
     const unsigned long nowForWaterDiag = millis();
     if (dbgWater && (lastWaterLevelDiagnosticAt == 0 ||
         nowForWaterDiag - lastWaterLevelDiagnosticAt >= DHT_RAW_DIAGNOSTIC_INTERVAL_MS))
@@ -2089,26 +2319,27 @@ void SensorManager::readEC()
     // ecSampler now runs in MILLIVOLTS mode (see its construction above) -
     // median() is already an ESP32-calibrated millivolts reading, not a raw
     // 0-4095 count. ecRaw keeps its existing field name/Firebase key (app
-    // compatibility) but now holds millivolts, matching what it actually is.
+    // compatibility) but now holds millivolts, matching what it is.
     const int medianMv = ecSampler.median();
     physicalSensors.ecRaw = medianMv;
 
     // Rail-proximity hardware-fault detection - see Config.h's "pH/EC
     // Hardware-Fault Detection" section (EC_FAULT_*/ADC_FAULT_RAW_*) for the
     // full design. Combines the calibrated millivolt signal with the raw
-    // 12-bit ADC count (chip-independent - see ADC_FAULT_RAW_*'s own comment
-    // for why the millivolt ceiling alone cannot be trusted across chips).
-    // Evaluated on its own EC_FAULT_CHECK_INTERVAL_MS cadence, independent of
-    // how often readEC() itself is called (every loop() tick once
-    // ecSampler.ready()), so "N consecutive evaluations" means N genuinely
-    // distinct, time-separated observations of the rolling median, not N
-    // re-checks of one barely-changed value within milliseconds. Suppressed
-    // entirely during the post-(re)connect analog settle window
-    // (isPhEcAnalogSettling()) - a probe/module that just became the active
-    // source is EXPECTED to still be electrically settling, and treating
-    // that as fault evidence would be exactly the false-positive this
-    // detector must avoid; applyEffectiveSensors() already treats that
-    // window as a known "not yet available" state for the same reason.
+    // 12-bit ADC count (chip-independent - see ADC_FAULT_RAW_*'s own
+    // comment for why the millivolt ceiling alone cannot be trusted across
+    // chips). Evaluated on its own EC_FAULT_CHECK_INTERVAL_MS cadence,
+    // independent of how often readEC() itself is called (every loop()
+    // tick once ecSampler.ready()), so "N consecutive evaluations" means N
+    // genuinely distinct, time-separated observations of the rolling
+    // median, not N re-checks of one barely-changed value within
+    // milliseconds. Suppressed entirely during the post-(re)connect analog
+    // settle window (isPhEcAnalogSettling()) - a probe/module that just
+    // became the active source is EXPECTED to still be electrically
+    // settling, and treating that as fault evidence would be exactly the
+    // false-positive this detector must avoid; applyEffectiveSensors()
+    // already treats that window as a known "not yet available" state for
+    // the same reason.
     if (!isPhEcAnalogSettling())
     {
         const unsigned long nowForEcFault = millis();
@@ -2145,6 +2376,11 @@ void SensorManager::readEC()
                         Serial.print(medianMv);
                         Serial.println("mV persistently at/beyond rail");
                     }
+                    if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                    {
+                        debugManager.printLogPrefix("SENS");
+                        Serial.println("EC FAULT confirmed");
+                    }
                 }
             }
             else
@@ -2162,6 +2398,13 @@ void SensorManager::readEC()
                         {
                             Serial.println("[EC-FAULT] recovered - electrical signal plausible again; stability window must still re-establish trust");
                         }
+                        if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                        {
+                            debugManager.printLogPrefix("SENS");
+                            Serial.print("EC RECOVERED | ");
+                            Serial.print(sensors.ec, 2);
+                            Serial.println("mS/cm");
+                        }
                     }
                 }
             }
@@ -2173,16 +2416,16 @@ void SensorManager::readEC()
 
     // === EC calibration (EC_CAL_* constants, Calibration.h) ===
     // Replaces the previous borrowed DFRobot TDS-sensor polynomial + fixed
-    // EC_FACTOR multiplier (real-hardware audit + calibration redesign task:
-    // that curve was fit to a different probe/front-end and never matched
-    // this hardware - a confirmed 12.88 mS/cm solution read only ~1.69
-    // mS/cm through it, an error not uniform enough across the range for a
-    // single output multiplier to safely correct). See Calibration.h's own
-    // "EC Calibration" section for the full reasoning; this only implements
-    // it: two-point linear once a genuine second point is confirmed,
-    // gracefully degrading to a one-point proportional (through-origin) fit
-    // using only the confirmed 12.88 mS/cm anchor until then - never
-    // fabricating a second point that hasn't actually been measured.
+    // EC_FACTOR multiplier (that curve was fit to a different probe/
+    // front-end and never matched this hardware - a confirmed 12.88 mS/cm
+    // solution read only ~1.69 mS/cm through it, an error not uniform
+    // enough across the range for a single output multiplier to safely
+    // correct). See Calibration.h's own "EC Calibration" section for the
+    // full reasoning; this only implements it: two-point linear once a
+    // genuine second point is confirmed, gracefully degrading to a
+    // one-point proportional (through-origin) fit using only the confirmed
+    // 12.88 mS/cm anchor until then - never fabricating a second point
+    // that hasn't actually been measured.
     float uncompensatedEc;
     const char* calibrationModel;
     if (isfinite(EC_CAL_2_VOLTAGE) && isfinite(EC_CAL_2_EC) &&
@@ -2239,14 +2482,14 @@ void SensorManager::readEC()
     }
 
     // === Temperature compensation - applied to the calibrated EC value,
-    // not the raw voltage (calibration redesign task: physically, this
-    // normalizes the MEASURED conductivity to a 25C reference, the standard
-    // water-quality convention - it is not a correction to the sensor's
-    // electrical signal, so it belongs after conversion, not before it. The
-    // old polynomial compensated voltage first only because that particular
-    // nonlinear curve made the two orders genuinely different; with this
-    // linear calibration model they are mathematically identical either
-    // way, so this reordering changes clarity, not behavior). ===
+    // not the raw voltage (physically, this normalizes the MEASURED
+    // conductivity to a 25C reference, the standard water-quality
+    // convention - not a correction to the sensor's electrical signal, so
+    // it belongs after conversion, not before. The old polynomial
+    // compensated voltage first only because that particular nonlinear
+    // curve made the two orders genuinely different; with this linear
+    // calibration model they're mathematically identical either way, so
+    // this reordering changes clarity, not behavior). ===
     const float compensationCoefficient =
         1.0f + 0.02f * (compensationTemp - 25.0f);
     const float compensatedEc = uncompensatedEc / compensationCoefficient;
@@ -2267,11 +2510,11 @@ void SensorManager::readEC()
     // Fail-safe EC plausibility check (Config.h's EC_CAL_VOLTAGE_MARGIN_V) -
     // separate from the rail-proximity fault detector above (electrically-
     // implausible voltage at/near the ADC's own physical rails). This
-    // instead catches a voltage that is electrically ordinary (nowhere near
+    // instead catches a voltage that's electrically ordinary (nowhere near
     // either rail, so the rail check above never flags it) but falls far
     // outside the domain the EC_CAL_1_*/EC_CAL_2_* two-point line
     // (Calibration.h) was actually fit against, or that the line
-    // extrapolates into a physically impossible negative EC - exactly the
+    // extrapolates into a physically impossible negative EC - the
     // real-hardware finding this guards against: a ~365-400mV reading, far
     // below EC_CAL_2_VOLTAGE, extrapolating through the steep two-point
     // slope into roughly -63 mS/cm with nothing to catch it. Does NOT touch
@@ -2285,14 +2528,13 @@ void SensorManager::readEC()
     // observation, never waiting on the persistent-fault streak. Without
     // this, physicalSensors.ec (finite even when negative/absurd) was
     // published straight through to sensors.ec, EC Low, automation's
-    // validEC() (partially - it does already reject negative, but not an
+    // validEC() (partially - already rejects negative, but not an
     // implausible positive extrapolation), and Firebase for up to
-    // EC_FAULT_CONFIRM_COUNT-1 ticks before physicalSensors.ecCalibrationFault
-    // ever confirmed. The streak below is UNCHANGED - it still, and only,
-    // controls when this graduates from "this one observation is
-    // untrustworthy" to "the sensor itself is persistently faulted"
-    // (physicalSensors.ecCalibrationFault, EC_FAULT_CONFIRM_COUNT/
-    // EC_FAULT_RECOVERY_COUNT unchanged).
+    // EC_FAULT_CONFIRM_COUNT-1 ticks before
+    // physicalSensors.ecCalibrationFault ever confirmed. The streak below
+    // is UNCHANGED - it still, and only, controls when this graduates from
+    // "this one observation is untrustworthy" to "the sensor itself is
+    // persistently faulted".
     const float ecCalVoltageLow = min(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) - EC_CAL_VOLTAGE_MARGIN_V;
     const float ecCalVoltageHigh = max(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) + EC_CAL_VOLTAGE_MARGIN_V;
 
@@ -2303,15 +2545,16 @@ void SensorManager::readEC()
         voltage > ecCalVoltageHigh;
 
     // Own separate streak/field (ecCalibrationFaultStreak/
-    // physicalSensors.ecCalibrationFault) from the rail detector above - see
-    // either's own declaration-site comment for why they are deliberately
-    // not shared. Same EC_FAULT_CHECK_INTERVAL_MS/EC_FAULT_CONFIRM_COUNT/
-    // EC_FAULT_RECOVERY_COUNT debounce shape, suppressed during the same
-    // post-(re)connect analog settle window as the rail check for the same
-    // reason (an unsettled reading is expected to look implausible
-    // transiently - not fault evidence). Unchanged: still only decides the
-    // PERSISTENT fault flag, reading the same ecImplausibleThisSample just
-    // computed above instead of recomputing it.
+    // physicalSensors.ecCalibrationFault) from the rail detector above -
+    // see either's own declaration-site comment for why they're
+    // deliberately not shared. Same EC_FAULT_CHECK_INTERVAL_MS/
+    // EC_FAULT_CONFIRM_COUNT/EC_FAULT_RECOVERY_COUNT debounce shape,
+    // suppressed during the same post-(re)connect analog settle window as
+    // the rail check for the same reason (an unsettled reading is expected
+    // to look implausible transiently - not fault evidence). Unchanged:
+    // still only decides the PERSISTENT fault flag, reading the same
+    // ecImplausibleThisSample just computed above instead of recomputing
+    // it.
     const unsigned long nowForEcCalibrationFault = millis();
     if (!isPhEcAnalogSettling() &&
         nowForEcCalibrationFault - lastEcCalibrationFaultCheckAt >= EC_FAULT_CHECK_INTERVAL_MS)
@@ -2394,16 +2637,14 @@ void SensorManager::readPH()
     // previous average() was - the same PH_SAMPLE_COUNT/PH_SAMPLE_INTERVAL
     // acquisition window, just a more robust summary statistic over it.
     //
-    // Finalized pH acquisition architecture (real-hardware pH bench audit -
-    // temporary PH_MEDIAN_ONLY_DIAGNOSTIC confirmed the direct median alone
-    // already produces sensible pH values, e.g. ~4.00-4.08 in a pH 4.01
-    // buffer): the median feeds PH_SLOPE/PH_OFFSET directly, with no
-    // further EMA smoothing stage - the pH-specific EMA that used to sit
-    // here has been removed. physicalSensors.ph is the CANDIDATE fed to the
-    // existing 10-sample stability window in applyEffectiveSensors(); that
-    // window (unchanged: 0.05 tolerance, 3-minute freshness) remains the
-    // sole authority for whether a reading is trustworthy enough to publish
-    // as sensors.ph or act on for dosing.
+    // Finalized pH acquisition architecture: the median feeds PH_SLOPE/
+    // PH_OFFSET directly, with no further EMA smoothing stage - the
+    // pH-specific EMA that used to sit here has been removed.
+    // physicalSensors.ph is the CANDIDATE fed to the existing 10-sample
+    // stability window in applyEffectiveSensors(); that window (unchanged:
+    // 0.05 tolerance, 3-minute freshness) remains the sole authority for
+    // whether a reading is trustworthy enough to publish as sensors.ph or
+    // act on for dosing.
     const int medianMv =
         phSampler.median();
 
@@ -2415,15 +2656,15 @@ void SensorManager::readPH()
     // 12-bit ADC count (chip-independent - see ADC_FAULT_RAW_*'s own
     // comment for why the millivolt ceiling alone cannot be trusted across
     // chips), never the calculated pH below - a rail-stuck raw value always
-    // produces a domain-impossible
-    // pH too, but reasoning from the electrical signal directly keeps this
-    // detector's thresholds anchored to the ADC/transmitter's own physical
-    // limits rather than to PH_SLOPE/PH_OFFSET or the 0-14 pH domain, so it
-    // can never be confused by a calibration change. Evaluated on its own
-    // PH_FAULT_CHECK_INTERVAL_MS cadence (readPH() itself runs every loop()
-    // tick once phSampler.ready(), far faster than the underlying rolling
-    // median actually refreshes - see PH_STEP_SAMPLE_INTERVAL_MS's own
-    // comment for the identical reasoning already applied to the step
+    // produces a domain-impossible pH too, but reasoning from the
+    // electrical signal directly keeps this detector's thresholds anchored
+    // to the ADC/transmitter's own physical limits rather than to
+    // PH_SLOPE/PH_OFFSET or the 0-14 pH domain, so it can never be
+    // confused by a calibration change. Evaluated on its own
+    // PH_FAULT_CHECK_INTERVAL_MS cadence (readPH() itself runs every
+    // loop() tick once phSampler.ready(), far faster than the underlying
+    // rolling median actually refreshes - see PH_STEP_SAMPLE_INTERVAL_MS's
+    // own comment for the identical reasoning already applied to the step
     // filter). Suppressed during the post-(re)connect analog settle window
     // (isPhEcAnalogSettling()) for the same reason readEC()'s own fault
     // detector is: a probe that just became the active source is EXPECTED
@@ -2490,12 +2731,13 @@ void SensorManager::readPH()
         PH_OFFSET;
 
     // Throttled diagnostic - readPH() itself runs every loop() tick, far
-    // more often than this needs to print. See DHT_RAW_DIAGNOSTIC_INTERVAL_MS
-    // for the same pattern. Suppressed outright while mock sensors are
-    // driving automation, same reasoning as dbgDht/dbgCooling above.
+    // more often than this needs to print. See
+    // DHT_RAW_DIAGNOSTIC_INTERVAL_MS for the same pattern. Suppressed
+    // outright while mock sensors are EFFECTIVELY driving automation, same
+    // reasoning as dbgDht/dbgCooling above.
     const unsigned long now = millis();
     if (debugManager.shouldPrintDebug(DebugCategory::PH) &&
-        !systemState.mockSensorsEnabled &&
+        !isUsingEffectiveMockSensors() &&
         (lastPhAdcDiagnosticAt == 0 ||
         now - lastPhAdcDiagnosticAt >= PH_ADC_DIAGNOSTIC_INTERVAL_MS))
     {

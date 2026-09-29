@@ -70,11 +70,11 @@ void GsmManager::update()
 // SIM800L emits an unsolicited "RDY" as the first line of its own boot
 // sequence (RDY / +CFUN: 1 / +CPIN: READY / Call Ready / SMS Ready) - a
 // reliable, distinct signature that it just powered on or reset, separate
-// from any AT command/response text this class ever matches on. Ignored
-// while already in WAITING_FOR_MODULE (that's exactly where a fresh boot
-// belongs, and a probe there is already in flight). Seen in any other
-// state, it means whatever this class currently believes about SIM/
-// registration/in-flight-send state is stale.
+// from any AT command/response text this class matches on. Ignored while
+// already in WAITING_FOR_MODULE (that's exactly where a fresh boot belongs,
+// and a probe there is already in flight). Seen in any other state, it
+// means whatever this class currently believes about SIM/registration/
+// in-flight-send state is stale.
 bool GsmManager::checkForModemRestart(unsigned long now)
 {
     if (state == State::WAITING_FOR_MODULE) return false;
@@ -251,10 +251,9 @@ void GsmManager::updateCheckingRegistration(unsigned long now)
     // checked with legacy circuit-switched AT+CREG? rather than AT+CEREG?
     // (the previous module was LTE Cat1 and needed EPS registration).
     // Response shape: "+CREG: <n>,<stat>[,...]" - stat 1 = registered home,
-    // 5 = registered roaming. Same shape and status codes as CEREG, so only
-    // the command/tag string changes here - the status digit still always
-    // immediately follows the first comma in both the 2-value and extended
-    // (5-value) forms.
+    // 5 = registered roaming. Same shape/status codes as CEREG, so only the
+    // command/tag string changes - the status digit still always
+    // immediately follows the first comma in both the 2- and 5-value forms.
     int tagIdx = rxBuffer.indexOf("+CREG:");
     if (tagIdx >= 0)
     {
@@ -281,14 +280,14 @@ void GsmManager::updateCheckingRegistration(unsigned long now)
     }
 }
 
-// Registration was previously never re-checked once READY was first
-// reached, so a loss of signal/registration after boot was invisible until
-// a send simply hung. This reuses updateCheckingRegistration() wholesale by
+// Registration was previously never re-checked once READY was first reached,
+// so a loss of signal/registration after boot was invisible until a send
+// simply hung. This reuses updateCheckingRegistration() wholesale by
 // demoting back to CHECKING_REGISTRATION - the same bounded, non-blocking
-// retry loop that got here the first time also handles recovering here,
-// and sendSms() already rejects with NOT_REGISTERED while in that state,
-// so NotificationManager defers rather than fails any send that lands in
-// the brief recheck window.
+// retry loop that got here the first time also handles recovering here, and
+// sendSms() already rejects with NOT_REGISTERED in that state, so
+// NotificationManager defers rather than fails any send landing in the
+// brief recheck window.
 void GsmManager::updateReady(unsigned long now)
 {
     if (now - lastRegistrationCheckAt < REGISTRATION_HEALTH_INTERVAL_MS) return;
@@ -401,8 +400,8 @@ void GsmManager::finishSend(SendResult result)
 // Best-effort diagnostic only - never changes SendResult or control flow.
 // Extracts and logs the numeric code from "+CMS ERROR: <n>" or
 // "+CME ERROR: <n>" (present because AT+CMEE=1 was sent once at module
-// detection) so a real failure reason survives in the serial log instead of
-// a bare "ERROR". Contains no phone number, so nothing here needs masking.
+// detection) so a real failure reason survives in the log instead of a bare
+// "ERROR". Contains no phone number, so nothing here needs masking.
 void GsmManager::logSendError(const String& response) const
 {
     int tagIdx = response.indexOf("+CMS ERROR:");

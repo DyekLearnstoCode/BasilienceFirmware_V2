@@ -11,13 +11,11 @@
 // ======================================================
 // Bumped whenever a compiled default changes in a way that could disagree
 // with a value an already-deployed device has already persisted (NVS and/or
-// Firebase) from a previous firmware version - a stored value is
-// indistinguishable at the value level alone from a genuine admin choice,
-// so reconciling it must be a one-time, explicitly-versioned migration, not
-// a "does it equal the old default" heuristic that could later clobber a
-// deliberate admin setting that happens to match. See
-// FirebaseManager::loadPersistedSettings()/readSettings() for the actual
-// migration steps this version gates (NVS key "cfgVersion").
+// Firebase). A stored value looks identical to a genuine admin choice, so
+// reconciling it must be a one-time, explicitly-versioned migration, never
+// an "equals the old default" heuristic that could clobber a deliberate
+// admin setting. See FirebaseManager::loadPersistedSettings()/readSettings()
+// for the actual migration steps this version gates (NVS key "cfgVersion").
 //   v1 (this version): air-temperature monitored maximum corrected 28C ->
 //     32C (systemState.maxAirTemp/TARGET_MAX_AIR_TEMP), automatic
 //     root-blower fogging speed corrected 30% -> 65%
@@ -30,68 +28,79 @@ constexpr uint8_t CONFIG_SCHEMA_VERSION = 1;
 // availability.
 constexpr unsigned long CHEMISTRY_FOGGING_HOLD_TIMEOUT_MS = 30000UL;
 
-// Minimum spacing between completed DS18B20 conversions. The sensor read
-// itself is a blocking OneWire transaction, so it must not run every loop
-// iteration - both to stop it from dominating loop() timing and to reduce
-// how often it can collide with other blocking work (e.g. Firebase calls).
+// Minimum spacing between completed DS18B20 conversions. The read is a
+// blocking OneWire transaction, so it must not run every loop iteration -
+// both to stop it dominating loop() timing and to reduce collisions with
+// other blocking work (e.g. Firebase calls).
 constexpr unsigned long WATER_TEMP_READ_INTERVAL_MS = 5000UL;
 
-// Minimum spacing between HC-SR04 trigger pulses. Without this, readWaterLevel()
-// re-triggers on literally every loop iteration - far faster than the sensor's
-// own echo/reverberation settling time - which is a common cause of spurious
-// pulseIn() timeouts unrelated to the sensor or wiring actually failing.
+// Minimum spacing between HC-SR04 trigger pulses. Without this,
+// readWaterLevel() re-triggers every loop iteration - far faster than the
+// sensor's own echo/reverberation settling time - a common cause of
+// spurious pulseIn() timeouts unrelated to wiring.
 constexpr unsigned long WATER_LEVEL_READ_INTERVAL_MS = 5000UL;
 
 // Minimum spacing between DHT22 samples. Confirmed marginal at the previous
-// 2000ms value (DHT22 intermittent-communication audit): 2000ms is exactly
-// the DHT22 datasheet's stated minimum sampling period AND exactly the DHT
-// library's own internal MIN_INTERVAL floor (DHT.cpp) - i.e. readDHT() was
-// polling right at the sensor's hard floor with zero margin. 2500ms keeps
-// the same debounce/EMA/threshold behavior (only the cadence changes) while
-// giving genuine headroom above that floor. Without a spacing gate at all,
-// readDHT() would re-sample on literally every loop iteration - far faster
-// than the sensor can actually answer - which is why humidity/air
-// temperature would intermittently blank out and reappear even though the
-// sensor itself never lost contact.
+// 2000ms (DHT22 intermittent-communication audit): that was exactly both
+// the datasheet's minimum sampling period and the DHT library's own
+// MIN_INTERVAL floor (DHT.cpp), i.e. zero margin. 2500ms keeps the same
+// debounce/EMA/threshold behavior while giving real headroom. Without a
+// spacing gate, readDHT() would re-sample far faster than the sensor can
+// answer, which is why humidity/air temperature intermittently blanked out
+// even though the sensor never lost contact.
 constexpr unsigned long DHT_READ_INTERVAL_MS = 5000UL;
 
 // DHT22 physical measurement range (datasheet: -40..80C, 0..100% RH) - pure
-// SENSOR VALIDITY, never an agronomic/automation threshold (28C or 10C are
-// both physically valid readings, whatever the cultivation target is). Used
-// only to reject an impossible/corrupted raw sample (e.g. 587.96C) BEFORE
-// it can reach dhtTemperatureFiltered/dhtHumidityFiltered - see readDHT()'s
-// own comment for the confirmed bug this fixes.
+// SENSOR VALIDITY, never an agronomic/automation threshold. Only rejects an
+// impossible/corrupted raw sample (e.g. 587.96C) before it reaches
+// dhtTemperatureFiltered/dhtHumidityFiltered - see readDHT()'s own comment.
 constexpr float DHT22_MIN_TEMP_C = -40.0f;
 constexpr float DHT22_MAX_TEMP_C = 80.0f;
 constexpr float DHT22_MIN_HUMIDITY_PCT = 0.0f;
 constexpr float DHT22_MAX_HUMIDITY_PCT = 100.0f;
 
 // Throttle for readDHT()'s [DHT-RAW] diagnostic's VALID case only - an
-// invalid raw sample is always printed immediately (already naturally rate-
-// limited to once per DHT_READ_INTERVAL_MS, and each one is the evidence
-// this diagnostic exists for).
+// invalid raw sample is always printed immediately (already rate-limited to
+// once per DHT_READ_INTERVAL_MS).
 constexpr unsigned long DHT_RAW_DIAGNOSTIC_INTERVAL_MS = 5000UL;
 
-// Exponential-smoothing weight given to each freshly accepted raw DHT22/
-// DS18B20 reading (0..1 - higher tracks the raw sensor faster but smooths
-// less, lower smooths more but lags a genuine change more). 0.3 converges
-// to ~90% of a real step change within about 6 accepted samples
-// (DHT ~15s at DHT_READ_INTERVAL_MS, DS18B20 ~6s at
-// WATER_TEMP_READ_INTERVAL_MS) while suppressing normal per-sample sensor
-// noise - see readDHT()/readWaterTemperature()'s own comments.
+// Exponential-smoothing weight for each freshly accepted raw DHT22/DS18B20
+// reading (0..1 - higher tracks faster but smooths less). 0.3 converges to
+// ~90% of a real step change within ~6 accepted samples (DHT ~15s at
+// DHT_READ_INTERVAL_MS, DS18B20 ~6s at WATER_TEMP_READ_INTERVAL_MS) while
+// suppressing normal sensor noise - see readDHT()/readWaterTemperature().
 constexpr float DHT_SMOOTHING_ALPHA = 0.3f;
 constexpr float WATER_TEMP_SMOOTHING_ALPHA = 0.3f;
 
-// How long a unit that booted into a PERSISTED mock source waits for a fresh
-// mock payload before giving up and reverting to physical sensors.
+// How long a unit that booted into a PERSISTED mock source waits for a
+// fresh mock payload before reverting to physical sensors.
 //
-// Mock readings are deliberately never persisted, so a unit that reboots with
-// mock mode still stored has no values to work from. Without this bound it
-// would sit idle indefinitely whenever the cloud never came back. This applies
-// ONLY to that boot-restored-without-payload window - it is not a general mock
-// inactivity timer, and a mock session enabled explicitly after boot is never
-// subject to it.
+// Mock readings are never persisted, so a unit rebooting with mock mode
+// still stored has no values to work from. Without this bound it would sit
+// idle indefinitely if the cloud never came back. Applies ONLY to that
+// boot-restored-without-payload window - not a general mock inactivity
+// timer, and a session enabled explicitly after boot is never subject to it.
 constexpr unsigned long MOCK_BOOT_PAYLOAD_TIMEOUT = 120000UL; // 2 minutes
+
+// Ongoing mock-payload freshness bound (M8 fix), separate from the boot-only
+// timeout above. FirebaseManager::readMockSensors() polls RTDB every
+// MOCK_READ_INTERVAL (2000ms, FirebaseManager.cpp) while Wi-Fi/Firebase are
+// up, calling SensorManager::notifyMockPayloadReceived() on every
+// successful poll - so under normal operation payload age never exceeds a
+// couple of polling cycles. The instant Wi-Fi drops,
+// FirebaseManager::syncMockSensors() returns immediately without polling,
+// so no further notifyMockPayloadReceived() calls happen until
+// reconnection. 15s is ~7x the normal 2s poll cadence and 3x
+// COMMAND_FAILURE_BACKOFF_INTERVAL (5s, FirebaseManager.cpp) - generous
+// enough to never false-trigger on ordinary jitter, but far shorter than
+// MOCK_BOOT_PAYLOAD_TIMEOUT since this covers an already-live session going
+// silent, not fresh-boot startup latency. See
+// SensorManager::applyEffectiveSensors().
+constexpr unsigned long MOCK_PAYLOAD_STALE_TIMEOUT_MS = 15000UL;
+
+// Throttle for the periodic "[MOCK] Active"/"[MOCK] STALE" diagnostic in
+// applyEffectiveSensors() - a heartbeat, not a per-tick print.
+constexpr unsigned long MOCK_STATUS_LOG_INTERVAL_MS = 5000UL;
 
 // Developer Dynamic Mock Readings. Firmware owns this cadence so automation,
 // alerts, Firebase publication, and Android Monitoring all consume the same
@@ -111,9 +120,9 @@ constexpr float MOCK_DYNAMIC_WATER_TEMP_STEP = 0.1f;
 constexpr float MOCK_DYNAMIC_WATER_LEVEL_ENVELOPE = 0.75f;
 constexpr float MOCK_DYNAMIC_WATER_LEVEL_STEP = 0.25f;
 
-// Shared short debounce threshold used to tell a transient one-tick sensor
+// Shared short debounce threshold to tell a transient one-tick sensor
 // hiccup (OneWire/ADC noise, a blocking call landing at the wrong moment)
-// apart from a genuinely failed/disconnected sensor. Applied consistently to
+// apart from a genuinely failed/disconnected sensor. Applied to
 // water-temperature confirmation, sensorFault, and the pH/EC/water-temp
 // safety validity checks that can abort an active operation.
 constexpr uint8_t SENSOR_TRANSIENT_FAILURE_THRESHOLD = 3;
@@ -143,30 +152,30 @@ constexpr uint8_t SENSOR_TRANSIENT_FAILURE_THRESHOLD = 3;
 
 // TEMPORARY migration flag. false (default) = legacy anonymous Firebase auth
 // remains available as a fallback whenever this device has no bootstrap
-// secret provisioned yet - required so already-fielded devices (including
-// the current test unit, which has not had a secret injected yet) are not
-// locked out the moment this firmware ships. Once every fielded device has
-// been confirmed to hold a secret and successfully bootstrap, set this to
-// true (forbidding the anonymous fallback) BEFORE restrictive RTDB rules are
-// ever deployed - see the Secure Device Auth report's deployment checklist.
-// Never silently left false in a "final" build; its state must always be a
-// deliberate, reported decision.
+// secret provisioned yet - needed so already-fielded devices (including the
+// current test unit, no secret injected yet) aren't locked out the moment
+// this firmware ships. Once every fielded device is confirmed to hold a
+// secret and bootstrap successfully, set this true (forbidding the
+// anonymous fallback) BEFORE restrictive RTDB rules are deployed - see the
+// Secure Device Auth report's deployment checklist. Never left false
+// silently in a "final" build; its state must always be a deliberate,
+// reported decision.
 constexpr bool SECURE_DEVICE_AUTH_REQUIRED = false;
 
 // Cloud Function HTTPS endpoint that verifies a device's bootstrap secret and
 // mints a Firebase custom token (uid = deviceId). PROPOSED path/region,
-// matching this project's existing asia-southeast1 Firebase region - verify
-// against the actual deployed function URL before physical use; not yet
-// deployed as of this task.
+// matching this project's existing asia-southeast1 region - verify against
+// the actual deployed function URL before physical use; not yet deployed as
+// of this task.
 #define BOOTSTRAP_ENDPOINT_URL "https://asia-southeast1-basilience-database.cloudfunctions.net/deviceAuthBootstrap"
 
 // Google Trust Services GTS Root R1 - fetched directly from Google's own
 // published trust store (https://pki.goog/repo/certs/gtsr1.pem), not
-// transcribed from memory. Cloud Functions/Cloud Run HTTPS endpoints chain up
-// to a Google Trust Services root; this is the long-lived root itself (valid
-// to 2036), not a short-lived leaf certificate, so it should not need
-// frequent rotation - but reconfirm against pki.goog if the bootstrap
-// endpoint ever fails TLS validation unexpectedly.
+// transcribed from memory. Cloud Functions/Cloud Run HTTPS endpoints chain
+// up to a Google Trust Services root; this is the long-lived root itself
+// (valid to 2036), not a short-lived leaf, so it shouldn't need frequent
+// rotation - reconfirm against pki.goog if the bootstrap endpoint ever fails
+// TLS validation unexpectedly.
 constexpr const char* BOOTSTRAP_CA_CERT = R"CERT(
 -----BEGIN CERTIFICATE-----
 MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
@@ -255,18 +264,18 @@ constexpr uint8_t RTC_SCL_PIN = 22;
 // ======================================================
 // GSM / SIM800L
 // ======================================================
-// Confirmed non-conflicting production wiring - does not overlap with any
-// sensor, actuator, I2C, or UART0 (USB/debug) pin above. Unchanged from the
+// Confirmed non-conflicting production wiring - no overlap with any sensor,
+// actuator, I2C, or UART0 (USB/debug) pin above. Unchanged from the
 // previous A76XX-family module - same pins, same UART framing (8N1).
 constexpr uint8_t GSM_RX_PIN = 36;  // ESP32 RX <- SIM800L TXD
 constexpr uint8_t GSM_TX_PIN = 23;  // ESP32 TX -> SIM800L RXD
 
 // Bench-confirmed baud for the physically wired SIM800L V2 (blue board,
 // SIM800 R13.08 firmware) on Smart/SMART Gold (PH) - see the GSM physical
-// validation report. An earlier revision of this firmware probed a list of
-// candidate bauds because the previously-installed LTE module's rate wasn't
-// knowable in advance; this specific module only ever answers at 9600, so
-// GsmManager now opens the UART here directly instead of cycling candidates.
+// validation report. An earlier revision probed a list of candidate bauds
+// because the previously-installed LTE module's rate wasn't known in
+// advance; this module only ever answers at 9600, so GsmManager opens the
+// UART here directly instead of cycling candidates.
 constexpr unsigned long GSM_BAUD_RATE = 9600UL;
 
 // ======================================================
@@ -290,17 +299,17 @@ constexpr float EC_TARGET_MAX = 1.8f;
 // Alert Hysteresis (Stage 2 sensor architecture redesign)
 // ======================================================
 // Schmitt-trigger recovery margins for AlertManager's threshold alerts - see
-// AlertManager::risesAboveWithHysteresis()/fallsBelowWithHysteresis(). Once a
-// reading has crossed a configured min/max and latched the alert, it must
-// cross back past (threshold +/- this margin), not merely back over the same
-// line, before the alert clears - stops a reading sitting right at the
-// configured boundary from flapping the alert (and firing a fresh
-// notification) on ordinary sensor noise. Applied only at the alert layer;
-// never modifies the user-configured min/max thresholds themselves, and
-// unrelated to any control-side hysteresis (e.g. WATER_COOLING_HYSTERESIS)
-// which answers a different question (when equipment switches, not when to
-// notify). One constant per parameter, sized relative to that parameter's own
-// min/max gap and known sensor noise floor (e.g. PH_STABILITY_TOLERANCE,
+// AlertManager::risesAboveWithHysteresis()/fallsBelowWithHysteresis(). Once
+// a reading crosses a configured min/max and latches the alert, it must
+// cross back past (threshold +/- this margin), not merely back over the
+// same line, before the alert clears - stops a reading sitting right at the
+// boundary from flapping the alert (and firing a fresh notification) on
+// ordinary sensor noise. Applied only at the alert layer; never modifies
+// the user-configured min/max thresholds themselves, and unrelated to any
+// control-side hysteresis (e.g. WATER_COOLING_HYSTERESIS), which answers a
+// different question (when equipment switches, not when to notify). One
+// constant per parameter, sized relative to that parameter's own min/max
+// gap and known sensor noise floor (e.g. PH_STABILITY_TOLERANCE,
 // EC_STABILITY_TOLERANCE above).
 constexpr float PH_ALERT_HYSTERESIS = 0.1f;
 constexpr float EC_ALERT_HYSTERESIS = 0.1f;
@@ -316,48 +325,48 @@ constexpr float WATER_LEVEL_CM_ALERT_HYSTERESIS = 0.3f;     // refillStartLevelC
 // Second-stage stability gate over readPH()/readEC()'s already-averaged
 // output - see SensorManager::updateStabilityWindow() and
 // applyEffectiveSensors(). A sliding window of STABILITY_SAMPLE_WINDOW
-// samples, taken roughly one interval apart, must all agree within the
-// tolerance below before sensors.ph/sensors.ec (the ONE dataset
+// samples, roughly one interval apart, must all agree within the tolerance
+// below before sensors.ph/sensors.ec (the ONE dataset
 // AutomationManager/AlertManager/SafetyManager/Firebase publication all
-// consume - no separate raw path feeds any of them) accept a new value; an
-// unstable window keeps the previous accepted value instead of
-// publishing/acting on the fluctuation. Calibration (PH_SLOPE/PH_OFFSET,
-// EC_FACTOR - Calibration.h) is untouched by this filter; it only decides
-// when an already-calibrated reading is trustworthy enough to act on.
+// consume) accept a new value; an unstable window keeps the previous
+// accepted value instead of publishing/acting on the fluctuation.
+// Calibration (PH_SLOPE/PH_OFFSET, EC_FACTOR - Calibration.h) is untouched
+// by this filter; it only decides when an already-calibrated reading is
+// trustworthy enough to act on.
 //
 // Sampling cadence: readPH()/readEC() recompute their rolling average every
 // loop() tick, but the underlying ring buffer only advances by one raw ADC
-// sample every PH_SAMPLE_INTERVAL/EC_SAMPLE_INTERVAL - consecutive loop-tick
-// reads of that average are therefore heavily autocorrelated and would make
-// "10 agreeing samples" trivially true even mid-excursion. Each sensor's own
-// interval (STABILITY_SAMPLE_INTERVAL_MS for EC, PH_STABILITY_SAMPLE_INTERVAL_MS
-// for pH, passed into updateStabilityWindow() per call) is sized to
-// approximately one full turnover of that sensor's own rolling average, so
-// each stability-window sample is a genuinely fresh observation rather than
-// a near-duplicate of the last. EC stays at 61 samples * 20ms =~1.2s, while
-// pH is now 90 samples * 30ms =~2.7s (widened - see PH_SAMPLE_COUNT/
-// PH_SAMPLE_INTERVAL's own comment - the shared 1000ms interval this used to
-// be was tuned for pH's old ~1.0s turnover and went stale for pH once that
-// window grew).
+// sample every PH_SAMPLE_INTERVAL/EC_SAMPLE_INTERVAL - consecutive
+// loop-tick reads of that average are heavily autocorrelated and would make
+// "10 agreeing samples" trivially true even mid-excursion. Each sensor's
+// own interval (STABILITY_SAMPLE_INTERVAL_MS for EC,
+// PH_STABILITY_SAMPLE_INTERVAL_MS for pH, passed into
+// updateStabilityWindow() per call) is sized to approximately one full
+// turnover of that sensor's own rolling average, so each stability-window
+// sample is a genuinely fresh observation. EC stays at 61 samples * 20ms
+// =~1.2s, while pH is now 90 samples * 30ms =~2.7s (widened - see
+// PH_SAMPLE_COUNT/PH_SAMPLE_INTERVAL's own comment - the shared 1000ms
+// interval this used to be was tuned for pH's old ~1.0s turnover and went
+// stale once that window grew).
 constexpr uint8_t STABILITY_SAMPLE_WINDOW = 10;
 constexpr unsigned long STABILITY_SAMPLE_INTERVAL_MS = 1000UL;   // EC only now
 constexpr unsigned long PH_STABILITY_SAMPLE_INTERVAL_MS = 2700UL;   // pH only
 
 // Starting point per the task spec - tight enough to still reject genuine
-// probe noise, loose enough that 10 samples (~27s at PH_STABILITY_SAMPLE_INTERVAL_MS)
-// reliably converge once the reading has actually settled. Re-tune only
-// against observed near-threshold noise amplitude, never as a stand-in for
-// fixing a noisy connection.
+// probe noise, loose enough that 10 samples (~27s at
+// PH_STABILITY_SAMPLE_INTERVAL_MS) reliably converge once the reading has
+// actually settled. Re-tune only against observed near-threshold noise
+// amplitude, never as a stand-in for fixing a noisy connection.
 constexpr float PH_STABILITY_TOLERANCE = 0.05f;
 
 // EC's anchor-point calibration (Calibration.h) maps the 1.2-2.0 mS/cm
-// cultivation range to only ~168-280mV at the probe - the same 0.05 mS/cm
-// tolerance used for pH would allow just ~7mV of jitter there, tighter than
-// the ~10mV of ADC movement already observed on this hardware's flatter pH
-// channel (see SensorManager's own real-hardware note). Widened to keep the
-// window able to close at real operating voltage; this is an estimate, not
-// a measured value - re-tune against the EC-CAL diagnostic's actual jitter
-// once the probe is dipped at cultivation-range EC.
+// cultivation range to only ~168-280mV at the probe - pH's 0.05 mS/cm
+// tolerance would allow just ~7mV of jitter here, tighter than the ~10mV of
+// ADC movement already observed on this hardware's flatter pH channel (see
+// SensorManager's own real-hardware note). Widened so the window can close
+// at real operating voltage; an estimate, not measured - re-tune against
+// the EC-CAL diagnostic's actual jitter once the probe is dipped at
+// cultivation-range EC.
 constexpr float EC_STABILITY_TOLERANCE = 0.1f;
 
 // ======================================================
@@ -367,34 +376,33 @@ constexpr float EC_STABILITY_TOLERANCE = 0.1f;
 // HC-SR04 water-depth step filter's design (see readWaterLevel()'s own
 // comment and WATER_LEVEL_STEP_* below). A physically-valid pH candidate
 // (0.0-14.0, already guarded elsewhere) can still transiently jump (e.g.
-// 6.3 -> 7.3 -> 6.2) without representing a real pH change - reservoir
-// electrical noise, not a genuine dose-worthy event. A candidate within
-// PH_TELEMETRY_DEADBAND of the current trusted anchor (lastAcceptedPhCandidate)
-// is treated as noise and never moves the anchor; a candidate beyond the
-// deadband is held pending until PH_STEP_CONFIRM_COUNT consecutive
-// candidates mutually agree within PH_STEP_CONFIRM_TOLERANCE - only then
-// does the new level replace the anchor and get offered to the existing
-// 10-sample stability window, which still independently decides whether
-// that trusted stream itself is stable enough to become authoritative.
-// This filter does not replace that window; it only decides what
-// candidate stream the window ever sees.
+// 6.3 -> 7.3 -> 6.2) without a real pH change - reservoir electrical noise,
+// not a genuine dose-worthy event. A candidate within PH_TELEMETRY_DEADBAND
+// of the current trusted anchor (lastAcceptedPhCandidate) is treated as
+// noise and never moves the anchor; a candidate beyond the deadband is held
+// pending until PH_STEP_CONFIRM_COUNT consecutive candidates mutually agree
+// within PH_STEP_CONFIRM_TOLERANCE - only then does the new level replace
+// the anchor and get offered to the existing 10-sample stability window,
+// which still independently decides whether that trusted stream is stable
+// enough to become authoritative. This filter only decides what candidate
+// stream the window ever sees.
 //
-// pH telemetry ratcheting fix: the anchor used to also accept any
-// candidate within PH_STEP_ACCEPT_DELTA (0.15) of itself IMMEDIATELY, no
-// confirmation streak required. Chained across many 300ms ticks, a slow
-// noisy drift could walk the anchor an arbitrary distance in one
-// direction (6.50 -> 6.62 -> 6.74 -> 6.86 -> ...) even though no single
-// step exceeded 0.15, since each accepted step simply became the new
-// anchor the next comparison was measured against. PH_TELEMETRY_DEADBAND
-// replaces that immediate-accept path: the anchor now only ever moves
-// after PH_STEP_CONFIRM_COUNT candidates confirm a genuinely new level
-// relative to the SAME still-unmoved anchor, so small correlated steps in
-// one direction can no longer accumulate into an unconfirmed drift.
+// pH telemetry ratcheting fix: the anchor used to also accept any candidate
+// within PH_STEP_ACCEPT_DELTA (0.15) of itself immediately, no confirmation
+// streak required. Chained across many 300ms ticks, a slow noisy drift
+// could walk the anchor an arbitrary distance in one direction
+// (6.50 -> 6.62 -> 6.74 -> 6.86 -> ...) even though no single step exceeded
+// 0.15, since each accepted step became the new anchor the next comparison
+// was measured against. PH_TELEMETRY_DEADBAND replaces that immediate-
+// accept path: the anchor now only moves after PH_STEP_CONFIRM_COUNT
+// candidates confirm a genuinely new level relative to the SAME unmoved
+// anchor, so small correlated steps can no longer accumulate into an
+// unconfirmed drift.
 constexpr float PH_TELEMETRY_DEADBAND = 0.05f;
 
 // Superseded by PH_TELEMETRY_DEADBAND above for the anchor's own
 // accept-vs-hold decision (see the ratcheting fix comment) - left defined,
-// unused by SensorManager, only in case a future tuning pass wants the
+// unused by SensorManager, in case a future tuning pass wants the
 // distinction back.
 constexpr float PH_STEP_ACCEPT_DELTA = 0.15f;
 constexpr float PH_STEP_CONFIRM_TOLERANCE = 0.05f;
@@ -403,16 +411,15 @@ constexpr uint8_t PH_STEP_CONFIRM_COUNT = 3;
 // Quick-response refinement: the step filter's own evaluation cadence,
 // deliberately separate from PH_STABILITY_SAMPLE_INTERVAL_MS (2700ms) - the
 // automation-trust stability window below still samples at that slower,
-// stricter cadence unchanged. This is a dedicated, faster cadence purely
-// for how often the TEMPORAL FILTER itself pulls a fresh candidate from
-// the continuously-updating 90-sample median - fast enough that 3
-// confirmations (PH_STEP_CONFIRM_COUNT) complete in ~3x this interval
-// (~0.75-1.2s at 300ms), slow enough that consecutive evaluations are
-// still genuinely distinct observations rather than re-evaluating one
-// barely-changed rolling median value from adjacent loop() ticks (each
-// individual raw ADC sample only refreshes every PH_SAMPLE_INTERVAL=30ms,
-// so 300ms already spans several fresh raw samples sliding through the
-// median).
+// stricter cadence. This is a dedicated, faster cadence purely for how
+// often the TEMPORAL FILTER pulls a fresh candidate from the continuously-
+// updating 90-sample median - fast enough that 3 confirmations
+// (PH_STEP_CONFIRM_COUNT) complete in ~3x this interval (~0.75-1.2s at
+// 300ms), slow enough that consecutive evaluations are still genuinely
+// distinct observations rather than re-evaluating one barely-changed
+// rolling median from adjacent loop() ticks (each raw ADC sample only
+// refreshes every PH_SAMPLE_INTERVAL=30ms, so 300ms already spans several
+// fresh raw samples sliding through the median).
 constexpr unsigned long PH_STEP_SAMPLE_INTERVAL_MS = 300UL;
 
 // ======================================================
@@ -420,15 +427,15 @@ constexpr unsigned long PH_STEP_SAMPLE_INTERVAL_MS = 300UL;
 // ======================================================
 // Distinct from the domain/step/stability validation above, which already
 // catches an implausible-but-mid-range candidate (e.g. pH 24.1 from a
-// floating-but-not-rail-stuck input) - this layer instead inspects the RAW
+// floating-but-not-rail-stuck input) - this layer inspects the RAW
 // millivolt signal (physicalSensors.phMilliVolts/ecRaw) for evidence of a
 // genuine electrical fault: a signal pinned at/near the ADC's own physical
 // rail, which no chemistry reading through this transmitter/module can ever
 // legitimately produce. Deliberately NOT a "normal cultivation voltage
 // range" - see this task's own design principle: a chemically unusual
-// solution (e.g. a very high or very low but real EC/pH) must never be
-// mistaken for a disconnected probe. These margins are anchored to the
-// hardware's own physical/documented limits, not to any agronomic range.
+// solution (very high or low but real EC/pH) must never be mistaken for a
+// disconnected probe. These margins are anchored to the hardware's own
+// physical/documented limits, not any agronomic range.
 //
 // Precedent this margin is chosen against: the pH module's own prior
 // documented failure (see basilience_ph_calibration.md, 2026-09-05..08) was
@@ -441,24 +448,24 @@ constexpr unsigned long PH_STEP_SAMPLE_INTERVAL_MS = 300UL;
 //
 // pH: the DFRobot Gravity Analog pH Meter V2 (SEN0161-V2) transmitter's own
 // documented output spec is 0-3.0V, so PH_FAULT_RAIL_HIGH_MV sits just under
-// that spec's own ceiling - a reading AT or ABOVE the transmitter's own
-// stated maximum is not a value it should ever produce from a probe, on any
-// solution, within its designed operating range. Cross-checked against this
-// unit's own calibration (Calibration.h: pH 7.00 ~= 1500mV, pH 4.00 ~=
-// 2038mV): even the full 0-14 pH domain extrapolates to roughly 245-2755mV,
-// comfortably inside both rail margins with real margin to spare.
+// that ceiling - a reading AT or ABOVE the transmitter's own stated maximum
+// is not a value it should ever produce, on any solution, within its
+// designed range. Cross-checked against this unit's own calibration
+// (Calibration.h: pH 7.00 ~= 1500mV, pH 4.00 ~= 2038mV): even the full 0-14
+// pH domain extrapolates to roughly 245-2755mV, comfortably inside both
+// rail margins with real margin to spare.
 constexpr int PH_FAULT_RAIL_LOW_MV = 50;
 constexpr int PH_FAULT_RAIL_HIGH_MV = 2950;
 
 // EC: the module's exact model/transmitter spec is NOT known (see the
-// sensor-inventory audit - it is only known to be an analog TDS-style probe,
-// 5V-powered, read via GPIO34's analogReadMilliVolts()). Without a documented
-// transmitter ceiling to anchor against the way pH's 0-3.0V spec allows,
-// this instead uses the ESP32 ADC_11db input's own practical ceiling as the
-// conservative bound - not an assumption about what the module itself should
-// output. EC's own calibration anchor (Calibration.h: 1.799V for a 12.88
-// mS/cm reference solution, far above the real 1.2-2.0 mS/cm cultivation
-// range) sits well clear of this margin on the low side already.
+// sensor-inventory audit - only known to be an analog TDS-style probe,
+// 5V-powered, read via GPIO34's analogReadMilliVolts()). Without a
+// documented transmitter ceiling to anchor against (unlike pH's 0-3.0V
+// spec), this uses the ESP32 ADC_11db input's own practical ceiling as the
+// conservative bound, not an assumption about module output. EC's own
+// calibration anchor (Calibration.h: 1.799V for a 12.88 mS/cm reference
+// solution, far above the real 1.2-2.0 mS/cm cultivation range) sits well
+// clear of this margin on the low side already.
 constexpr int EC_FAULT_RAIL_LOW_MV = 50;
 constexpr int EC_FAULT_RAIL_HIGH_MV = 3200;
 
@@ -466,61 +473,62 @@ constexpr int EC_FAULT_RAIL_HIGH_MV = 3200;
 // the CHIP-INDEPENDENT rail signal, preferred over the millivolt thresholds
 // above where the two disagree. analogReadMilliVolts()'s calibrated ceiling
 // at raw=4095 depends on this specific chip's own eFuse calibration data
-// (Two Point / Vref / Default), which is not read out or logged anywhere in
-// this firmware and is known to vary unit-to-unit - commonly landing
-// somewhere in the ~2900-3300mV band, but not a guaranteed fixed number. A
-// millivolt-only high-rail check therefore risks a false NEGATIVE on a chip
-// whose calibration curve maps raw=4095 to a value below PH_FAULT_RAIL_HIGH_MV/
-// EC_FAULT_RAIL_HIGH_MV - a genuinely saturated input that never gets
-// flagged. Raw count has no such risk: 4095 at 12-bit resolution is the
-// ADC's own physical ceiling on every ESP32 unit, true by construction, not
-// by calibration. Shared between pH and EC (both use the same 12-bit
-// resolution/ADC_11db attenuation, set once in SensorManager::begin() -
-// this is an ADC/attenuation-level property, not a per-sensor one, unlike
-// the millivolt margins above which are legitimately sensor-specific).
+// (Two Point / Vref / Default), not read out or logged anywhere in this
+// firmware and known to vary unit-to-unit - commonly ~2900-3300mV, but not
+// a guaranteed fixed number. A millivolt-only high-rail check therefore
+// risks a false NEGATIVE on a chip whose curve maps raw=4095 below
+// PH_FAULT_RAIL_HIGH_MV/EC_FAULT_RAIL_HIGH_MV - a genuinely saturated input
+// that never gets flagged. Raw count has no such risk: 4095 at 12-bit
+// resolution is the ADC's own physical ceiling on every ESP32 unit, true by
+// construction, not calibration. Shared between pH and EC (both use the
+// same 12-bit resolution/ADC_11db attenuation, set once in
+// SensorManager::begin() - an ADC/attenuation-level property, not a
+// per-sensor one, unlike the millivolt margins above which are legitimately
+// sensor-specific).
 //
 // Margins: 5 counts (~0.12% of full scale) off each hard rail, wide enough
 // to absorb residual ADC dither at true saturation even after the existing
-// 90/61-sample median, narrow enough that no plausible mid-range signal
-// (pH or EC alike) can ever wander into it. Combined with the millivolt
-// checks via OR - either signal alone is sufficient evidence of a fault,
-// see SensorManager::readPH()/readEC().
+// 90/61-sample median, narrow enough that no plausible mid-range signal can
+// ever wander into it. Combined with the millivolt checks via OR - either
+// signal alone is sufficient evidence of a fault, see
+// SensorManager::readPH()/readEC().
 constexpr int ADC_FAULT_RAW_LOW = 5;
 constexpr int ADC_FAULT_RAW_HIGH = 4090;
 
 // How often the fault detector re-evaluates the rolling median, deliberately
 // independent of the 20ms raw sample rate feeding phSampler/ecSampler and of
 // STABILITY_SAMPLE_INTERVAL_MS/PH_STEP_SAMPLE_INTERVAL_MS above (different
-// purposes, different cadences). Evaluating any faster would let "N
-// consecutive evaluations" be satisfied by re-checking one still-settling
-// median within milliseconds - the same class of bug already fixed
-// elsewhere for the pH step filter and the HC-SR04 step filter (both
-// require genuinely distinct, time-separated observations).
+// purposes, different cadences). Evaluating faster would let "N consecutive
+// evaluations" be satisfied by re-checking one still-settling median within
+// milliseconds - the same class of bug already fixed elsewhere for the pH
+// step filter and the HC-SR04 step filter (both require genuinely distinct,
+// time-separated observations).
 constexpr unsigned long PH_FAULT_CHECK_INTERVAL_MS = 1000UL;
 constexpr unsigned long EC_FAULT_CHECK_INTERVAL_MS = 1000UL;
 
 // Consecutive rail-condition evaluations (at the interval above) required
 // before a probable hardware fault is CONFIRMED. Deliberately conservative:
 // actuator switching (peristaltic pumps, solenoid, Peltier) can transiently
-// disturb the analog front end, and a fault call blocks dosing/fogging until
-// manually reset - a false positive here is costly, so this trades speed for
-// certainty. 8 x 1000ms = 8 seconds minimum of sustained rail-pinned signal
-// before a fault is ever raised.
+// disturb the analog front end, and a fault call blocks dosing/fogging
+// until manually reset - a false positive here is costly, so this trades
+// speed for certainty. 8 x 1000ms = 8 seconds minimum of sustained
+// rail-pinned signal before a fault is ever raised.
 constexpr uint8_t PH_FAULT_CONFIRM_COUNT = 8;
 constexpr uint8_t EC_FAULT_CONFIRM_COUNT = 8;
 
 // Consecutive PLAUSIBLE (non-rail) evaluations required before a CONFIRMED
 // fault clears. Symmetric with the confirmation count above, same reasoning
-// SensorManager::readDHT() already established for its own dhtRecoveryStreak:
-// a marginal/flickering fault recovering on one isolated good sample and
-// immediately failing again must not thrash phFault/ecFault (and the alert/
-// notification it feeds). Clearing this flag only stops forcing sensors.ph/
-// ec to NaN - it does NOT itself restore automation trust; the existing
-// step filter/stability window (reset at fault onset) must still
+// SensorManager::readDHT() already established for dhtRecoveryStreak: a
+// marginal/flickering fault recovering on one isolated good sample and
+// immediately failing again must not thrash phFault/ecFault (and the
+// alert/notification it feeds). Clearing this flag only stops forcing
+// sensors.ph/ec to NaN - it does NOT restore automation trust; the
+// existing step filter/stability window (reset at fault onset) must still
 // independently re-earn a confirmed, stable reading before
 // canDosePH()/canDoseEC()/canFog() report SAFE again. See this task's
-// required recovery sequence: electrical signal plausible -> fault recovery
-// confirmed -> normal stability criteria satisfied -> automation eligible.
+// required recovery sequence: electrical signal plausible -> fault
+// recovery confirmed -> normal stability criteria satisfied -> automation
+// eligible.
 constexpr uint8_t PH_FAULT_RECOVERY_COUNT = 8;
 constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
 
@@ -529,9 +537,9 @@ constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
 // electrical rail above - e.g. ~365-400mV - can still fall so far outside
 // the domain EC_CAL_1_VOLTAGE/EC_CAL_2_VOLTAGE (Calibration.h) were actually
 // fit against that the two-point line extrapolates it into a physically
-// impossible negative EC, which the rail check alone never catches. This
-// does NOT change the calibration anchors or the two-point formula itself -
-// it only judges whether a given reading is far enough outside that model's
+// impossible negative EC, which the rail check alone never catches. Does
+// NOT change the calibration anchors or the two-point formula itself - it
+// only judges whether a reading is far enough outside that model's
 // validated domain to be untrustworthy. Margin (not a hard clamp at the two
 // anchor voltages) because only two solutions were ever captured and real
 // cultivation-range EC can legitimately sit a bit outside that narrow
@@ -544,7 +552,7 @@ constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
 // and its own fault field (physicalSensors.ecCalibrationFault) - kept
 // independent of the rail detector's own ecFaultStreak/physicalSensors.ecFault
 // so the two confirm/recovery debounces can never race each other into
-// clearing a fault the other one is still confirming; applyEffectiveSensors()
+// clearing a fault the other is still confirming; applyEffectiveSensors()
 // ORs both into the one published ecFault flag/NaN override.
 constexpr float EC_CAL_VOLTAGE_MARGIN_V = 0.3f;
 
@@ -552,7 +560,7 @@ constexpr float EC_CAL_VOLTAGE_MARGIN_V = 0.3f;
 // hardware pre-integration follow-up, Part A) - independent of
 // STABILITY_SAMPLE_INTERVAL_MS (how often the window itself re-evaluates).
 // The existing "unstable; keeping last=" log only fires once, on the
-// stable->unstable transition edge, so a window that then never re-agrees
+// stable->unstable transition edge, so a window that never re-agrees
 // produces no further evidence on its own; this makes the current
 // candidate/min/max/range visible every few seconds regardless of outcome.
 constexpr unsigned long STABILITY_DIAGNOSTIC_INTERVAL_MS = 5000UL;
@@ -576,16 +584,16 @@ constexpr unsigned long PH_ADC_DIAGNOSTIC_INTERVAL_MS = 5000UL;
 // - one-point or two-point - is currently active).
 constexpr unsigned long EC_ADC_DIAGNOSTIC_INTERVAL_MS = 5000UL;
 
-// If no NEW stable window is accepted within this long of the last one,
-// the held value is too old to keep trusting and sensors.ph/ec fall back to
-// NaN (SENSOR_FAULT via the existing validPH()/validEC() path - see
-// SafetyManager.cpp) rather than silently acting on a stale reading forever.
-// A separate concern from PH_EC_CORRECTION_STALL_TIMEOUT_MS below (that one
+// If no NEW stable window is accepted within this long of the last one, the
+// held value is too old to keep trusting and sensors.ph/ec fall back to NaN
+// (SENSOR_FAULT via the existing validPH()/validEC() path - see
+// SafetyManager.cpp) rather than silently acting on a stale reading
+// forever. Separate from PH_EC_CORRECTION_STALL_TIMEOUT_MS below (that one
 // bounds an active correction's dosing/lock decision; this one is purely
-// "has the probe stopped reporting anything trustworthy at all") - 3 minutes
-// gives headroom above legitimate churn during active dosing while still
-// catching a genuinely dead/disconnected probe well before "stale" would
-// otherwise mean "silently wrong for a very long time."
+// "has the probe stopped reporting anything trustworthy at all") - 3
+// minutes gives headroom above legitimate churn during active dosing while
+// still catching a genuinely dead/disconnected probe well before "stale"
+// would otherwise mean "silently wrong for a very long time."
 constexpr unsigned long PH_EC_STABLE_TIMEOUT_MS = 180000UL;
 
 constexpr float LOW_WATER_LEVEL = 20.0f;
@@ -596,28 +604,27 @@ constexpr float LOW_WATER_LEVEL = 20.0f;
 // again (AutomationManager::updateCooling() no longer overwrites either from
 // systemState.maxWaterTemp every tick - that overwrite was silently
 // defeating their existing Firebase/NVS read-write wiring, making them look
-// configurable while never actually taking effect; removed as part of this
-// change). HIGH_WATER_TEMP is the PREVENTIVE automatic-cooling trigger
-// (despite its name, kept unchanged deliberately - see updateCooling()'s own
-// comment on why a full field/key rename was judged too risky for an
-// un-compiled change), not the maximum - that role now belongs solely to
-// systemState.maxWaterTemp/TARGET_MAX_WATER_TEMP (28.0C), which is also the
-// separate upper safety ceiling SafetyManager::canFog() suspends fogging
-// above. COOLER_OFF_TEMP is the cooling release threshold, independently
-// set rather than derived - the resulting gap (26.5 - 25.5 = 1.0C) is
-// smaller than the previous derived 2.5C, an intentional consequence of
-// moving the trigger down while preserving the already-confirmed 25.5C
-// release point; see WATER_COOLING_HYSTERESIS's own comment below for why
-// that constant is no longer used to compute it.
+// configurable while never taking effect; removed as part of this change).
+// HIGH_WATER_TEMP is the PREVENTIVE automatic-cooling trigger (despite its
+// name, kept unchanged deliberately - see updateCooling()'s own comment on
+// why a full field/key rename was judged too risky for an un-compiled
+// change), not the maximum - that role now belongs solely to
+// systemState.maxWaterTemp/TARGET_MAX_WATER_TEMP (28.0C), also the separate
+// upper safety ceiling SafetyManager::canFog() suspends fogging above.
+// COOLER_OFF_TEMP is the cooling release threshold, independently set
+// rather than derived - the resulting gap (26.5 - 25.5 = 1.0C) is smaller
+// than the previous derived 2.5C, an intentional consequence of moving the
+// trigger down while preserving the already-confirmed 25.5C release point;
+// see WATER_COOLING_HYSTERESIS's own comment below for why that constant is
+// no longer used to compute it.
 constexpr float HIGH_WATER_TEMP = 26.5f;
 constexpr float COOLER_OFF_TEMP = 25.5f;
 
 // RETIRED - superseded by architecture update (cooling trigger/release are
-// now independently-set HIGH_WATER_TEMP/COOLER_OFF_TEMP above, not one
-// derived from systemState.maxWaterTemp minus this gap). Left in place,
-// unmodified, only so it remains available as a documented historical
-// reference for the resulting 1.0C gap's own prior value (2.5C) - not read
-// by any live code path any more.
+// now independently-set HIGH_WATER_TEMP/COOLER_OFF_TEMP above, not derived
+// from systemState.maxWaterTemp minus this gap). Left in place, unmodified,
+// only as a documented historical reference for the resulting 1.0C gap's
+// own prior value (2.5C) - not read by any live code path any more.
 constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 
 // ======================================================
@@ -627,10 +634,10 @@ constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 // FILL/soak/FLUSH via DevOptionsFragment's manual actuator controls, DS18B20
 // observed through each phase): 5s is enough to fill, 30s of Peltier-only
 // soak is the cooling window, 5s is enough to flush. Still named with the
-// _TEMP suffix - not because the values are placeholders any more, but
-// because the underlying reservoir/Peltier hardware they're tuned to could
-// change (a bigger reservoir, a different Peltier module) and would need
-// these re-measured, not just re-guessed.
+// _TEMP suffix - not because the values are placeholders, but because the
+// underlying reservoir/Peltier hardware they're tuned to could change (a
+// bigger reservoir, a different Peltier module) and would need these
+// re-measured, not just re-guessed.
 //
 // DEFERRED - ineffective-cooling detection: deliberately NOT implemented.
 // The pulse mechanism can currently repeat FILL->COOL_SOAK->FLUSH
@@ -645,8 +652,8 @@ constexpr float WATER_COOLING_HYSTERESIS = 2.5f;
 // completes; the resulting cooling rate; how many cycles this reservoir
 // typically needs to recover from a real excursion; behavior under hotter
 // ambient conditions than bench-tested; and whether one Peltier module can
-// hold this ~10.6L working volume below 28C at all under worst-case ambient.
-// Flagged here, not solved, until that data exists.
+// hold this ~10.6L working volume below 28C at all under worst-case
+// ambient. Flagged here, not solved, until that data exists.
 constexpr unsigned long COOLING_PULSE_FILL_DURATION_MS_TEMP = 5UL * 1000UL;
 constexpr unsigned long COOLING_PULSE_SOAK_DURATION_MS_TEMP = 20UL * 1000UL;
 constexpr unsigned long COOLING_PULSE_FLUSH_DURATION_MS_TEMP = 5UL * 1000UL;
@@ -667,7 +674,7 @@ constexpr unsigned long COOLING_PULSE_CONFIRM_TIMEOUT_MS = 30UL * 1000UL;
 // These answer "is the reading inside the range the crop should be kept in?"
 // and are what Monitoring, alerts and Reports classify against.
 //
-// They are deliberately SEPARATE from the actuator control thresholds below
+// Deliberately SEPARATE from the actuator control thresholds below
 // (HIGH_AIR_TEMP/AIR_TEMP_RELEASE, HIGH_WATER_TEMP/COOLER_OFF_TEMP,
 // REFILL_START_LEVEL/REFILL_STOP_LEVEL), which answer a different question:
 // "when should a fan/cooler/valve switch state?" A release/off threshold is
@@ -689,11 +696,27 @@ constexpr float TARGET_MAX_HUMIDITY = 75.0f;
 constexpr float TARGET_MIN_WATER_TEMP = 18.0f;
 constexpr float TARGET_MAX_WATER_TEMP = 28.0f;
 
-// Derived from the band the system already maintains the reservoir between
-// (refill starts at 20%, stops at 75%). Kept as its own setting so the refill
-// control thresholds stay independently tunable.
-constexpr float TARGET_MIN_WATER_LEVEL = 20.0f;
-constexpr float TARGET_MAX_WATER_LEVEL = 75.0f;
+// Derived from the band the system already maintains the reservoir between -
+// see AlertManager::updateLowWaterAlert()'s "TARGET-RANGE classification"
+// (waterLevelLow/waterLevelHigh, what the app cards color against), separate
+// from the CONTROL thresholds (refillStartLevelCm/refillStopLevelCm) that
+// actually open/close the solenoid.
+//
+// CONFIRMED STALE VALUE (found during water-level management spec
+// alignment): these were still 20%/75%, left over from the retired LEGACY
+// percentage refill model (REFILL_START_LEVEL/REFILL_STOP_LEVEL, both also
+// 20.0/75.0 - see "Water Refill (LEGACY percentage model)" below) and never
+// recomputed when the water-depth-model task moved refill control to
+// centimeter thresholds. They never actually matched either the old 6cm-
+// basis percentage (REFILL_START_CM=2.0cm/REFILL_STOP_CM was 3.0cm would
+// have been ~33%/50%) or, now, the new 20cm-basis one. Recomputed here from
+// the actual current authoritative control thresholds (REFILL_START_CM=2.0,
+// REFILL_STOP_CM=5.0) against the new MAX_WORKING_WATER_CM=20.0 basis -
+// 2.0/20*100 and 5.0/20*100 - so this target range finally means what its
+// own comment always said it should: the same band the refill controller
+// actually maintains.
+constexpr float TARGET_MIN_WATER_LEVEL = 10.0f;
+constexpr float TARGET_MAX_WATER_LEVEL = 25.0f;
 
 constexpr float HIGH_AIR_TEMP = 32.0f;
 constexpr float AIR_TEMP_RELEASE = 26.0f;
@@ -775,13 +798,13 @@ constexpr unsigned long SENSOR_STABILIZATION_TIME = 60000UL; // 1 minute
 // Coherent-snapshot readiness (quick-response refinement task) - deliberately
 // NOT SENSOR_STABILIZATION_TIME above, which is AutomationManager's own
 // boot-wait state duration for a different purpose (holding automatic
-// refill/pH/EC/fog regulation off) and is far longer than Monitoring UI
+// refill/pH/EC/fog regulation off) and far longer than Monitoring UI
 // readiness should ever need to wait. See FirebaseManager::writeSensors()'s
-// own comment for the exact readiness rule: the "fast" sensors (water level,
-// pH telemetry) reaching their own first determination before
+// own comment for the exact readiness rule: the "fast" sensors (water
+// level, pH telemetry) reaching their own first determination before
 // SENSOR_READY_MIN_MS is not trusted as coincidence (an artifact of
-// evaluating before any real read cycle has run), and SENSOR_READY_MAX_MS is
-// the hard fallback so a genuinely stuck/failed fast sensor still bounds
+// evaluating before any real read cycle has run), and SENSOR_READY_MAX_MS
+// is the hard fallback so a genuinely stuck/failed fast sensor still bounds
 // readiness rather than blocking the dashboard indefinitely.
 constexpr unsigned long SENSOR_READY_MIN_MS = 500UL;
 constexpr unsigned long SENSOR_READY_MAX_MS = 3000UL;
@@ -820,6 +843,33 @@ constexpr unsigned long COLD_FOG_ON_TIME =
 constexpr unsigned long COLD_FOG_OFF_TIME =
     5UL * 60UL * 1000UL; // 5 minutes
 
+// Night Fogging Mode. Selected by RTC/time only (AutomationManager::
+// processFogCycle()), never by relative humidity, and takes precedence over
+// the HOT/COLD/NORMAL temperature-based cadence above whenever the RTC
+// confirms the current time falls in [NIGHT_START, NIGHT_END). A cadence
+// selection only - it reuses the exact same STARTUP -> NORMAL lifecycle,
+// canFog() safety gate, Blower pairing/purge, and cultivation-cycle gating
+// every other fogging strategy already goes through; see processFogCycle()'s
+// own comment for the precedence/RTC-invalid-fallback details.
+constexpr unsigned long NIGHT_FOG_ON_TIME =
+    2UL * 60UL * 1000UL; // 2 minutes
+
+constexpr unsigned long NIGHT_FOG_OFF_TIME =
+    10UL * 60UL * 1000UL; // 10 minutes
+
+// Night period: 22:00 inclusive to 06:00 exclusive - passed to the existing
+// AutomationManager::isWithinSchedule(startHour, startMinute, endHour,
+// endMinute) helper (already overnight-wraparound-correct and already
+// proven via the grow-light schedule's own confirmed bug fix), not a new
+// time-window implementation. Fixed constants, not a systemState/Firebase-
+// configurable setting - unlike lightOnHour/lightOnMinute/lightOffHour/
+// lightOffMinute, the night fogging window was not specified as
+// admin-configurable.
+constexpr uint8_t NIGHT_FOG_START_HOUR = 22;
+constexpr uint8_t NIGHT_FOG_START_MINUTE = 0;
+constexpr uint8_t NIGHT_FOG_END_HOUR = 6;
+constexpr uint8_t NIGHT_FOG_END_MINUTE = 0;
+
 // Short Blower overrun after the Fogger turns off (automatic fogging and
 // startup fogging alike) to clear fog concentrated near the reservoir toward
 // the root chamber. Consumes the front of the existing OFF/rest window -
@@ -837,8 +887,8 @@ constexpr unsigned long BLOWER_PURGE_MS =
 // comment already (incorrectly) claiming the replacement had happened. Now
 // genuinely consumed, and the root-zone blower's automatic fogging speed is
 // independent of canopy temperature/humidity demand and of CANOPY_FAN's PWM,
-// exactly as intended - confirmed default is 65%, not the previous 30%
-// (the comment previously and inconsistently also said "50%" here - neither
+// exactly as intended - confirmed default is 65%, not the previous 30% (the
+// comment previously and inconsistently also said "50%" here - neither
 // matched the actual 30 value; this is now internally consistent). Used as
 // the DEFAULT AND the boot/never-configured fallback - it is never written
 // back to Firebase on its own; see FirebaseManager::readSettings()'s own
@@ -854,19 +904,19 @@ constexpr uint8_t BLOWER_SPEED_MAX_PERCENT = 100;
 // Canopy/Blower PWM hardware parameters - see ActuatorManager::begin()'s
 // ledcAttach() call, the single place these are applied, and
 // ActuatorManager::percentToDuty(), the single place a 0-100% command is
-// converted to a duty value. Named here (rather than the previous inline
-// 5000/8 literals) so the max-duty calculation shared by percentToDuty()
-// and its own diagnostic logging has one source of truth.
+// converted to a duty value. Named here (rather than inline 5000/8 literals)
+// so the max-duty calculation shared by percentToDuty() and its own
+// diagnostic logging has one source of truth.
 //
 // Frequency lowered from 5000 Hz to 200 Hz after real-hardware bench testing
-// (FanPwmSpeedTest.ino) on the actual driver board, an opto-isolated 4-channel
-// MOSFET module. At 5000 Hz (200us/cycle) the optocoupler's turn-on/turn-off
-// delay ate a large share of every pulse: low percentages barely switched on
-// and anything a bit higher never fully switched off, so nearly the whole
-// 0-100% range collapsed to full speed. At 200 Hz (5ms/cycle) the fans
-// respond proportionally across the range - confirmed usable from 15%
-// (Blower) / 25% (Canopy Fan) up to 100%, with 65-75% the cleanest-running
-// band for both.
+// (FanPwmSpeedTest.ino) on the actual driver board, an opto-isolated
+// 4-channel MOSFET module. At 5000 Hz (200us/cycle) the optocoupler's
+// turn-on/turn-off delay ate a large share of every pulse: low percentages
+// barely switched on and anything higher never fully switched off, so
+// nearly the whole 0-100% range collapsed to full speed. At 200 Hz
+// (5ms/cycle) the fans respond proportionally across the range - confirmed
+// usable from 15% (Blower) / 25% (Canopy Fan) up to 100%, with 65-75% the
+// cleanest-running band for both.
 constexpr uint32_t CANOPY_BLOWER_PWM_FREQUENCY_HZ = 200;
 constexpr uint8_t CANOPY_BLOWER_PWM_RESOLUTION_BITS = 8;
 
@@ -1028,16 +1078,28 @@ constexpr float WATER_LEVEL_FULL_DISTANCE_CM = 5.0f;
 // report. These are the reservoir's actual measured physical dimensions,
 // fixed for this reservoir design - unlike WATER_LEVEL_EMPTY_DISTANCE_CM
 // (sensor mounting height, which does vary per installation), they are not
-// exposed as a /settings field. The physical container height (~29cm) must
-// NOT be treated as 100% - MAX_WORKING_WATER_CM (6.0cm) is the working
-// capacity, matching the intended operating band, not the tank's full
-// physical depth.
+// exposed as a /settings field.
 //
-// Reference: depth 0/1/2/3/4/5/6 cm -> 0/16.7/33.3/50.0/66.7/83.3/100 % ->
-// 0.00/1.77/3.54/5.30/7.07/8.84/10.61 L.
+// Water-level management spec alignment: MAX_WORKING_WATER_CM used to be
+// 6.0cm, a deliberately-NOT-100% "working capacity" distinct from the tank's
+// full physical depth (~29cm container height). The spec instead defines
+// "the reservoir's approximately 20-centimeter full depth" as 100% of the
+// reservoir level - changed to 20.0cm to match. This constant is now both
+// the 100% basis for the derived percentage AND the physical-plausibility
+// acceptance ceiling for a measured depth (SensorManager::readWaterLevel()),
+// so both move together; kept as one constant, not split, exactly as before.
+// It still is NOT the tank's full container height (~29cm) - that remains
+// headroom above the fill line for the HC-SR04 sensor's own mounting
+// position (see WATER_LEVEL_EMPTY_DISTANCE_CM, 28.67cm sensor-to-bottom),
+// not a usable depth. The per-read-cycle jump-plausibility ceiling
+// (WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM below) is deliberately NOT tied to this
+// constant any more - see its own comment for why.
+//
+// Reference: depth 0/2/4/5/6/10/15/20 cm -> 0/10/20/25/30/50/75/100 % ->
+// 0.00/3.54/7.07/8.84/10.61/17.68/26.52/35.36 L.
 constexpr float RESERVOIR_LENGTH_CM = 52.0f;
 constexpr float RESERVOIR_WIDTH_CM = 34.0f;
-constexpr float MAX_WORKING_WATER_CM = 6.0f;
+constexpr float MAX_WORKING_WATER_CM = 20.0f;
 
 // Control thresholds (centimeters of water DEPTH) - authoritative for
 // automation. Do not derive refill decisions by converting the working
@@ -1064,14 +1126,19 @@ constexpr float MAX_WORKING_WATER_CM = 6.0f;
 //                                is ever required.
 // REFILL_STOP_CM is deliberate hysteresis above REFILL_START_CM so a
 // completed refill is not immediately re-triggered by the same low reading;
-// 6cm (MAX_WORKING_WATER_CM) is never the refill target, only the
-// working-capacity ceiling for monitoring/reporting - and is never a cap on
-// the actual measured sensors.waterLevelCm itself (see
+// MAX_WORKING_WATER_CM (the reservoir's ~20cm full depth) is never the
+// refill target, only the 100%/physical ceiling for monitoring/reporting -
+// and is never a cap on the actual measured sensors.waterLevelCm itself (see
 // SensorManager::readWaterLevel()): only the derived percentage clamps at
-// 100%, an overfilled reservoir still reports its true depth above 6cm.
+// 100%, an overfilled reservoir still reports its true depth above it.
+// Water-level management spec alignment: "the refill process will stop once
+// a confirmed water depth of at least 5.0 centimeters is reached" - was
+// 3.0cm, changed to match. Well under MAX_WORKING_WATER_CM (20.0cm, the
+// reservoir's full depth) - refill still only ever tops the reservoir back
+// up to its normal ~5cm/9-10L operating point, never toward full.
 constexpr float CRITICAL_LOW_WATER_CM = 1.0f;
 constexpr float REFILL_START_CM = 2.0f;
-constexpr float REFILL_STOP_CM = 3.0f;
+constexpr float REFILL_STOP_CM = 5.0f;
 
 // ======================================================
 // HC-SR04 Accepted-Value Temporal Plausibility Filter
@@ -1112,12 +1179,22 @@ constexpr uint8_t WATER_LEVEL_STEP_CONFIRM_COUNT = 3;
 // reacquisition exactly as before.
 //
 // A jump this large or larger from the current TRUSTED depth is never
-// physically plausible in a single read cycle (a genuine fast manual
-// fill/drain still moves far less than the entire working range in 5-10s)
-// and is never eligible to become trusted no matter how many times it
-// repeats - tied to the existing MAX_WORKING_WATER_CM geometry constant
-// rather than an arbitrary new number.
-constexpr float WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM = MAX_WORKING_WATER_CM;
+// physically plausible in a single read cycle: the automatic refill's own
+// solenoid, the fastest real source of level change this system has, only
+// moves the reservoir from REFILL_START_CM (2.0cm) toward REFILL_STOP_CM
+// (5.0cm) - a few cm - over its full 30s run, i.e. well under this much in
+// one 5s WATER_LEVEL_READ_INTERVAL_MS tick. Never eligible to become trusted
+// no matter how many times it repeats.
+//
+// Water-level management spec alignment: deliberately NO LONGER tied to
+// MAX_WORKING_WATER_CM (now the reservoir's full ~20cm depth, the 100%
+// basis/physical-acceptance ceiling - see its own comment). Anchoring a
+// realistic single-read-cycle movement bound to the FULL reservoir depth
+// would make it far too permissive (a ~20cm jump is not remotely realistic
+// in 5-10s either, so inheriting that value here would have been wrong even
+// before this change) - kept as its own literal value, still the old 6.0cm
+// figure, which already comfortably bounds any real single-cycle movement.
+constexpr float WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM = 6.0f;
 
 // A jump smaller than the implausible ceiling above (still a genuine "large
 // jump" past WATER_LEVEL_STEP_ACCEPT_CM, but not physically absurd) is
@@ -1127,4 +1204,15 @@ constexpr float WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM = MAX_WORKING_WATER_CM;
 // WATER_LEVEL_STEP_CONFIRM_COUNT, at the same WATER_LEVEL_READ_INTERVAL_MS
 // cadence (so up to ~25-30s of sustained agreement, not ~10s).
 constexpr uint8_t WATER_LEVEL_JUMP_CONFIRM_COUNT = 6;
+
+// ======================================================
+// Serial diagnostics (observability pass) - shared between FirebaseManager
+// and DebugManager, so declared here rather than duplicated or left with
+// file-local (default internal) linkage in one .cpp.
+// ======================================================
+// A Firebase RTDB/auth call at or above this duration is reported as SLOW
+// regardless of log level - see DebugManager::logFirebaseDuration(). Below
+// it, a duration is only shown at LEVEL_VERBOSE. Unchanged from this
+// project's original threshold.
+constexpr unsigned long SLOW_FIREBASE_OPERATION_MS = 2000;
 #endif

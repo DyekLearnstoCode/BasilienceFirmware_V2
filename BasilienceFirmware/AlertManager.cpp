@@ -156,13 +156,13 @@ void AlertManager::update()
     // dataset: while the mock-vs-physical source is still unresolved after
     // boot, sensors are held invalid, and no alert (including sensorFault)
     // should be derived from that transient window either. A boot-restored
-    // mock session waiting for its first fresh payload is the same
-    // situation - SensorManager::applyEffectiveSensors() is deliberately
-    // publishing an all-NaN placeholder so automatic actuators fail closed
-    // (unchanged, not touched here), and that placeholder must not also be
-    // misread as a genuine sensor fault. Both checks only ever return early
-    // - actuator/safety gating (SafetyManager's isfinite() checks against
-    // the still-NaN `sensors`) is untouched by this file.
+    // mock session waiting for its first fresh payload is the same situation
+    // - SensorManager::applyEffectiveSensors() deliberately publishes an
+    // all-NaN placeholder so automatic actuators fail closed (unchanged, not
+    // touched here), and that placeholder must not be misread as a genuine
+    // sensor fault. Both checks only ever return early - actuator/safety
+    // gating (SafetyManager's isfinite() checks against the still-NaN
+    // `sensors`) is untouched by this file.
     if (!systemState.sensorSourceResolved || sensorManager.isMockBootWaiting())
     {
         return;
@@ -195,18 +195,18 @@ void AlertManager::updateLowWaterAlert()
     // reacquiring a baseline - only a genuinely accepted new depth.
     const bool newSample = newObservation(sensorManager.getWaterLevelSampleVersion(), waterLevelLastProcessedVersion);
 
-    // CONTROL signal - stays on refillStartLevelCm (water depth, cm)
-    // because it gates AutomationManager::handleNormal()'s automatic refill
-    // trigger and SafetyManager::canResetSafety() - see Config.h's "Water
-    // Reservoir Geometry" section. Deliberately NOT criticalLowWaterCm
-    // (the stricter bar that blocks pH/EC/fogging/cooling directly in
+    // CONTROL signal - stays on refillStartLevelCm (water depth, cm) because
+    // it gates AutomationManager::handleNormal()'s automatic refill trigger
+    // and SafetyManager::canResetSafety() - see Config.h's "Water Reservoir
+    // Geometry" section. Deliberately NOT criticalLowWaterCm (the stricter
+    // bar that blocks pH/EC/fogging/cooling directly in
     // SafetyManager/ActuatorManager, independent of this alert): this flag
     // means "eligible to refill," a materially less severe condition.
-    // Retargeting this at minWaterLevel would change when the valve opens,
-    // which is a control change, not a reporting one. A LOW-only condition
-    // (no upper bound) - recovers once the depth has risen back past
-    // refillStartLevelCm + WATER_LEVEL_CM_ALERT_HYSTERESIS, not merely back
-    // over the same line the refill valve itself just opened at.
+    // Retargeting at minWaterLevel would change when the valve opens, a
+    // control change, not a reporting one. A LOW-only condition (no upper
+    // bound) - recovers once depth has risen back past refillStartLevelCm +
+    // WATER_LEVEL_CM_ALERT_HYSTERESIS, not merely back over the same line
+    // the refill valve itself just opened at.
     setAlertDebounced("lowWater", alertState.lowWater,
         belowWithHysteresis(alertState.lowWater, sensors.waterLevelCm,
             systemState.refillStartLevelCm, WATER_LEVEL_CM_ALERT_HYSTERESIS, valid),
@@ -217,8 +217,8 @@ void AlertManager::updateLowWaterAlert()
     // reading can never raise this any more than it can raise lowWater. No
     // actuator gate reads this directly - the <=2.0cm operational block
     // above already covers pH/EC/fogging/cooling; this is purely a
-    // status/notification severity signal for a reservoir that has fallen
-    // even further, past criticalLowWaterCm.
+    // status/notification severity signal for a reservoir fallen even
+    // further, past criticalLowWaterCm.
     setAlertDebounced("criticalLowWater", alertState.criticalLowWater,
         belowWithHysteresis(alertState.criticalLowWater, sensors.waterLevelCm,
             systemState.criticalLowWaterCm, WATER_LEVEL_CM_ALERT_HYSTERESIS, valid),
@@ -239,8 +239,8 @@ void AlertManager::updateLowWaterAlert()
     // this itself (systemState.refillNoRiseStreak requires 2 consecutive
     // no-rise refill attempts before reaching 2) - no separate pendingCount
     // needed here, unlike the threshold alerts above. Mirrors
-    // ecDilutionIneffective's exact same treatment in updateECAlert(). Not a
-    // Stage 2 threshold alert - untouched.
+    // ecDilutionIneffective's treatment in updateECAlert(). Not a Stage 2
+    // threshold alert - untouched.
     setAlert(
         "refillIneffective",
         alertState.refillIneffective,
@@ -258,15 +258,15 @@ bool AlertManager::updateTemperatureAlert()
     // Stage 2: shared "genuinely new DHT observation" gate - one read
     // refreshes temperature AND humidity together (SensorManager's single
     // dhtSampleVersion), so updateHumidityAlert() reuses the same result
-    // (passed back to update() below) rather than tracking its own. Does
-    // NOT advance on a not-due-yet tick or a failed/held-stale read - only
-    // a genuinely accepted new reading.
+    // (passed back to update() below) rather than tracking its own. Does NOT
+    // advance on a not-due-yet tick or a failed/held-stale read - only a
+    // genuinely accepted new reading.
     const bool newSample = newObservation(sensorManager.getDhtSampleVersion(), dhtLastProcessedVersion);
 
-    // Both sides now come from the configured target range. Previously the low
-    // side compared against the hard-coded COLD_FOG_TEMPERATURE constant, which
-    // was a fogging-strategy value rather than a user-facing bound. Canopy fan
-    // control is unaffected: handleCanopyClimate() reads highAirTemp /
+    // Both sides now come from the configured target range. Previously the
+    // low side compared against the hard-coded COLD_FOG_TEMPERATURE constant,
+    // a fogging-strategy value rather than a user-facing bound. Canopy fan
+    // control is unaffected: handleCanopyClimate() reads highAirTemp/
     // airTempRelease directly and never consults these flags.
     setAlertDebounced(
         "lowAirTemperature",
@@ -292,8 +292,7 @@ void AlertManager::updateHumidityAlert(bool newSample)
     // once by updateTemperatureAlert() and passed in - same DHT read
     // refreshes both, so a second independent newObservation() call here
     // against the same dhtSampleVersion (already consumed into
-    // dhtLastProcessedVersion by updateTemperatureAlert() this cycle) would
-    // always read false.
+    // dhtLastProcessedVersion this cycle) would always read false.
     const bool valid = sensors.dhtAvailable;
 
     setAlertDebounced("humidityLow", alertState.humidityLow,
@@ -310,9 +309,9 @@ void AlertManager::updateHumidityAlert(bool newSample)
 void AlertManager::updateWaterTemperatureAlert()
 {
     // A missing reading is not an out-of-range reading: the old form compared
-    // NaN directly, which silently evaluated false and reported "in range" for
-    // a dead sensor. Peltier control is unaffected - updateCooling() reads
-    // highWaterTemp / coolerOffTemp directly.
+    // NaN directly, silently evaluating false and reporting "in range" for a
+    // dead sensor. Peltier control is unaffected - updateCooling() reads
+    // highWaterTemp/coolerOffTemp directly.
     const bool valid = isfinite(sensors.waterTemp);
 
     // Stage 2: shared "genuinely new DS18B20 observation" gate for both
@@ -330,13 +329,12 @@ void AlertManager::updateWaterTemperatureAlert()
     // No active water-heating actuator exists in this design and none is
     // added by this alert - low water temperature is a MONITORED/ALERT
     // condition only, never an automatic control trigger. The ultrasonic
-    // fogger's normal operation does produce PASSIVE warming of the
-    // nutrient solution as a side effect of its own unrelated function
-    // (misting the root chamber) - that is not, and must not be confused
-    // with, a closed-loop heater: nothing here commands extra fogging (or
-    // anything else) in response to this alert, and the programmed fog
-    // cadence (AutomationManager::processFogCycle()) is untouched by water
-    // temperature in either direction.
+    // fogger's normal operation does produce PASSIVE warming of the nutrient
+    // solution as a side effect of its unrelated function (misting the root
+    // chamber) - that must not be confused with a closed-loop heater:
+    // nothing here commands extra fogging in response to this alert, and
+    // the programmed fog cadence (AutomationManager::processFogCycle()) is
+    // untouched by water temperature in either direction.
     setAlertDebounced(
         "waterTempLow",
         alertState.waterTempLow,
@@ -350,15 +348,16 @@ void AlertManager::updateWaterTemperatureAlert()
 void AlertManager::updatePHAlert()
 {
     // sensors.ph is the live SensorManager-filtered value (Stage 1 of the
-    // sensor architecture redesign - see SensorManager::applyEffectiveSensors())
-    // and can now change every loop() tick, not just once per confirmed
-    // stability-window agreement as before Stage 1 - so the raw threshold
-    // compare alone would chatter again exactly the way the old, now-removed
-    // PH_ALERT_HYSTERESIS was originally added to fix. Stage 2 reinstates
-    // that anti-flicker margin at the alert layer specifically (Config.h's
-    // PH_ALERT_HYSTERESIS), this time paired with genuine-observation-based
-    // confirmation (newObservation()) instead of overlapping with an
-    // upstream stability gate - see aboveWithHysteresis()/belowWithHysteresis().
+    // sensor architecture redesign - see
+    // SensorManager::applyEffectiveSensors()) and can now change every
+    // loop() tick, not just once per confirmed stability-window agreement as
+    // before Stage 1 - so the raw threshold compare alone would chatter
+    // again exactly the way the old, now-removed PH_ALERT_HYSTERESIS was
+    // originally added to fix. Stage 2 reinstates that anti-flicker margin
+    // at the alert layer (Config.h's PH_ALERT_HYSTERESIS), paired with
+    // genuine-observation-based confirmation (newObservation()) instead of
+    // overlapping with an upstream stability gate - see
+    // aboveWithHysteresis()/belowWithHysteresis().
     const bool valid = isfinite(sensors.ph) && sensors.ph >= 0.0f && sensors.ph <= 14.0f;
     const bool newSample = newObservation(sensorManager.getPhSampleVersion(), phLastProcessedVersion);
     const bool low = belowWithHysteresis(alertState.phLow, sensors.ph,
@@ -410,8 +409,8 @@ void AlertManager::updateSensorFaultAlert()
     // SafetyManager::canResetSafety(), which gates whether the GLOBAL
     // systemState.safetyLock can ever clear, so an unstable DHT (a known,
     // recurring electrical-environment issue - see readDHT()) must never be
-    // able to keep REFILL/PH/EC/COOLING locked out system-wide. DHT health is
-    // published separately as sensors.dhtAvailable/dhtStale (see
+    // able to keep REFILL/PH/EC/COOLING locked out system-wide. DHT health
+    // is published separately as sensors.dhtAvailable/dhtStale (see
     // FirebaseManager::writeSensors()) rather than folded back in here.
     const bool sensorFault =
 
@@ -442,7 +441,7 @@ void AlertManager::updateSensorFaultAlert()
     // A single transient invalid tick must not immediately raise sensorFault.
     // Any valid tick resets the pending count right away so a real recovery
     // is never delayed; only SENSOR_TRANSIENT_FAILURE_THRESHOLD consecutive
-    // invalid ticks actually raise it.
+    // invalid ticks raise it.
     if (rawFault)
     {
         if (sensorFaultPendingCount < SENSOR_TRANSIENT_FAILURE_THRESHOLD)

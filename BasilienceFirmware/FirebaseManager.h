@@ -29,11 +29,35 @@ public:
         RECOVERING
     };
 
+    // Arms cloud bring-up and returns immediately - it performs no network
+    // I/O and never waits on Wi-Fi, DNS, TLS or authentication. Called once,
+    // from loop(), the first time Wi-Fi is connected. The whole first
+    // connection (network preflight -> authentication -> post-auth database
+    // initialization) is then advanced a bounded step at a time by update(),
+    // so local sensing, safety, automation and actuator control keep running
+    // on every loop() iteration while the cloud is unreachable. The cloud is
+    // "ready" only once update() has completed every step below, not merely
+    // because Wi-Fi is connected.
     void begin();
+
+    // loop() does not call update() while the setup AP owns the radio, so
+    // update()'s own Wi-Fi-lost handling never runs for that outage. This is
+    // called each provisioning-mode iteration to do it instead: withdraw the
+    // permission to call the Firebase library (so the first cloud call after
+    // the network returns is preceded by a fresh preflight), start the outage
+    // clock that decides the 30s command re-baseline, and discard an unfinished
+    // first-connection attempt so the next one starts from a fresh preflight.
+    // Cheap and idempotent.
+    void noteProvisioningActive();
 
     void loadPersistedSettings();
 
     void update();
+
+    // Serial Diagnostics / Observability pass: set by loadPersistedSettings()
+    // before Wi-Fi/Firebase ever start, purely for the boot summary line -
+    // read-only elsewhere, never consulted by any control/settings logic.
+    bool settingsRestoredFromNvs = false;
 
     void syncMockSensors();
 
@@ -96,14 +120,15 @@ private:
     // across all of them by design (the smallest mechanism that still
     // guarantees SOME of them get serviced periodically). Used only to give
     // manual-interaction deferral a bounded grace window instead of an
-    // unbounded suppression - see shouldDeferLowPriorityForManualInteraction().
+    // unbounded suppression - see
+    // shouldDeferLowPriorityForManualInteraction().
     unsigned long lastLowPriorityCloudJobAt = 0;
     // Timestamp of the last fresh manual actuator or operation command
     // firmware actually observed (a new write under /commands/{actuator} or
     // a new, non-duplicate /commands/current request) - set in
     // consumeActuatorCommandSnapshot() and readCommands() respectively. The
-    // tighter, event-driven half of the manual-interaction defer signal: see
-    // update()'s deferLowPriorityForManualInteraction.
+    // tighter, event-driven half of the manual-interaction defer signal:
+    // see update()'s deferLowPriorityForManualInteraction.
     unsigned long lastManualCommandActivityAt = 0;
 
 public:
@@ -119,6 +144,12 @@ private:
     uint8_t automaticControlPassesRemaining = 0;
 
     bool wasFirebaseConnected = false;
+
+    // Serial Diagnostics / Observability pass (section 5): edge-tracking only
+    // for the [NET] WiFi UP/LOST transition lines - never read by any
+    // control/reconnect logic, which already uses wifiManager.isConnected()
+    // directly.
+    bool wasWifiConnectedForLog = true;
     bool suspendedForProvisioning = false;
     bool hasPublishedHeartbeat = false;
     bool heartbeatResumePending = false;
@@ -167,6 +198,45 @@ private:
     uint16_t automaticTerminalRequestId = 0;
     SensorData automaticTerminalSensors;
     uint16_t lastDeferredCommandRequestId = 0;
+
+    // Second half of the /commands/current dedupe key (see
+    // isDuplicateRequest()): two senders can legitimately reuse the same
+    // requestId, but not the same requestId AND requestTimestamp.
+    uint32_t lastProcessedRequestTimestamp = 0;
+
+    // /commands/current is a persistent document, not an event queue, and
+    // the firmware never deletes it. The first successful read after boot,
+    // and the first read after a cloud outage of
+    // COMMAND_REBASELINE_OUTAGE_MS or more, is therefore recorded as
+    // already-handled instead of executed - otherwise a reboot (RAM
+    // watermark lost) or a command written while the device was
+    // unreachable would run, possibly hours late, on reconnect.
+    bool currentCommandBaselined = false;
+
+    // millis() of the first update() tick of the current cloud outage, or 0
+    // while the cloud is reachable. See noteCloudUnavailable()/
+    // noteCloudAvailable().
+    unsigned long cloudUnavailableSince = 0;
+    void noteCloudUnavailable();
+    void noteCloudAvailable();
+
+    // Developer/test command nodes (commands/automationTestMode,
+    // commands/ignoreWaterLevelAutomation, commands/mockSensors) are level
+    // flags that stay in RTDB. They must never survive a device reboot, so
+    // the CLEAR_DEV_FLAGS startup step writes enabled=false to all three, and
+    // cloud startup cannot reach COMPLETE until that has succeeded; until
+    // every write has succeeded, their readers ignore an enabled=true - a
+    // failed clear can never re-arm a stale flag. Retried from update().
+    //
+    // Also cleared to false by noteCloudAvailable() after a reconnect from
+    // an outage of COMMAND_REBASELINE_OUTAGE_MS or more: a value written to
+    // one of these nodes while the device was offline is otherwise honoured
+    // the instant the cloud comes back, since this flag was already true
+    // from boot. This forces the same boot-time re-clear to run again first.
+    bool devCommandsCleared = false;
+    unsigned long lastDevCommandClearAttemptAt = 0;
+    void clearDevCommandsAtBoot();
+
     unsigned long automaticTerminalSnapshotUploadedAt = 0;
     bool automaticTerminalSensorUploadFailureLogged = false;
 
@@ -179,10 +249,160 @@ private:
     unsigned long cooldownDurationMs = 0;
 
     //==================================================
-    // Initialization
+    // Non-blocking cloud startup (first Firebase connection)
     //==================================================
 
-    void initializeDatabase();
+    // PREFLIGHT       - a background task proves DNS + a TLS handshake work
+    //                   BEFORE any Firebase library HTTPS call is made from the
+    //                   main loop task. The library's own connect/handshake
+    //                   waits are not bounded tightly enough to risk on a
+    //                   network that has not been proven reachable.
+    // AUTHENTICATING  - the existing auth state machine (startAuthAttempt() /
+    //                   pollAuthStateMachine()), one bounded step per update().
+    // INIT_STEPS      - post-auth database initialization, one small step per
+    //                   update() (see CloudInitStep).
+    // COMPLETE        - normal cloud sync (the rest of update()).
+    //
+    // From INIT_STEPS onward every Firebase library call is also gated by
+    // cloudPathVerified (below): a passing preflight is what permits library
+    // calls, and Wi-Fi loss or the first transport failure takes that
+    // permission away until a fresh preflight passes again.
+    enum class CloudStartupPhase : uint8_t
+    {
+        NOT_STARTED,
+        PREFLIGHT,
+        AUTHENTICATING,
+        INIT_STEPS,
+        COMPLETE
+    };
+
+    // Everything begin() used to do synchronously after authentication,
+    // split so each update() tick performs at most one step.
+    enum class CloudInitStep : uint8_t
+    {
+        RESOLVE_DEVICE_ID,
+        PRIME_COMMANDS_EARLY,
+        SEED_STATUS,
+        SEED_SETTINGS,
+        SEED_COMMANDS_CURRENT,
+        SEED_OPERATIONS_CURRENT,
+        CLEAR_SENSOR_TEST,
+        CLEAR_DEV_FLAGS,
+        PRIME_COMMANDS_FINAL,
+        READ_SETTINGS,
+        FINISH
+    };
+
+    CloudStartupPhase cloudStartupPhase = CloudStartupPhase::NOT_STARTED;
+    CloudInitStep cloudInitStep = CloudInitStep::RESOLVE_DEVICE_ID;
+
+    // 0 means "attempt as soon as possible". millis() of the earliest moment
+    // the next preflight may start.
+    unsigned long cloudStartupNextAttemptAt = 0;
+    unsigned long cloudStartupBackoffMs = 0;
+    uint16_t cloudStartupAttempt = 0;
+    unsigned long cloudInitRetryAt = 0;
+    unsigned long cloudInitRetryMs = 0;
+    bool sensorTestBootClearDone = false;
+    // Set by readSettings() so startup can tell a real read from a failed one
+    // without changing readSettings()' many early returns.
+    bool lastSettingsReadOk = false;
+
+    // "The network path to Firebase was proven usable by a preflight that has
+    // not since been invalidated." While false, update() makes NO Firebase
+    // library call at all (no Firebase.ready(), no RTDB read or write, no
+    // token refresh, no recovery). It is set by a passing preflight, cleared by
+    // Wi-Fi loss, provisioning, the first transport failure of any library
+    // call, a failed Firebase.ready(), and a token refresh that is due while
+    // the last preflight is stale (see CLOUD_PATH_FRESH_MS in the .cpp).
+    bool cloudPathVerified = false;
+    unsigned long cloudPathVerifiedAt = 0;
+
+    enum class PreflightPoll : uint8_t
+    {
+        PENDING,
+        PASSED,
+        FAILED
+    };
+
+    void advanceCloudStartupConnect();
+    void advanceCloudInit();
+    bool runCloudInitStep();
+    // Startup only: an authentication attempt failed. Returns to PREFLIGHT.
+    void scheduleCloudStartupRetry(bool libraryContacted, const char* reason);
+    // Escalating gate on when the next preflight may start. Changes no phase.
+    void bumpCloudRetryBackoff(bool libraryContacted, const char* reason);
+    void abortCloudStartupAttempt();
+    void completeCloudStartup();
+
+    // Wi-Fi is gone (or the setup AP owns the radio): drop the path
+    // verification, forget any backoff (the outage was the network's) and
+    // restart an unfinished first connection from a fresh preflight.
+    void noteNetworkLost();
+    // Withdraws permission to call the library. libraryContacted=true means
+    // the library itself just failed (so the retry waits at least
+    // COOLDOWN_INITIAL_MS), false means the trigger was cheap to detect.
+    void revokeCloudPath(const char* reason, bool libraryContacted);
+    bool cloudPathFresh() const;
+    // One background-preflight step. Shared by the first connection and by
+    // every later re-verification, so there is exactly one implementation.
+    PreflightPoll pollPreflight();
+    // Post-READY hold: while cloudPathVerified is false, update() calls only
+    // this.
+    void advanceRuntimePreflight();
+
+    // Connectivity diagnostics ([NET] lines). Each prints once per event, never
+    // per loop tick.
+    void logWifiConnectedDiagnostics();
+    void logSystemTimeDiagnostics();
+
+    // Network preflight (background task). Same thread-safety shape as the
+    // bootstrap HTTP task below: the task touches ONLY its own local network
+    // objects and the plain result fields here - never the Firebase library,
+    // never SystemState or any other manager - writes them once, then gives
+    // preflightDoneSemaphore. The main task reads them only after taking it.
+    static constexpr uint8_t PREFLIGHT_HOST_COUNT = 4;
+    SemaphoreHandle_t preflightDoneSemaphore = nullptr;
+    // True from task creation until the main task has observed the task's
+    // semaphore give. Guards against ever starting a second preflight task
+    // while an abandoned one could still be writing the result fields.
+    bool preflightTaskActive = false;
+    // True while the PREFLIGHT phase is waiting on a result.
+    bool preflightRunning = false;
+    unsigned long preflightStartedAt = 0;
+    uint8_t preflightHostCount = 0;
+    // Written by the main task before creating the task; read by the task.
+    String preflightHosts[PREFLIGHT_HOST_COUNT];
+    // Written by the task only, before it signals done.
+    int8_t preflightDns[PREFLIGHT_HOST_COUNT];       // 1 ok, 0 failed, -1 not attempted
+    char preflightDnsIp[PREFLIGHT_HOST_COUNT][40];
+    // Real TLS handshakes, no data sent: [0] = the auth host (preflightHosts[0]),
+    // [1] = the database host (preflightHosts[2]). The second is only tried
+    // once the first has succeeded.
+    static constexpr uint8_t PREFLIGHT_TLS_TARGETS = 2;
+    int8_t preflightTls[PREFLIGHT_TLS_TARGETS];      // 1 ok, 0 failed, -1 not attempted
+    int preflightTlsError[PREFLIGHT_TLS_TARGETS];
+    uint32_t preflightTlsMs[PREFLIGHT_TLS_TARGETS];
+    // Heap seen just before the first handshake and after the last one has been
+    // torn down (the difference is what a handshake costs, and that it is
+    // returned).
+    uint32_t preflightHeapBefore = 0;
+    uint32_t preflightMaxBlockBefore = 0;
+    uint32_t preflightFreeHeap = 0;
+    uint32_t preflightMaxBlock = 0;
+
+    bool startPreflight();
+    bool evaluatePreflightResult();
+    static void preflightTaskFn(void* arg);
+
+    void seedStatusNode();
+    // The seed steps return false only when the step must be retried (a
+    // transport failure that leaves it unknown whether the node exists). An
+    // application-level "path does not exist" is the normal first-boot case
+    // and is what triggers seeding.
+    bool seedSettingsNode();
+    bool seedCommandsCurrentNode();
+    bool seedOperationsCurrentNode();
 
     bool writeJson(
         const String& path,
@@ -241,23 +461,25 @@ private:
     // hands off to notificationManager.requestTestSms() (the real SMS
     // pipeline: durable queue -> recipient fan-out -> GsmManager), then
     // deletes the command node so a later poll/reconnect never replays it.
-    // Mirrors consumeActuatorCommandSnapshot()'s own delete-after-consume
-    // pattern rather than a persisted enabled/disabled flag, since this is a
-    // one-shot request, not a standing mode.
+    // Mirrors consumeActuatorCommandSnapshot()'s delete-after-consume
+    // pattern rather than a persisted enabled/disabled flag, since this is
+    // a one-shot request, not a standing mode.
     void readTestSmsCommand();
     uint64_t lastTestSmsCommandTimestamp = 0;
 
-    void provisionDevice();
+    // Returns true once deviceId is known (already persisted, or just looked
+    // up); false when the lookup could not complete and should be retried.
+    bool provisionDevice();
 
     // Reads the 6 raw STA MAC bytes via esp_read_mac(ESP_MAC_WIFI_STA),
     // which works regardless of WiFi.mode()/WiFi.begin() state - unlike
     // WiFi.macAddress(), which reads back all-zero whenever the STA
-    // interface has never been brought up (confirmed root cause: a device
-    // with no saved credentials boots straight into WiFi.mode(WIFI_AP)
-    // provisioning, so the STA netif is never started and
-    // WiFi.macAddress() has nothing to report). Logs "[IDENTITY] ERROR:
-    // Unable to resolve hardware Wi-Fi MAC" and returns false (out left
-    // untouched) if the read fails or comes back all-zero.
+    // interface has never been brought up (a device with no saved
+    // credentials boots straight into WiFi.mode(WIFI_AP) provisioning, so
+    // the STA netif is never started and WiFi.macAddress() has nothing to
+    // report). Logs "[IDENTITY] ERROR: Unable to resolve hardware Wi-Fi
+    // MAC" and returns false (out left untouched) if the read fails or
+    // comes back all-zero.
     bool readHardwareStaMac(uint8_t out[6]);
 
     //==================================================
@@ -265,14 +487,15 @@ private:
     //==================================================
 
     // Non-blocking auth state machine (critical verification report,
-    // Priority 1). Both begin() (boot) and beginFirebaseRecovery()/
+    // Priority 1). Both the first connection (advanceCloudStartupConnect(),
+    // driven from update()) and beginFirebaseRecovery()/
     // pollFirebaseRecovery() (runtime, reachable at any time - including
-    // mid-dose) drive the SAME
-    // underlying credential order (refresh token -> device-secret bootstrap
-    // -> legacy anonymous fallback) through this one implementation, so
-    // there is exactly one place that decides how a device authenticates.
-    // See the .cpp for the full per-state rationale and the one remaining
-    // bounded exception (the device-secret bootstrap's HTTPS POST).
+    // mid-dose) drive the SAME underlying credential order (refresh token
+    // -> device-secret bootstrap -> legacy anonymous fallback) through this
+    // one implementation, so there is exactly one place that decides how a
+    // device authenticates. See the .cpp for the full per-state rationale
+    // and the one remaining bounded exception (the device-secret
+    // bootstrap's HTTPS POST).
     enum class FirebaseAuthPhase : uint8_t
     {
         IDLE,
@@ -307,30 +530,18 @@ private:
     // Advances the state machine by exactly one bounded step and returns
     // immediately once that step is done - never loops, never delays. The
     // one exception is the TRY_DEVICE_SECRET step's HTTPS POST, a single
-    // bounded (shortened-timeout) blocking call - see its own comment in the
-    // .cpp for why a full non-blocking HTTP client is out of scope for this
-    // pass. Returns true once the attempt has concluded (authPhase is
+    // bounded (shortened-timeout) blocking call - see its own comment in
+    // the .cpp for why a full non-blocking HTTP client is out of scope for
+    // this pass. Returns true once the attempt has concluded (authPhase is
     // SUCCESS or FAILED this call); false while still in flight.
     bool pollAuthStateMachine();
-
-    // Orchestrates the boot-time auth flow synchronously: at this point in
-    // the boot sequence (called only from begin(), before any growth cycle
-    // or dosing can possibly be in progress - AutomationManager always
-    // starts in SENSOR_STABILIZATION) a bounded local poll loop is
-    // acceptable, so this is the one place this class still blocks its
-    // caller - every RUNTIME recovery attempt (beginFirebaseRecovery()/
-    // pollFirebaseRecovery(), reachable at any time, including mid-dose)
-    // drives the identical underlying state machine non-blockingly instead,
-    // one step per FirebaseManager::update() call. Returns false if no
-    // credential worked.
-    bool trySecureAuthentication();
 
     // Restores a previously-established identity from a persisted refresh
     // token (Firebase.setCustomToken() auto-detects a non-JWT-shaped string
     // as a refresh token and performs a refresh-grant sign-in directly - see
     // FirebaseCore.cpp's own signer logic - no bootstrap call needed). Kicks
-    // off Firebase.begin() and returns immediately; WAIT_REFRESH_READY polls
-    // Firebase.ready() non-blockingly for the actual result.
+    // off Firebase.begin() and returns immediately; WAIT_REFRESH_READY
+    // polls Firebase.ready() non-blockingly for the actual result.
     bool restoreFromRefreshToken(const String& refreshToken);
 
     // Resolves the device MAC (fast, synchronous, no network) and hands the
@@ -338,8 +549,8 @@ private:
     // bootstrapHttpTaskFn()) that performs the actual HTTPS POST - this
     // function itself returns immediately, never blocking the caller.
     // Returns false only if the MAC isn't resolvable yet or the background
-    // task could not be created (e.g. out of heap); WAIT_BOOTSTRAP_HTTP polls
-    // for the task's result non-blockingly. The secret is copied into
+    // task could not be created (e.g. out of heap); WAIT_BOOTSTRAP_HTTP
+    // polls for the task's result non-blockingly. The secret is copied into
     // bootstrapHttpSecret for the task's own use and cleared the moment the
     // task is done with it; never logged, never echoed anywhere.
     bool bootstrapSecureAuth(const String& secret);
@@ -356,12 +567,12 @@ private:
     // Firebase.*, no fbdo, no config/auth access) and never touches any
     // AutomationManager/ActuatorManager/SystemState field. Every actual
     // Firebase library call (Firebase.setCustomToken()/Firebase.begin()/
-    // Firebase.ready()) still happens only in the main loop task, exactly as
-    // before - so no Firebase library call is ever made from more than one
-    // task. The task is pinned to the same core the main loop task is
-    // running on (captured at kickoff via xPortGetCoreID(), not assumed) so
-    // the two are always time-sliced, never truly concurrent, which removes
-    // any cross-core cache-visibility question for the plain bool/String
+    // Firebase.ready()) still happens only in the main loop task, exactly
+    // as before - so no Firebase library call is ever made from more than
+    // one task. The task is pinned to the same core the main loop task
+    // runs on (captured at kickoff via xPortGetCoreID(), not assumed) so
+    // the two are always time-sliced, never truly concurrent, removing any
+    // cross-core cache-visibility question for the plain bool/String
     // handoff below - xSemaphoreGive()/xSemaphoreTake() still provide the
     // actual synchronization guarantee regardless.
     SemaphoreHandle_t bootstrapHttpDoneSemaphore = nullptr;
@@ -381,6 +592,10 @@ private:
     bool bootstrapHttpResultSuccess = false;
     String bootstrapHttpResultToken;
     String bootstrapHttpResultDeviceId;
+    // Last HTTP status the task saw (-1 = it never connected). Same
+    // single-writer-then-signal rule as the fields above; used only to
+    // classify a failed attempt in the [NET] log, never for control flow.
+    int bootstrapHttpResultCode = 0;
 
     // Task entry point. Static (FreeRTOS task functions cannot be non-static
     // member functions); `arg` is the owning FirebaseManager instance,
@@ -412,8 +627,8 @@ private:
 
     // True for transport/network-style failures only (timeouts, connection
     // refused/lost/reset, SSL failures, "no http server", 5xx gateway
-    // errors) - grounded in the exact strings FB_Const.h's errorReason()
-    // can return, not guessed. False for application-level outcomes such as
+    // errors) - grounded in the exact strings FB_Const.h's errorReason() can
+    // return, not guessed. False for application-level outcomes such as
     // permission denied, a missing optional path, malformed data, or a
     // rejected operation command, none of which indicate a broken
     // connection.
@@ -426,11 +641,11 @@ private:
     // Non-blocking recovery (critical verification report, Priority 1).
     // beginFirebaseRecovery() tears down the possibly-stuck transport
     // session and kicks off the SAME auth state machine begin() uses (auth
-    // state and NVS credentials are untouched), then returns immediately -
+    // state and NVS credentials untouched), then returns immediately -
     // called once, from update(), the instant COOLDOWN's backoff window
     // elapses. pollFirebaseRecovery() advances that attempt by one bounded
     // step per subsequent update() call while firebaseHealth stays
-    // RECOVERING, and moves to HEALTHY on success or back to COOLDOWN with
+    // RECOVERING, moving to HEALTHY on success or back to COOLDOWN with
     // escalated backoff on failure once the state machine concludes.
     void beginFirebaseRecovery();
     void pollFirebaseRecovery();
@@ -444,7 +659,8 @@ private:
     bool isOperationLifecycleOwned() const;
 
     bool isDuplicateRequest(
-        uint16_t requestId) const;
+        uint16_t requestId,
+        uint32_t requestTimestamp) const;
 
     bool validateOperationRequest(
         OperationType operation,

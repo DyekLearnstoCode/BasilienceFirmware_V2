@@ -6,10 +6,11 @@ namespace
 {
     // A single transient invalid tick (OneWire hiccup, ADC noise, a blocking
     // call landing at the wrong moment) must not abort an active automatic
-    // operation. Each metric tracks its own short consecutive-invalid streak;
-    // any valid reading clears it immediately, while a genuinely sustained
-    // failure still reports invalid after the same short threshold used
-    // elsewhere (sensorFault, water-temperature confirmation).
+    // operation. Each metric tracks its own short consecutive-invalid
+    // streak; any valid reading clears it immediately, while a genuinely
+    // sustained failure still reports invalid after the same short
+    // threshold used elsewhere (sensorFault, water-temperature
+    // confirmation).
     bool debouncedValid(bool rawValid, uint8_t& invalidStreak)
     {
         if (rawValid)
@@ -143,12 +144,12 @@ SafetyResult SafetyManager::canDosePH() const
     // matching actuator-level gate and its bypass log.
     //
     // refillStartLevelCm (2.0cm), NOT criticalLowWaterCm (1.0cm) - see the
-    // static automation integration audit. criticalLowWaterCm is a stricter,
-    // separate escalation threshold ON TOP of this operational bar, not a
-    // replacement for it; the operational "block dependent controllers"
-    // boundary has always been the same 2.0cm level that makes refill
-    // eligible, matching the pre-water-depth-model design where a single
-    // shared threshold played both roles.
+    // static automation integration audit. criticalLowWaterCm is a
+    // stricter, separate escalation threshold ON TOP of this operational
+    // bar, not a replacement for it; the operational "block dependent
+    // controllers" boundary has always been the same 2.0cm level that makes
+    // refill eligible, matching the pre-water-depth-model design where a
+    // single shared threshold played both roles.
     if(!systemState.ignoreWaterLevelAutomation &&
        sensors.waterLevelCm <= systemState.refillStartLevelCm)
     {
@@ -203,16 +204,15 @@ SafetyResult SafetyManager::canDiluteEC() const
     // Confirmed live bug: this used to compare against refillStopLevelCm
     // (the "stop actively refilling" threshold, 3.0cm/50% of working depth
     // by default - see Config.h's "Water Reservoir Geometry") to decide
-    // whether there is room to add diluting water. That is a materially
-    // lower bar than "actually full" - a half-full reservoir already sits at
-    // or above refillStopLevelCm, so EC dilution was reported RESERVOIR_FULL
-    // (and, via AutomationManager::processECCorrection(), permanently
-    // ecSubsystemLocked pending a manual Reset Safety) at 50% depth just as
-    // readily as at true capacity. MAX_WORKING_WATER_CM is the actual
-    // working-capacity ceiling - "no more room, full stop" - and is the
-    // correct bar for this specific "can we physically add more water"
-    // question, distinct from refillStopLevelCm's "have we topped up enough
-    // for now" one.
+    // whether there is room to add diluting water. That's a materially
+    // lower bar than "actually full" - a half-full reservoir already sits
+    // at or above refillStopLevelCm, so EC dilution was reported
+    // RESERVOIR_FULL (and, via AutomationManager::processECCorrection(),
+    // permanently ecSubsystemLocked pending a manual Reset Safety) at 50%
+    // depth just as readily as at true capacity. MAX_WORKING_WATER_CM is
+    // the actual working-capacity ceiling - "no more room, full stop" - the
+    // correct bar for "can we physically add more water", distinct from
+    // refillStopLevelCm's "have we topped up enough for now".
     if(sensors.waterLevelCm >= MAX_WORKING_WATER_CM &&
        sensors.ec > systemState.ecTargetMax) return SafetyResult::RESERVOIR_FULL;
     return SafetyResult::SAFE;
@@ -258,61 +258,47 @@ SafetyResult SafetyManager::canFog() const
     // Cooling/fogging architecture update: nutrient-solution temperature
     // above the maximum acceptable ceiling (systemState.maxWaterTemp, 28.0C
     // default) suspends root fogging as a safety response, independent of
-    // cooling's own automatic-Peltier gate below - this is the single
-    // authoritative fogging gate the task calls for, not a check scattered
-    // into AutomationManager::processFogCycle()'s own state machine.
-    // Deliberately no separate validWaterTemperature()/SENSOR_FAULT check
-    // here: an invalid (NaN) reading makes this comparison false by IEEE-754
+    // cooling's own automatic-Peltier gate below - the single authoritative
+    // fogging gate the task calls for, not a check scattered into
+    // AutomationManager::processFogCycle()'s own state machine. Deliberately
+    // no separate validWaterTemperature()/SENSOR_FAULT check here: an
+    // invalid (NaN) reading makes this comparison false by IEEE-754
     // definition, so an untrustworthy DS18B20 does not itself suspend
     // fogging through this gate - DS18B20 validity continues to affect only
-    // cooling (SafetyManager::canCool()), matching the confirmed scope of
-    // this change. Strict > (not >=): exactly 28.0C is still the normal
-    // "allowed" side, matching the existing waterTempOutOfRange alert's own
-    // > comparison (AlertManager::updateWaterTemperatureAlert()) - only a
-    // genuine excursion ABOVE the ceiling suspends fogging. No separate
-    // release hysteresis is added for the resume condition (waterTemp <=
+    // cooling (SafetyManager::canCool()). Strict > (not >=): exactly 28.0C
+    // is still the normal "allowed" side, matching the existing
+    // waterTempOutOfRange alert's own > comparison
+    // (AlertManager::updateWaterTemperatureAlert()) - only a genuine
+    // excursion ABOVE the ceiling suspends fogging. No separate release
+    // hysteresis is added for the resume condition (waterTemp <=
     // maxWaterTemp) - canFog() is already re-evaluated fresh every tick with
     // a plain threshold for every other condition here (pH/EC/water level
     // all use plain thresholds, no decision-layer hysteresis - see the pH
-    // comment below), so a second, different pattern for this one check
-    // would be inconsistent with the existing architecture, not a missing
-    // safety margin.
+    // comment below), so a different pattern for this one check would be
+    // inconsistent with the existing architecture, not a missing margin.
     if(sensors.waterTemp > systemState.maxWaterTemp)
     {
         return SafetyResult::HIGH_WATER_TEMP;
     }
 
-    if(!validPH())
-    {
-        return SafetyResult::SENSOR_FAULT;
-    }
+    // pH/EC validity and in-range checks were REMOVED from this gate: root
+    // fogging is what keeps the roots alive, and a chemistry fault (probe
+    // failure, a correction that exhausted its budget, an empty dosing
+    // bottle) must not by itself switch it off for as long as the fault
+    // lasts. Chemistry problems are still handled where they belong - dosing
+    // is blocked by canDosePH()/canDoseEC()/canDiluteEC(), and the pH/EC
+    // alerts and subsystem locks still raise the fault. What stays here are
+    // the genuine fogging safety gates: safety lock, water level
+    // validity/low water, water temperature above the maximum, and the
+    // dosing/mixing window below.
 
-    // sensors.ph is the stable-value filter's authoritative output (see
-    // SensorManager::applyEffectiveSensors()), so this plain comparison
-    // no longer needs its own decision-layer hysteresis.
-    if(sensors.ph < systemState.minPH || sensors.ph > systemState.maxPH)
-    {
-        return SafetyResult::INVALID_PH;
-    }
-
-    if(!validEC())
-    {
-        return SafetyResult::SENSOR_FAULT;
-    }
-
-    if(sensors.ec < systemState.minEC || sensors.ec > systemState.maxEC)
-    {
-        return SafetyResult::INVALID_EC;
-    }
-
-    // Quiet-monitoring/4-minute-budget redesign: still block fogging
-    // unconditionally while actively dosing or during the initial silent
-    // settle window (the reading is not yet current enough to trust), but
-    // once handleStabilizingPH() marks itself purely watching
-    // (phWatchPhaseActive), pH is already confirmed within [minPH, maxPH]
-    // above, so fogging is allowed to resume - re-checked fresh every tick,
-    // so it stops again immediately if pH drifts back out of range or a
-    // redose starts.
+    // Still block fogging while a correction is actively dosing or during
+    // the initial silent settle window (the just-dosed solution is still
+    // mixing), and let it resume once handleStabilizingPH()/
+    // handleStabilizingEC() mark themselves purely watching
+    // (phWatchPhaseActive/ecWatchPhaseActive). A mode gate, not a range
+    // gate: a correction that fails or completes returns the mode to
+    // NORMAL, which releases it regardless of the reading.
     if(systemState.currentMode == DOSING_PH ||
        (systemState.currentMode == STABILIZING_PH && !systemState.phWatchPhaseActive))
     {
@@ -390,16 +376,15 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
     reason = "";
 
     // Requiring the reading to already be back in range here made the lock a
-    // deadlock: the subsystem trips after the PH_EC_CORRECTION_STALL_TIMEOUT_MS
-    // budget expires on a genuinely stalled correction specifically because
-    // automation could not get the reading into range, so a reset that
-    // demanded that same condition could never actually succeed while the
-    // real problem
-    // persisted - only a human manually dosing the reservoir by hand could
-    // clear it. Reset Safety is the admin's explicit request for a fresh
-    // attempt, not a claim that the problem is already fixed; it still
-    // requires the sensor itself to be reporting a real, physically valid
-    // number (validPH()/validEC()) so a reset is never granted against a
+    // deadlock: the subsystem trips after PH_EC_CORRECTION_STALL_TIMEOUT_MS
+    // expires on a genuinely stalled correction specifically because
+    // automation could not get the reading into range, so a reset demanding
+    // that same condition could never succeed while the real problem
+    // persisted - only a human manually dosing the reservoir could clear it.
+    // Reset Safety is the admin's explicit request for a fresh attempt, not
+    // a claim the problem is already fixed; it still requires the sensor
+    // itself to be reporting a real, physically valid number
+    // (validPH()/validEC()) so a reset is never granted against a
     // broken/disconnected probe, but no longer requires the chemistry to
     // already be corrected. processResetSafetyOperation() zeroes
     // phAttempts/ecAttempts right after this succeeds, so automation gets a
@@ -449,9 +434,9 @@ bool SafetyManager::resetRecoverableSubsystems(String& reason)
     if(systemState.coolingSubsystemLocked)
     {
         // Mirrors canCool()'s own gate (refillStartLevelCm, not
-        // criticalLowWaterCm) - this must clear exactly when canCool() would
-        // newly report SAFE, or the lock could be released while canCool()
-        // still blocks, or stay stuck after canCool() would already permit
+        // criticalLowWaterCm) - must clear exactly when canCool() would
+        // newly report SAFE, or the lock could release while canCool() still
+        // blocks, or stay stuck after canCool() would already permit
         // cooling again.
         if(validWaterLevel() && validWaterTemperature() &&
            sensors.waterLevelCm > systemState.refillStartLevelCm)

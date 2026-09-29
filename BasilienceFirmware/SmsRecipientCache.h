@@ -19,14 +19,12 @@ public:
     void begin();
 
     // Applies a freshly-read authoritative snapshot: each entry is
-    // structurally validated (GsmManager::isValidCanonicalPhilippineMobile,
-    // no carrier-prefix table) and deduplicated by canonical number. Only
-    // persists to NVS if the resulting set actually differs from what's
-    // cached, to avoid unnecessary flash wear. A failed RTDB read must never
-    // call this - the caller is responsible for leaving the last known-good
-    // cache untouched on failure. An authoritative EMPTY snapshot (0 entries
-    // because no one is currently assigned/eligible) is a valid input and
-    // clears the cache.
+    // structurally validated (GsmManager::isValidCanonicalPhilippineMobile)
+    // and deduplicated by canonical number. Only persists to NVS if the
+    // result actually differs from what's cached, to avoid flash wear. A
+    // failed RTDB read must never call this - leave the last known-good
+    // cache untouched. An authoritative EMPTY snapshot (no one currently
+    // assigned/eligible) is valid and clears the cache.
     void applySnapshot(const String canonicalPhones[], uint8_t count);
 
     uint8_t recipientCount() const;

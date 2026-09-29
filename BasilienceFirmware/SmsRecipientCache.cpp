@@ -54,8 +54,8 @@ void SmsRecipientCache::applySnapshot(const String canonicalPhones[], uint8_t in
     }
 
     // Captured before the overwrite below, purely so a removal (fewer
-    // enabled/valid recipients than before) can be called out explicitly -
-    // the assignment/save themselves are unconditional either way.
+    // recipients than before) can be called out explicitly - the
+    // assignment/save happen unconditionally either way.
     const uint8_t previousCount = count;
 
     for (uint8_t i = 0; i < dedupedCount; i++) phones[i] = deduped[i];

@@ -8,22 +8,28 @@ class AutomationManager
 public:
     void begin();
     void update();
-    void setManualCoolingDemand(bool active);
+    // reason is diagnostics-only (Serial Diagnostics / Observability pass,
+    // section 7) - defaults to "" for every pre-existing call site, logging
+    // the same 0<->1 edge with no reason suffix; only the site that most
+    // needs distinguishing (the F4 independent-deadline-expiry path in
+    // ActuatorManager.cpp) is expected to pass one. Never affects the flag
+    // value itself.
+    void setManualCoolingDemand(bool active, const char* reason = "");
 
     // Admin's explicit judgment that the current water level is acceptable -
     // called by ActuatorManager::requestCommand() when a manual OFF for
     // SOLENOID arrives while an automatic refill is in progress. Ends the
     // refill early, the same way handleRefilling() itself would once
     // sensors.waterLevel reaches refillStopLevel; a no-op if REFILLING isn't
-    // actually the current mode.
+    // the current mode.
     void stopRefillManually();
 
     // Read-only view of the circulation demand mask maintained by
-    // updateCooling(). ActuatorManager consults these before allowing a manual
-    // OFF so a user cannot stop circulation that an automatic operation is
-    // relying on. This is the same mask that drives the pump and the existing
-    // "[CIRCULATION] Demand added/removed" diagnostics - not a second copy of
-    // the demand conditions.
+    // updateCooling(). ActuatorManager consults these before allowing a
+    // manual OFF so a user cannot stop circulation an automatic operation is
+    // relying on. Same mask that drives the pump and the existing
+    // "[CIRCULATION] Demand added/removed" diagnostics - not a second copy
+    // of the demand conditions.
     bool isCirculationRequired() const;
     const char* circulationRequirementReason() const;
 
@@ -91,12 +97,11 @@ private:
     // NaN = no manual acceptance in effect - the ordinary refillStartLevelCm
     // threshold governs. Set by stopRefillManually() to the water depth (cm)
     // at the moment the admin accepted it; the low-water auto-refill trigger
-    // then only fires again once the depth drops below THIS, not merely for
+    // then only fires again once depth drops below THIS, not merely for
     // remaining under refillStartLevelCm, so an admin's explicit "current
-    // level is enough" isn't undone within the same tick by the very
-    // condition it was meant to override. Cleared back to NaN the instant a
-    // real refill is in progress (handleRefilling() itself, whichever path
-    // started it), since any active refill supersedes a prior acceptance.
+    // level is enough" isn't undone within the same tick by the condition it
+    // was meant to override. Cleared back to NaN the instant a real refill
+    // is in progress, since any active refill supersedes a prior acceptance.
     float manualRefillAcceptedLevel = NAN;
 
     // One-shot guard so handleRefilling()'s developer-override exit logs
@@ -112,9 +117,9 @@ private:
     // HC-SR04 confirmation (sensors.refillStartConfirmed - 3 consecutive
     // ACCEPTED readings, see SensorManager::readWaterLevel()), not merely
     // the debounced alertState.lowWater flag alone: a low-water ALERT can
-    // legitimately stay true across many main-loop ticks off a single
-    // accepted reading, which is sufficient evidence to notify a user but
-    // was never intended to be sufficient evidence to open the solenoid.
+    // legitimately stay true across many ticks off a single accepted
+    // reading, sufficient to notify a user but not sufficient to open the
+    // solenoid.
     bool autoRefillEligible() const;
 
     enum class AutomaticRefillPhase : uint8_t
@@ -138,8 +143,8 @@ private:
     // Pulse-cooling task: FILL/FLUSH-internal sub-phase and when it started.
     // systemState.coolingPulseState (the externally-visible IDLE/FILL/
     // COOL_SOAK/FLUSH state) lives in Types.h since ActuatorManager needs to
-    // read it too; this finer-grained phase is purely local sequencing detail
-    // nothing outside this class needs.
+    // read it too; this finer-grained phase is purely local sequencing
+    // detail nothing outside this class needs.
     CoolingPulsePhase coolingPulsePhase = CoolingPulsePhase::NONE;
     unsigned long coolingPulsePhaseStartedAt = 0;
     // Debounces updateCoolingPulseStateMachine()'s own water-temp validity
@@ -147,8 +152,8 @@ private:
     // SafetyManager::validWaterTemperature() (a private, per-call static
     // there, not reachable from here) - without this, a single transient
     // reading could fail this raw check on the same tick canCool() still
-    // reports SAFE via its own debounce, hard-locking the cooling subsystem
-    // off a glitch the rest of the system was built to tolerate.
+    // reports SAFE via its own debounce, hard-locking cooling off a glitch
+    // the rest of the system was built to tolerate.
     uint8_t coolingPulseWaterTempInvalidStreak = 0;
     void updateCoolingPulseStateMachine(bool automaticCoolingAllowed, SafetyResult coolingSafety, bool chemistryNeedsCirculation);
 
@@ -180,31 +185,30 @@ private:
     // Last AUTOMATIC canopy fan speed actually commanded from a fresh DHT
     // reading (handleCanopyClimate()) - see the automation resilience pass
     // report. Retained (not reset to 100%) whenever DHT becomes unavailable,
-    // so canopy ownership does not abruptly jump. CANOPY_FAN-only again as
-    // of two confirmed fixes: no longer consumed by handleCultivationPaused()
-    // (no-active-cultivation-cycle fix - automatic canopy fan is commanded
-    // OFF outright while no cultivation cycle is active, not held at this or
-    // any other baseline speed), and no longer borrowed by the root-zone
-    // Blower in processFogCycle() (root-blower/canopy-fan speed separation
-    // fix - the Blower now uses its own independent
-    // systemState.blowerSpeedPercent while fogging is actively ON). Read
-    // solely within handleCanopyClimate()'s own DHT-unavailable branch now.
-    // 70% is the deliberate boot-time default (no valid DHT reading has ever
-    // existed yet) - PWM COMMAND only, never measured RPM. Matches the
-    // NORMAL-demand speed in handleCanopyClimate(), itself set to the
-    // middle of the 65-75% band real-hardware bench testing found both fans
-    // run cleanest in (CANOPY_BLOWER_PWM_FREQUENCY_HZ's own comment).
+    // so canopy ownership does not abruptly jump. CANOPY_FAN-only again as of
+    // two confirmed fixes: no longer consumed by handleCultivationPaused()
+    // (automatic canopy fan is commanded OFF outright while no cultivation
+    // cycle is active, not held at this or any other baseline speed), and no
+    // longer borrowed by the root-zone Blower in processFogCycle() (the
+    // Blower now uses its own independent systemState.blowerSpeedPercent
+    // while fogging is actively ON). Read solely within
+    // handleCanopyClimate()'s own DHT-unavailable branch now. 70% is the
+    // deliberate boot-time default (no valid DHT reading has ever existed
+    // yet) - PWM COMMAND only, never measured RPM. Matches the NORMAL-demand
+    // speed in handleCanopyClimate(), itself set to the middle of the 65-75%
+    // band real-hardware bench testing found both fans run cleanest in
+    // (CANOPY_BLOWER_PWM_FREQUENCY_HZ's own comment).
     uint8_t lastAutomaticCanopySpeed = 70;
 
     // 0 = circulation not yet confirmed running for the current
     // STABILIZING_PH episode. Set once, in updateCooling(), the first tick
     // CIRCULATION_PUMP reports confirmed RUNNING while PH_STABILIZATION
     // demand is active - handleStabilizingPH() measures its 10-second wait
-    // from this, not from stateStartTime, so the interval reflects actual
+    // from this, not stateStartTime, so the interval reflects actual
     // pump-on time rather than the state-entry tick (which can precede
-    // confirmed circulation by up to ~1s of actuator ramp-up). Reset back to
-    // 0 by changeState() on every fresh entry into STABILIZING_PH, including
-    // a retry, so each stabilization episode gets its own full 10s.
+    // confirmed circulation by up to ~1s of actuator ramp-up). Reset to 0 by
+    // changeState() on every fresh entry into STABILIZING_PH, including a
+    // retry, so each stabilization episode gets its own full 10s.
     unsigned long phStabilizationCirculationConfirmedAt = 0;
 
     // Same anchor, same reasoning, for STABILIZING_EC - see
@@ -264,6 +268,21 @@ private:
     void processResetSafetyOperation();
     void processECCorrectionOperation();
 
+    // A manual pH/EC operation is its own correction episode and must get
+    // the same fresh 4-minute budget/trend bookkeeping an automatic one gets
+    // in processPHCorrection()/processECCorrection(). Without it
+    // correctionCycleStartAt stays 0, so "millis() - 0 >= budget" is already
+    // true once uptime passes 4 minutes and the episode is failed/locked at
+    // its first watch tick.
+    void beginManualCorrectionEpisode(bool isPH);
+
+    // Low water (SafetyResult::LOW_WATER only) during a pH/EC correction:
+    // stop the current correction cleanly WITHOUT latching the chemistry
+    // subsystem, so refill can run and the correction can be re-evaluated
+    // afterwards. Every other safety result still goes through
+    // abortCurrentOperation()/failCurrentSubsystem().
+    void stopCorrectionForLowWater();
+
     bool abortCurrentOperation(
     SafetyResult result);
 
@@ -297,9 +316,9 @@ private:
     // sensors.ph/ec being non-NaN. Requires the sensor's CURRENT stability
     // window to have just reconfirmed the reading (SensorManager::
     // isPhCurrentlyStable()/isEcCurrentlyStable()), not merely that a
-    // pre-dose/pre-disturbance value is still being retained for display.
-    // Does not gate a correction already RUNNING/STABILIZING - see each call
-    // site for exactly what it blocks.
+    // pre-dose/pre-disturbance value is still retained for display. Does not
+    // gate a correction already RUNNING/STABILIZING - see each call site for
+    // exactly what it blocks.
     bool canStartNewPHCorrection() const;
     bool canStartNewECCorrection() const;
 

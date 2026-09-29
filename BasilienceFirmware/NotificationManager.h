@@ -27,10 +27,10 @@ public:
     // fan-out -> GsmManager -> SIM800L), triggered by FirebaseManager::
     // readTestSmsCommand(). Never touches AlertManager/SafetyManager/
     // automation and never fabricates a sensor condition - it only enqueues
-    // a TEST_SMS event through the same enqueueEvent()/updateSmsFanOut()
-    // path every real alert already uses. ONLINE/OFFLINE wording is derived
-    // fresh from systemState.wifiConnected/firebaseConnected at call time,
-    // never hardcoded.
+    // a TEST_SMS event through the same enqueueEvent()/updateSmsFanOut() path
+    // every real alert already uses. ONLINE/OFFLINE wording is derived fresh
+    // from systemState.wifiConnected/firebaseConnected at call time, never
+    // hardcoded.
     void requestTestSms();
 
     // --- Cloud replay integration point, called from FirebaseManager's
@@ -64,19 +64,19 @@ private:
     static constexpr unsigned long SMS_RETRY_DELAY_MS = 30UL * 1000UL;
     static constexpr unsigned long CLOUD_REPLAY_RESUBMIT_MS = 5UL * 60UL * 1000UL;
     // Freshness policy (Part S): a deferred SMS is only attempted once
-    // cellular recovers if the event is still this fresh - otherwise it is
+    // cellular recovers if the event is still this fresh - otherwise it's
     // marked FAILED (no stale multi-day-old warning is ever sent). Harvest
-    // reminders tolerate a longer window since "due today" is still useful
-    // information a day later; ordinary alerts do not.
+    // reminders tolerate a longer window since "due today" is still useful a
+    // day later; ordinary alerts do not.
     static constexpr unsigned long GENERAL_SMS_FRESHNESS_MS = 6UL * 60UL * 60UL * 1000UL;       // 6 hours
     static constexpr unsigned long HARVEST_DUE_SMS_FRESHNESS_MS = 24UL * 60UL * 60UL * 1000UL;  // 24 hours
     // A PENDING event whose GSM module never becomes ready (no SIM800L
-    // wired, or it never registers) previously waited forever with no
-    // bound at all - this is the timeout that gives up on ATTEMPTING SMS in
-    // that case (distinct from GENERAL_SMS_FRESHNESS_MS above, which governs
+    // wired, or it never registers) previously waited forever with no bound
+    // at all - this is the timeout that gives up on ATTEMPTING SMS in that
+    // case (distinct from GENERAL_SMS_FRESHNESS_MS above, which governs
     // whether an already-DEFERRED send is still worth attempting once GSM
-    // does recover). 5 minutes is generous enough not to punish a real
-    // SIM800L's normal power-on/network-registration delay.
+    // recovers). 5 minutes is generous enough not to punish a real SIM800L's
+    // normal power-on/network-registration delay.
     static constexpr unsigned long SMS_START_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
     Preferences preferences;
@@ -91,13 +91,12 @@ private:
     // One-shot-per-incident SMS memory for the offline fallback (goal: an
     // alert that became active while ONLINE, where the app already owns
     // delivery, must still get exactly one SMS the moment cloud connectivity
-    // is later lost, and never more than one per continuous active streak).
-    // Set true the instant queueOfflineAlertFallback() actually enqueues for
-    // that type; reset back to false only when the underlying alert itself
-    // recovers (false), so a later true->false->true is a genuinely new,
-    // SMS-eligible incident again. Connectivity flapping (online<->offline)
-    // while the alert stays continuously active never touches these flags,
-    // so it can never cause a second SMS for the same incident.
+    // is later lost, never more than one per continuous active streak). Set
+    // true the instant queueOfflineAlertFallback() actually enqueues for that
+    // type; reset to false only when the underlying alert itself recovers,
+    // so a later true->false->true is a genuinely new, SMS-eligible incident.
+    // Connectivity flapping while the alert stays continuously active never
+    // touches these flags, so it can never cause a second SMS.
     bool lowWaterIncidentSmsSent = false;
     bool waterTempIncidentSmsSent = false;
     bool airTempIncidentSmsSent = false;

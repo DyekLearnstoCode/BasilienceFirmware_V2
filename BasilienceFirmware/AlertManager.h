@@ -28,19 +28,19 @@ private:
 
     // Stage 2 (sensor architecture redesign, incident-style alerts):
     // per-parameter, per-direction confirmation counters applied via
-    // setAlertDebounced() below. Each alert now needs TWO counters, not one:
+    // setAlertDebounced() below. Each alert needs TWO counters, not one:
     // *AbnormalPendingCount counts consecutive genuine new observations
     // agreeing the hysteresis-gated threshold is crossed (raises the alert
-    // once it reaches SENSOR_TRANSIENT_FAILURE_THRESHOLD);
-    // *RecoveryPendingCount counts consecutive genuine new observations
-    // agreeing the hysteresis recovery margin has been crossed back (clears
-    // the alert on the same threshold). Both sides require genuinely NEW
-    // sensor samples (see newObservation()/SensorManager's *SampleVersion
-    // getters) - a loop() tick that re-evaluates an unchanged reading
-    // advances neither. This makes each alert represent one confirmed
-    // abnormal episode with exactly one false->true and one true->false
-    // notification edge, instead of clearing (or re-raising) on a single
-    // reading right at either threshold.
+    // at SENSOR_TRANSIENT_FAILURE_THRESHOLD); *RecoveryPendingCount counts
+    // consecutive new observations agreeing the recovery margin has been
+    // crossed back (clears the alert on the same threshold). Both sides
+    // require genuinely NEW sensor samples (see newObservation()/
+    // SensorManager's *SampleVersion getters) - a loop() tick that
+    // re-evaluates an unchanged reading advances neither. This makes each
+    // alert represent one confirmed abnormal episode with exactly one
+    // false->true and one true->false notification edge, instead of
+    // clearing (or re-raising) on a single reading right at either
+    // threshold.
     uint8_t lowWaterAbnormalPendingCount = 0;
     uint8_t lowWaterRecoveryPendingCount = 0;
     uint8_t criticalLowWaterAbnormalPendingCount = 0;
@@ -84,18 +84,17 @@ private:
 
     void setAlert(const char* name, bool& currentValue, bool nextValue);
 
-    // Shared confirmation logic for every threshold-crossing alert
-    // (Stage 2). nextAbnormal already reflects the hysteresis-gated
-    // Schmitt-trigger check (aboveWithHysteresis()/belowWithHysteresis()),
-    // using currentValue as the "currently active" side. While nextAbnormal
-    // is true, only abnormalPendingCount advances (recoveryPendingCount is
-    // held at 0); while false, only recoveryPendingCount advances
-    // (abnormalPendingCount held at 0) - either counter only advances on a
-    // call made with newObservation=true (see newObservation() below), and
-    // the alert flips exactly once either counter reaches
-    // SENSOR_TRANSIENT_FAILURE_THRESHOLD. pendingCount pairs are per-alert
-    // state owned by the caller, since alerts derived from the same sensor
-    // (e.g. phLow/phHigh) must debounce independently of each other.
+    // Shared confirmation logic for every threshold-crossing alert (Stage 2).
+    // nextAbnormal already reflects the hysteresis-gated Schmitt-trigger
+    // check (aboveWithHysteresis()/belowWithHysteresis()), using
+    // currentValue as the "currently active" side. While nextAbnormal is
+    // true, only abnormalPendingCount advances (recoveryPendingCount held at
+    // 0); while false, only recoveryPendingCount advances - either counter
+    // only advances on a call made with newObservation=true (see
+    // newObservation() below), and the alert flips exactly once either
+    // counter reaches SENSOR_TRANSIENT_FAILURE_THRESHOLD. pendingCount pairs
+    // are per-alert state owned by the caller, since alerts derived from the
+    // same sensor (e.g. phLow/phHigh) must debounce independently.
     void setAlertDebounced(const char* name, bool& currentValue, bool nextAbnormal,
                            uint8_t& abnormalPendingCount, uint8_t& recoveryPendingCount,
                            bool newSample);
@@ -105,9 +104,9 @@ private:
     // get*SampleVersion() accessors, incremented ONLY at that sensor's own
     // accepted-observation point, never merely on elapsed time or a
     // re-evaluated stale/failed/skipped read) against the caller-owned
-    // lastProcessedVersion, consuming it (updating lastProcessedVersion) the
-    // moment a change is seen - "current version == last processed -> do
-    // nothing; current version != last processed -> process once".
+    // lastProcessedVersion, consuming it the moment a change is seen -
+    // "current version == last processed -> do nothing; else -> process
+    // once".
     static bool newObservation(uint32_t currentVersion, uint32_t& lastProcessedVersion);
 
     // Schmitt-trigger threshold checks (Stage 2 hysteresis): while

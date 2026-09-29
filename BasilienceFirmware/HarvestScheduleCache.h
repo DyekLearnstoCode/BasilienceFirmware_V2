@@ -15,10 +15,9 @@ public:
     void begin();
 
     // Applies a freshly-read authoritative snapshot. A failed RTDB read must
-    // never call this - the caller leaves the last known-good schedule as-is.
-    // active=false (no active cycle, or the cycle completed/was deleted)
-    // deactivates the cached schedule so a stale cycle can't keep firing
-    // HARVEST_DUE after it no longer applies.
+    // never call this - leave the last known-good schedule as-is. active=false
+    // (no active cycle, or it completed/was deleted) deactivates the cache so
+    // a stale cycle can't keep firing HARVEST_DUE after it no longer applies.
     void applySnapshot(const String& cycleId, int cycleNumber, uint32_t nextHarvestAtEpoch, bool active);
 
     bool isActive() const;

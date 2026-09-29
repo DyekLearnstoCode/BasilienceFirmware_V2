@@ -65,22 +65,22 @@ void WiFiManager::begin()
     // appearing on real hardware after the previous fix: that earlier fix
     // (Firebase.reconnectNetwork(false)) only stopped the Firebase client
     // library's own reconnect calls. It never touched the ESP32 Arduino
-    // core's OWN native auto-reconnect, which is a SEPARATE mechanism -
-    // STAClass's constructor defaults _autoReconnect to true
+    // core's OWN native auto-reconnect, a SEPARATE mechanism - STAClass's
+    // constructor defaults _autoReconnect to true
     // (libraries/WiFi/src/STA.cpp:231, ESP32 core 3.1.3), and nothing in
-    // this firmware ever called setAutoReconnect(false) to turn it off.
-    // On a disconnect with a "reconnectable" reason, STA.cpp's internal
+    // this firmware ever called setAutoReconnect(false) to turn it off. On
+    // a disconnect with a "reconnectable" reason, STA.cpp's internal
     // _onStaArduinoEvent (~line 156-164) synchronously calls disconnect()
     // then connect() itself, entirely outside WiFiManager's state machine -
     // the exact second reconnect owner this architecture is supposed to
     // rule out. That same synchronous re-entrant disconnect()/connect()
     // pair is also the most likely reason the [WIFI-EVENT] logs (connected,
-    // got-IP, AND disconnected - all three, not just disconnected) never
-    // printed cleanly: the event object/dispatch gets reused before this
-    // firmware's own onWiFiEvent() has a clean chance to run. This call is
-    // set once, here, at boot - the flag lives on the WiFi singleton
-    // constructed at static-init time, so WiFi.mode()/WiFi.begin() calls
-    // later never reset it back to its default-true state.
+    // got-IP, AND disconnected) never printed cleanly: the event
+    // object/dispatch gets reused before this firmware's own onWiFiEvent()
+    // has a clean chance to run. Set once, here, at boot - the flag lives
+    // on the WiFi singleton constructed at static-init time, so
+    // WiFi.mode()/WiFi.begin() calls later never reset it back to its
+    // default-true state.
     WiFi.setAutoReconnect(false);
 
     // Sibling fix to setAutoReconnect(false) above, same root cause: the
@@ -94,10 +94,10 @@ void WiFiManager::begin()
     // wins over it, but leaving persistence on means stale credentials sit
     // in a second, undocumented location this app's own saveCredentials()/
     // loadCredentials() never touches or clears - exactly the kind of
-    // hidden state the setAutoReconnect(false) fix above was written to
-    // rule out for auto-reconnect. Disabling it here makes this app's own
-    // Preferences "wifi" namespace the SOLE source of truth for every
-    // connection attempt, with no other cached fallback able to take effect.
+    // hidden state the setAutoReconnect(false) fix above rules out for
+    // auto-reconnect. Disabling it makes this app's own Preferences "wifi"
+    // namespace the SOLE source of truth for every connection attempt, with
+    // no other cached fallback able to take effect.
     WiFi.persistent(false);
 
     preferences.begin("wifi", false);
@@ -202,10 +202,9 @@ void WiFiManager::enterConnectedState()
 
 // LEGACY - not part of the connection state machine and unreachable in this
 // build: its only caller chain is reconnect() <- updateCredentialsSafely(),
-// which has no callers. Left in place deliberately (no dead-code cleanup in
-// this task). It must not be wired back up without being rewritten on top of
-// startConnectionAttempt(); it blocks for up to RECOVERY_TIMEOUT and would
-// bypass every guarantee below.
+// which has no callers. Left in place deliberately. Must not be wired back
+// up without being rewritten on top of startConnectionAttempt(); it blocks
+// for up to RECOVERY_TIMEOUT and would bypass every guarantee below.
 bool WiFiManager::connect()
 {
     if (!hasCredentials())
@@ -384,10 +383,10 @@ bool WiFiManager::saveCredentials(
     // begin()'s own return value was never checked - if opening the "wifi"
     // namespace itself fails (corrupt/stale NVS state, not necessarily out
     // of space), every putString() below silently fails too and looks
-    // identical to a normal write failure, with no way to tell the two
-    // apart from this log. FirebaseManager.cpp already checks this same
-    // call for its own namespaces (e.g. "device_auth", "manual_cmd") - this
-    // brings saveCredentials() in line with that.
+    // identical to a normal write failure, with no way to tell the two apart
+    // from this log. FirebaseManager.cpp already checks this same call for
+    // its own namespaces (e.g. "device_auth", "manual_cmd") - this brings
+    // saveCredentials() in line with that.
     bool opened = preferences.begin("wifi", false);
     if (!opened)
     {
@@ -399,11 +398,11 @@ bool WiFiManager::saveCredentials(
     // only reclaimed once a page is later garbage-collected. Confirmed on
     // this device via the raw ESP-IDF diagnostic below: nvs_set_str()
     // returning ESP_ERR_NVS_NOT_ENOUGH_SPACE for both "ssid" and "password"
-    // despite freeEntries() reporting 126 free overall - that combination is
-    // NVS's classic single-page-fragmentation failure (free space exists,
-    // just not contiguous in one page), which repeated /setup submissions
-    // for the same two keys make worse over time by leaving another stale
-    // copy behind on every attempt. Erasing them first reclaims that space
+    // despite freeEntries() reporting 126 free overall - NVS's classic
+    // single-page-fragmentation failure (free space exists, just not
+    // contiguous in one page), which repeated /setup submissions for the
+    // same two keys make worse over time by leaving another stale copy
+    // behind on every attempt. Erasing them first reclaims that space
     // immediately instead of appending yet another copy - scoped to only
     // these two keys in the "wifi" namespace, so it cannot touch
     // "device_auth" (the Firebase bootstrap secret) or any other namespace.
@@ -430,15 +429,15 @@ bool WiFiManager::saveCredentials(
     Serial.print(" nvsFreeEntries=");
     Serial.println(freeEntries);
 
-    // putString() returning 0 was previously never checked here, so a
-    // write that silently failed (NVS full/corrupted, or nvs_commit()
-    // failing after a successful nvs_set_str()) still reported success to
-    // this function's caller and to the /setup HTTP handler, leaving
-    // whatever credentials already existed in NVS untouched - the confirmed
-    // cause of "credentials always revert to the previous network."
-    // /setup already rejects an empty SSID before ever calling this, so
-    // ssidBytes==0 here is unambiguously a real failure, not a legitimate
-    // empty value; password may legitimately be empty (open networks), so
+    // putString() returning 0 was previously never checked here, so a write
+    // that silently failed (NVS full/corrupted, or nvs_commit() failing
+    // after a successful nvs_set_str()) still reported success to this
+    // function's caller and to the /setup HTTP handler, leaving whatever
+    // credentials already existed in NVS untouched - the confirmed cause of
+    // "credentials always revert to the previous network." /setup already
+    // rejects an empty SSID before ever calling this, so ssidBytes==0 here
+    // is unambiguously a real failure, not a legitimate empty value;
+    // password may legitimately be empty (open networks), so
     // passwordBytes==0 only counts as a failure when a non-empty password
     // was actually submitted.
     if (ssidBytes == 0 || (password.length() > 0 && passwordBytes == 0))
@@ -447,16 +446,16 @@ bool WiFiManager::saveCredentials(
 
         // Preferences::putString() only ever returns 0-or-not, swallowing
         // the real esp_err_t (e.g. ESP_ERR_NVS_TYPE_MISMATCH if "ssid"/
-        // "password" were ever stored as a different type by older firmware,
-        // vs. ESP_ERR_NVS_NOT_ENOUGH_SPACE, vs. a flash-level error) - opened
-        // is already known true here (freeEntries() above required a
-        // successful begin()), so this repeats the same writes through the
-        // raw ESP-IDF API purely to name the actual failure. This is a
-        // second, real write attempt (not a dry run) - if it happens to
-        // succeed where the wrapper reported failure, the credentials are
-        // now genuinely saved despite this function still returning false
-        // for this attempt; that would itself be a useful, informative
-        // outcome, not a problem to guard against.
+        // "password" were ever stored as a different type by older
+        // firmware, vs. ESP_ERR_NVS_NOT_ENOUGH_SPACE, vs. a flash-level
+        // error) - opened is already known true here (freeEntries() above
+        // required a successful begin()), so this repeats the same writes
+        // through the raw ESP-IDF API purely to name the actual failure.
+        // This is a second, real write attempt (not a dry run) - if it
+        // happens to succeed where the wrapper reported failure, the
+        // credentials are now genuinely saved despite this function still
+        // returning false for this attempt; that's itself a useful,
+        // informative outcome, not a problem to guard against.
         nvs_handle_t rawHandle;
         esp_err_t openErr = nvs_open("wifi", NVS_READWRITE, &rawHandle);
         Serial.print("[WIFI] NVS raw diagnostic: nvs_open=");
@@ -589,10 +588,10 @@ void WiFiManager::update()
 
         // A /setup submission (in either MANUAL or FALLBACK provisioning) is
         // being tried - see beginManualReconnectAttempt(). Exclusive of the
-        // self-heal retry below for the same reason as the MANUAL guard that
-        // used to live here: ESP32's AP and STA share one radio, and this
-        // and the self-heal loop must never both call WiFi.begin() while the
-        // other's attempt is still in flight.
+        // self-heal retry below for the same reason as the MANUAL guard
+        // that used to live here: ESP32's AP and STA share one radio, and
+        // this and the self-heal loop must never both call WiFi.begin()
+        // while the other's attempt is still in flight.
         if (manualAttemptState != ManualAttemptState::NONE)
         {
             updateManualReconnectAttempt();
@@ -600,18 +599,19 @@ void WiFiManager::update()
         }
 
         // MANUAL provisioning is a user actively submitting NEW credentials
-        // through this same setup AP (WifiConfigFragment's POST /setup) - the
-        // self-heal retry below has no business running here, and actively
-        // breaks that submission. ESP32's AP and STA share one radio: every
-        // AP_RECONNECT_INTERVAL (30s) this used to force WIFI_AP_STA and call
-        // WiFi.begin() to retry the OLD saved network, an association attempt
-        // that stays in flight for up to RECOVERY_TIMEOUT (20s) - i.e. the
-        // softAP's radio was destabilized roughly 2/3 of the time. If the
-        // phone's POST /setup landed during that window, the request would
-        // time out or the connection would reset (confirmed bug: "credentials
-        // submit fails"). Only FALLBACK provisioning (unattended, entered
-        // because the device itself lost its known network) should keep
-        // trying to self-heal in the background.
+        // through this same setup AP (WifiConfigFragment's POST /setup) -
+        // the self-heal retry below has no business running here, and
+        // actively breaks that submission. ESP32's AP and STA share one
+        // radio: every AP_RECONNECT_INTERVAL (30s) this used to force
+        // WIFI_AP_STA and call WiFi.begin() to retry the OLD saved network,
+        // an association attempt that stays in flight for up to
+        // RECOVERY_TIMEOUT (20s) - i.e. the softAP's radio was destabilized
+        // roughly 2/3 of the time. If the phone's POST /setup landed during
+        // that window, the request would time out or the connection would
+        // reset (confirmed bug: "credentials submit fails"). Only FALLBACK
+        // provisioning (unattended, entered because the device itself lost
+        // its known network) should keep trying to self-heal in the
+        // background.
         if (provisioningMode == ProvisioningMode::MANUAL) return;
 
         // Keep the setup portal available while occasionally trying the retained
@@ -682,8 +682,8 @@ void WiFiManager::update()
     // printed "Connection lost" and moved to RETRY_WAIT even while still
     // genuinely connected; the very next update() then saw linkUp still
     // true with wifiState now RETRY_WAIT, took the branch below (correctly,
-    // for what it actually detects), and printed "reconnect handled by
-    // ESP32 auto-reconnect" - a complete, self-inflicted, radio-independent
+    // for what it actually detects), and printed "reconnect handled by ESP32
+    // auto-reconnect" - a complete, self-inflicted, radio-independent
     // CONNECTED<->RETRY_WAIT oscillation with no real disconnect, no real
     // reconnect, and nothing for the STA event handler to ever report.
     // Steady-state "still connected" must be a plain no-op, never fall into
@@ -1001,8 +1001,8 @@ void WiFiManager::setupAPServer()
         // flash rather than assuming the write stuck. Compared directly
         // against the just-submitted value so a divergence (encoding
         // corruption, a write that silently failed) is visible immediately
-        // in this same log, instead of only showing up indirectly as a
-        // failed reconnect after reboot.
+        // in this log, instead of only showing up indirectly as a failed
+        // reconnect after reboot.
         preferences.begin("wifi", true);
         String verifySsid = preferences.getString("ssid", "");
         preferences.end();
@@ -1027,12 +1027,12 @@ void WiFiManager::setupAPServer()
     });
 
     // Secure Device Auth: one-time migration/provisioning delivery of this
-    // device's bootstrap secret. Only ever reachable because this whole HTTP
-    // server only exists/serves while provisioning mode is active (started
-    // from startAP(), stopped from stopAP()) - there is no separate "enabled"
-    // flag to forget, and no path to reach this route during normal
-    // operation. The secret is never echoed back and never logged; only its
-    // presence/absence is.
+    // device's bootstrap secret. Only ever reachable because this whole
+    // HTTP server only exists/serves while provisioning mode is active
+    // (started from startAP(), stopped from stopAP()) - no separate
+    // "enabled" flag to forget, and no path to reach this route during
+    // normal operation. The secret is never echoed back and never logged;
+    // only its presence/absence is.
     server.on("/secure-provision", HTTP_POST, [this]() {
         Serial.println("[AP HTTP] POST /secure-provision");
         if (!server.hasArg("deviceSecret") || server.arg("deviceSecret").isEmpty()) {
@@ -1042,11 +1042,12 @@ void WiFiManager::setupAPServer()
             return;
         }
 
-        // generateDeviceSecret.js emits 32 random bytes as unpadded base64url,
-        // which is always 43 characters. This bound is intentionally generous
-        // (not an exact-length check) so a minor change to the generator's
-        // encoding does not brick provisioning, while still rejecting empty-
-        // adjacent noise or an oversized payload before it reaches NVS.
+        // generateDeviceSecret.js emits 32 random bytes as unpadded
+        // base64url, always 43 characters. This bound is intentionally
+        // generous (not an exact-length check) so a minor change to the
+        // generator's encoding doesn't brick provisioning, while still
+        // rejecting empty-adjacent noise or an oversized payload before it
+        // reaches NVS.
         const size_t secretLen = server.arg("deviceSecret").length();
         if (secretLen < 16 || secretLen > 128) {
             Serial.println("[AP HTTP] Invalid secure-provision request (deviceSecret length out of range)");

@@ -34,15 +34,22 @@ void setup()
 
     Serial.println("[CONTROL] Local automation and safety ready");
 
+    // Serial Diagnostics / Observability pass (section 14): one compact
+    // configuration summary, now that every local manager's own begin() has
+    // run and RTC/harvest-cache/settings state reflects this boot - still
+    // before Wi-Fi/Firebase start, so it never depends on connectivity.
+    debugManager.printBootSummary();
+    Serial.println("[BOOT] Local automation initialized");
+    Serial.println("[BOOT] Waiting for WiFi...");
+
     wifiManager.begin();
 
     // WiFi.macAddress() reads back all-zero here whenever this boot has no
     // saved credentials (goes straight into WiFi.mode(WIFI_AP)-only
-    // provisioning, so the STA netif is never started) - see the task
-    // report for the full trace. getFormattedMacAddress()/getMacAddress()
-    // read the hardware MAC directly via esp_read_mac(), which works
-    // regardless of WiFi mode/state.
-    // A "" result means readHardwareStaMac() already logged
+    // provisioning, so the STA netif is never started) - see the task report
+    // for the full trace. getFormattedMacAddress()/getMacAddress() read the
+    // hardware MAC directly via esp_read_mac(), which works regardless of
+    // WiFi mode/state. A "" result means readHardwareStaMac() already logged
     // "[IDENTITY] ERROR: ..." - nothing further to print here.
     String staMac = firebaseManager.getFormattedMacAddress();
     if (!staMac.isEmpty())
@@ -77,6 +84,11 @@ void setup()
 
 void loop()
 {
+    // Serial Diagnostics / Observability pass (sections 6/7): recorded first,
+    // before any other work this iteration, so the measured gap is how long
+    // the whole previous iteration actually took, including everything below.
+    debugManager.recordLoopTick();
+
     // Provisioning is a local, latency-sensitive mode. Service DNS/HTTP first and
     // skip every Firebase/SSL path while the setup AP owns the radio. Local
     // sensor, safety, automation, and actuator enforcement must still run.
@@ -114,12 +126,20 @@ void loop()
         // Keep the AP HTTP/DNS service responsive without suspending local
         // safety checks or actuator watchdogs.
         wifiManager.update();
+        firebaseManager.noteProvisioningActive();
         debugManager.update();
         return;
     }
 
     // A saved network can recover while the setup AP is active. Firebase was
-    // intentionally never started on that boot, so initialize it only now.
+    // intentionally never started on that boot, so it is armed only now.
+    // begin() does NO network I/O and returns immediately: the first cloud
+    // connection (network preflight -> authentication -> database
+    // initialization) is advanced a bounded step per loop() iteration by
+    // update() below, so an unreachable or slow cloud can never hold up the
+    // sensing/safety/automation/actuator work above. Cloud readiness is
+    // reported by systemState.firebaseConnected, which stays false until every
+    // startup step has finished - Wi-Fi being connected does not imply it.
     if (!firebaseInitialized && wifiManager.isConnected())
     {
         firebaseManager.begin();

@@ -6,11 +6,10 @@
 #include "FoggingQueueTypes.h"
 
 // Durable, offline-capable history of CONFIRMED fogger ON/OFF transitions -
-// history correctness only. Does not decide when the fogger runs (that
-// stays entirely in AutomationManager/ActuatorManager); this class only
-// observes the already-confirmed result and makes sure a record of it
-// reaches Firestore exactly once, whether the device was online at the
-// moment of the transition or not.
+// history correctness only. Does not decide when the fogger runs (that stays
+// entirely in AutomationManager/ActuatorManager); this class only observes
+// the already-confirmed result and makes sure a record reaches Firestore
+// exactly once, online or not.
 //
 // Deliberately not a copy of NotificationManager: no SMS fan-out, no
 // severity/eviction-by-priority, no free-text title/message. Fogging
@@ -39,7 +38,7 @@ public:
     //     job cursor - one job slot, one event in flight at a time, same
     //     shape as NotificationManager's cloud replay integration so it
     //     shares the existing health/backoff/starvation-avoidance behavior
-    //     for free (see runOneOptionalFirebaseJob). ---
+    //     for free (runOneOptionalFirebaseJob). ---
     bool getNextReplayEvent(FoggingQueueEvent& outEvent, String& outEventId);
     bool isReplayStale(const String& eventId, unsigned long staleAfterMs);
     void markReplaySubmitted(const String& eventId);

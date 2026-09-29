@@ -3,13 +3,13 @@
 
 #include <Arduino.h>
 
-// Foundation driver for a SIMCom SIM800L GSM/GPRS module. Owns the
-// dedicated GSM UART and a millis()-driven state machine so cultivation
-// control (sensors/automation/safety/actuators) is never blocked while the
-// module boots, registers, or sends an SMS - update() never calls delay() or
-// spins in a wait loop. GsmManager knows nothing about Firebase, user roles,
-// or alert/delivery policy: it only sends text a caller supplies to a number
-// a caller supplies, one at a time, and reports why if it couldn't.
+// Foundation driver for a SIMCom SIM800L GSM/GPRS module. Owns the dedicated
+// GSM UART and a millis()-driven state machine so cultivation control
+// (sensors/automation/safety/actuators) is never blocked while the module
+// boots, registers, or sends an SMS - update() never calls delay() or spins
+// in a wait loop. GsmManager knows nothing about Firebase, user roles, or
+// alert/delivery policy: it only sends text a caller supplies to a number a
+// caller supplies, one at a time, and reports why if it couldn't.
 //
 // The AT/SMS command set here (AT, AT+CPIN?, AT+CMGF=1, AT+CMGS) is standard
 // Hayes/3GPP TS 27.005 and behaves identically across GSM modules; the one
@@ -17,8 +17,8 @@
 // registration - the previous target module, an A76XX/A7680C, is LTE Cat1).
 // SIM800L is 2G/GPRS-only and has no EPS stack, so registration is now
 // checked with the legacy circuit-switched AT+CREG? instead - the response
-// shape (+CREG: <n>,<stat>) and status codes are the same as CEREG's, so the
-// parsing logic needed no change beyond the command/tag string itself.
+// shape (+CREG: <n>,<stat>) and status codes match CEREG's, so the parsing
+// logic needed no change beyond the command/tag string.
 //
 // Hardened against the physically bench-validated SIM800L V2 unit (see the
 // GSM physical validation report): READY now periodically re-verifies
@@ -27,7 +27,7 @@
 // SIM800L's own signature for "I just (re)booted" - is recognized from any
 // state so a genuine modem restart (e.g. a power blip) cleanly aborts any
 // in-flight send and re-enters initialization instead of leaving the state
-// machine wedged in a READY that no longer reflects reality.
+// machine wedged in a stale READY.
 class GsmManager
 {
 public:
@@ -58,12 +58,11 @@ public:
 
     // Starts sending `message` to `phoneNumber` (must already be in canonical
     // +639XXXXXXXXX form - this class validates defensively but does not
-    // normalize) if the module is READY and idle. Returns true if the
-    // request was accepted and is now in progress; false if rejected
-    // immediately, in which case getLastResult() reports why. Either way this
-    // call itself never blocks - a caller feeding multiple recipients should
-    // poll isBusy()/getLastResult() each loop() and call sendSms() again for
-    // the next recipient once the previous one finishes.
+    // normalize) if the module is READY and idle. Returns true if accepted
+    // and now in progress; false if rejected immediately, in which case
+    // getLastResult() reports why. Either way this call never blocks - a
+    // caller feeding multiple recipients should poll isBusy()/getLastResult()
+    // each loop() and call sendSms() again once the previous one finishes.
     bool sendSms(const String& phoneNumber, const String& message);
 
     bool isBusy() const;
@@ -109,9 +108,9 @@ private:
     // another look - see updateReady().
     unsigned long lastRegistrationCheckAt = 0;
 
-    // Every duration below is a bound on how long GsmManager will wait for a
-    // given AT response before retrying or giving up - never an indefinite
-    // wait. None of them block loop(): update() checks millis() and returns.
+    // Every duration below bounds how long GsmManager waits for a given AT
+    // response before retrying or giving up - never indefinite. None of
+    // them block loop(): update() checks millis() and returns.
     static constexpr unsigned long MODULE_PROBE_RETRY_INTERVAL_MS = 3000UL;
     static constexpr unsigned long SIM_CHECK_RETRY_INTERVAL_MS = 3000UL;
     static constexpr unsigned long REGISTRATION_RETRY_INTERVAL_MS = 5000UL;

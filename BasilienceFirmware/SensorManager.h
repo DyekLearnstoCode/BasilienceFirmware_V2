@@ -84,6 +84,43 @@ private:
     bool sensorSourceWaitingLogged = false;
     bool mockBootWaitHeldLogged = false;
 
+    // Timestamp of the most recent CONFIRMED mock payload - set by
+    // notifyMockPayloadReceived() on EVERY successful ~MOCK_READ_INTERVAL
+    // poll while mock stays enabled (FirebaseManager::readMockSensors()),
+    // not just the first one after boot. Distinct from mockBootWaitStartedAt
+    // below, which only covers that first payload - this covers the rest of
+    // the session too, so a later Wi-Fi/Firebase outage can be detected (M8
+    // fix). See applyEffectiveSensors()'s MOCK PAYLOAD FRESHNESS block.
+    unsigned long lastMockPayloadAt = 0;
+
+    // Whether the EFFECTIVE dataset (`sensors`) was actually sourced from
+    // mock last tick - distinct from lastReportedMockSource above, which
+    // tracks the raw enabled/disabled developer intent for the
+    // "[AUTOMATION] Sensor source=" announcement. A stale-mock fallback (see
+    // applyEffectiveSensors()) keeps mockSensorsEnabled true while no longer
+    // actually using mock data, so the mock<->physical stability-window
+    // reset logic needs this separate, EFFECTIVE-source signal to fire
+    // exactly once per real transition rather than every tick a staleness
+    // fallback persists.
+    bool lastEffectiveSourceWasMock = false;
+
+    // Edge-detection for the "[MOCK] Effective source: ..." transition log
+    // (effective-mock-source consistency fix). Separate from
+    // lastEffectiveSourceWasMock above: that plain bool cannot by itself
+    // distinguish PHYSICAL from INVALID_TEST_HOLD, since
+    // applyEffectiveSensors() sets it false for both (see each branch's own
+    // comment) - this instead remembers which of the three effective-source
+    // CATEGORIES was last printed, so logEffectiveSourceTransition() fires
+    // exactly once per real transition between all three, not just on the
+    // two-state MOCK/not-MOCK edge. Empty string means "nothing logged yet
+    // this boot".
+    String lastLoggedEffectiveMockSource = "";
+
+    // Edge-detection for the "[MOCK] STALE"/recovery transition logs -
+    // separate from mockBootWaitHeldLogged above, which is boot-wait-only.
+    bool mockStaleLogged = false;
+    unsigned long lastMockStatusLogAt = 0;
+
     // Sensor-source persistence. The effective source (mock vs. physical) is
     // decided locally at boot from NVS so a cold boot with no Wi-Fi/Firebase
     // still reaches a definite source and local automation can run. Firebase
@@ -98,12 +135,12 @@ private:
     bool mockBootWaitingForPayload = false;
     unsigned long mockBootWaitStartedAt = 0;
 
-    // Timestamp of the most recent moment physical sensors became the active
-    // source (cold boot direct to physical, mock boot-wait timeout, or the
-    // cloud turning mock off). applyEffectiveSensors() holds sensors.ph/ec
-    // NaN for PH_EC_ANALOG_SETTLE_TIME after this, since the analog probes
-    // haven't electrically settled yet even though physicalSensors already
-    // has a finite (but still drifting) reading.
+    // Timestamp of the most recent moment physical sensors became the
+    // active source (cold boot direct to physical, mock boot-wait timeout,
+    // or the cloud turning mock off). applyEffectiveSensors() holds
+    // sensors.ph/ec NaN for PH_EC_ANALOG_SETTLE_TIME after this, since the
+    // analog probes haven't electrically settled yet even though
+    // physicalSensors already has a finite (but still drifting) reading.
     unsigned long physicalPhEcSettledAt = 0;
 
     void resolveLocalSensorSource();
@@ -118,6 +155,21 @@ private:
     uint8_t waterTempFailureStreak = 0;
     float lastValidWaterTemp = NAN;
 
+    // Runtime reliability fix (R2): the DS18B20 conversion is requested
+    // asynchronously (see begin()'s waterSensor.setWaitForConversion(false))
+    // instead of blocking this task for ~750ms every
+    // WATER_TEMP_READ_INTERVAL_MS. waterTempConversionPending is true from
+    // the moment requestTemperatures() is issued until the device's own
+    // conversion time has elapsed; only then does readWaterTemperature()
+    // actually read the scratchpad. waterTempConversionWaitMs is captured
+    // via waterSensor.millisToWaitForConversion() at request time (750ms at
+    // the default/unconfigured 12-bit resolution this firmware uses) so
+    // this stays correct if the configured resolution is ever changed
+    // elsewhere.
+    bool waterTempConversionPending = false;
+    unsigned long waterTempConversionStartedAt = 0;
+    uint16_t waterTempConversionWaitMs = 750;
+
     // Stage 2 (AlertManager sample-confirmed alerts): increments exactly
     // once per genuinely accepted new DS18B20 reading - see
     // readWaterTemperature()'s own physicalSensors.waterTemp write. Never
@@ -129,15 +181,15 @@ private:
     // Light exponential smoothing over accepted raw DS18B20 readings - see
     // readWaterTemperature()'s own comment for why (real-hardware
     // pre-integration Part D: occasional per-sample flicker with no
-    // averaging at all before this). NaN means "no filtered value yet";
-    // reset (not blended) on a confirmed-unavailable -> recovered
-    // transition so recovery never blends against a stale pre-outage value.
+    // averaging before this). NaN means "no filtered value yet"; reset (not
+    // blended) on a confirmed-unavailable -> recovered transition so
+    // recovery never blends against a stale pre-outage value.
     float waterTempFiltered = NAN;
 
     // DS18B20 enumeration state. 0 devices at boot is re-checked on the same
     // throttled WATER_TEMP_READ_INTERVAL_MS cadence readWaterTemperature()
-    // already uses - no separate timer - so a probe that wasn't settled yet
-    // at begin() is picked up automatically once it starts responding.
+    // already uses - no separate timer - so a probe not yet settled at
+    // begin() is picked up automatically once it starts responding.
     // waterSensorAddress is cached once enumeration succeeds so normal reads
     // use DallasTemperature::getTempC(address) instead of re-walking the
     // OneWire bus search on every getTempCByIndex(0) call.
@@ -150,8 +202,8 @@ private:
 
     // Stage 2 (AlertManager sample-confirmed alerts): incremented inside
     // updateStabilityWindow() (shared with pH below) at EC's own DECISION
-    // cadence, STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the raw
-    // ~20ms AnalogSampler ADC cadence, which is far too fast to represent a
+    // cadence, STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the raw ~20ms
+    // AnalogSampler ADC cadence, which is far too fast to represent a
     // meaningful filtered decision observation for alert-confirmation
     // purposes (that raw cadence remains exactly as fast for LIVE telemetry,
     // sensors.ec - only alert confirmation is throttled to this slower
@@ -179,8 +231,8 @@ private:
     // The confirmed/recovering flags this state produces
     // (physicalSensors.phFault/ecFault, Types.h) are read and acted on in
     // applyEffectiveSensors(), never here directly - readPH()/readEC() only
-    // ever populate physicalSensors, matching every other sensor's existing
-    // split between acquisition (read*()) and effective-dataset assembly
+    // ever populate physicalSensors, matching every other sensor's split
+    // between acquisition (read*()) and effective-dataset assembly
     // (applyEffectiveSensors()).
     unsigned long lastPhFaultCheckAt = 0;
     uint8_t phFaultStreak = 0;
@@ -195,9 +247,9 @@ private:
     // comment and physicalSensors.ecCalibrationFault's declaration-site
     // comment in Types.h). A SEPARATE streak/throttle from
     // ecFaultStreak/ecFaultRecoveryStreak/lastEcFaultCheckAt above -
-    // deliberately not shared, so this detector's own confirm/recovery
-    // debounce can never race the rail detector's into clearing a fault the
-    // other is still confirming.
+    // deliberately not shared, so this detector's confirm/recovery debounce
+    // can never race the rail detector's into clearing a fault the other is
+    // still confirming.
     unsigned long lastEcCalibrationFaultCheckAt = 0;
     uint8_t ecCalibrationFaultStreak = 0;
     uint8_t ecCalibrationFaultRecoveryStreak = 0;
@@ -205,31 +257,31 @@ private:
     // Per-observation plausibility result, recomputed EVERY readEC() tick
     // (unlike ecCalibrationFaultStreak above, which only advances on the
     // throttled EC_FAULT_CHECK_INTERVAL_MS cadence) - true when THIS
-    // sample's compensatedEc/voltage is non-finite, negative, or outside
-    // the EC_CAL_VOLTAGE_MARGIN_V-widened calibration domain. Lets
-    // applyEffectiveSensors() invalidate sensors.ec immediately for a single
-    // bad observation without waiting on EC_FAULT_CONFIRM_COUNT consecutive
-    // confirmations - that streak still, and only, controls the separate
-    // PERSISTENT physicalSensors.ecCalibrationFault flag.
+    // sample's compensatedEc/voltage is non-finite, negative, or outside the
+    // EC_CAL_VOLTAGE_MARGIN_V-widened calibration domain. Lets
+    // applyEffectiveSensors() invalidate sensors.ec immediately for a
+    // single bad observation without waiting on EC_FAULT_CONFIRM_COUNT
+    // consecutive confirmations - that streak still, and only, controls the
+    // separate PERSISTENT physicalSensors.ecCalibrationFault flag.
     bool ecImplausibleThisSample = false;
 
     // pH temporal step filter - see Config.h's PH_STEP_ACCEPT_DELTA/
     // PH_STEP_CONFIRM_TOLERANCE/PH_STEP_CONFIRM_COUNT and
-    // applyEffectiveSensors()'s own comment. Mirrors the HC-SR04 water-depth
-    // step filter's design (lastAcceptedWaterDepthCm/waterLevelStepCandidateCm/
-    // waterLevelStepCandidateCount above). lastAcceptedPhCandidate is the
-    // last TRUSTED candidate - this IS the FAST TELEMETRY value published as
-    // sensors.ph (quick-response refinement task), completely independent of
-    // whether phStabilityWindow below has itself converged; NAN means no
-    // trusted baseline yet (boot, or the filter has never confirmed a first
-    // reading - never published as a fabricated number, see
-    // applyEffectiveSensors()'s own comment). phStepCandidate/
-    // phStepCandidateCount track an in-progress confirmation streak (used
-    // for BOTH initial-baseline establishment and a later large-jump
-    // confirmation - structurally identical, same as the water filter's own
-    // reacquisition-vs-jump reuse); phStepCandidate is NAN exactly when no
-    // streak is in progress, which isPhCurrentlyStable()/isPhConfirming()
-    // below also read directly.
+    // applyEffectiveSensors()'s own comment. Mirrors the HC-SR04
+    // water-depth step filter's design (lastAcceptedWaterDepthCm/
+    // waterLevelStepCandidateCm/waterLevelStepCandidateCount above).
+    // lastAcceptedPhCandidate is the last TRUSTED candidate - this IS the
+    // FAST TELEMETRY value published as sensors.ph (quick-response
+    // refinement task), completely independent of whether phStabilityWindow
+    // below has itself converged; NAN means no trusted baseline yet (boot,
+    // or the filter has never confirmed a first reading - never published
+    // as a fabricated number, see applyEffectiveSensors()'s own comment).
+    // phStepCandidate/phStepCandidateCount track an in-progress
+    // confirmation streak (used for BOTH initial-baseline establishment and
+    // a later large-jump confirmation - structurally identical, same as the
+    // water filter's own reacquisition-vs-jump reuse); phStepCandidate is
+    // NAN exactly when no streak is in progress, which
+    // isPhCurrentlyStable()/isPhConfirming() below also read directly.
     float lastAcceptedPhCandidate = NAN;
     float phStepCandidate = NAN;
     uint8_t phStepCandidateCount = 0;
@@ -237,7 +289,7 @@ private:
     // millis() lastAcceptedPhCandidate was last (re)established - the
     // TELEMETRY side's own freshness clock, independent of
     // phStabilityWindow.lastStableAt (the AUTOMATION-TRUST side's). See
-    // applyEffectiveSensors()'s own comment for why telemetry needs its own
+    // applyEffectiveSensors()'s comment for why telemetry needs its own
     // staleness check rather than sharing the window's.
     unsigned long lastAcceptedPhCandidateAt = 0;
     // Edge-detection for the telemetry-side "[PH-FILTER] telemetry stale"
@@ -246,9 +298,9 @@ private:
 
     // Stage 2 (AlertManager sample-confirmed alerts): incremented inside
     // updateStabilityWindow() (shared with EC above) at pH's own DECISION
-    // cadence, PH_STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the
-    // faster ~300ms PH_STEP_SAMPLE_INTERVAL_MS step-filter cadence, which is
-    // too fast to represent a meaningful filtered decision observation for
+    // cadence, PH_STABILITY_SAMPLE_INTERVAL_MS - deliberately NOT the faster
+    // ~300ms PH_STEP_SAMPLE_INTERVAL_MS step-filter cadence, too fast to
+    // represent a meaningful filtered decision observation for
     // alert-confirmation purposes (that faster cadence remains exactly as
     // fast for LIVE telemetry, sensors.ph - only alert confirmation is
     // throttled to this slower cadence). Each increment corresponds to the
@@ -262,14 +314,15 @@ private:
 
     // Throttles the step filter's own evaluation (state advancement AND its
     // [PH-FILTER] diagnostics) to PH_STEP_SAMPLE_INTERVAL_MS (quick-response
-    // refinement task - deliberately faster than PH_STABILITY_SAMPLE_INTERVAL_MS,
-    // which the automation-trust window below still uses unchanged). readPH()
-    // recomputes physicalSensors.ph on every loop() tick from a
-    // continuously-updating median, so without this throttle "3 consecutive
-    // candidates" could be satisfied by evaluating the SAME unchanged median
-    // dozens of times within milliseconds, which is not 3 genuinely distinct
-    // observations (the same bug class already fixed for the water-refill
-    // threshold confirmation counters - see readWaterLevel()'s own comment).
+    // refinement task - deliberately faster than
+    // PH_STABILITY_SAMPLE_INTERVAL_MS, which the automation-trust window
+    // below still uses unchanged). readPH() recomputes physicalSensors.ph on
+    // every loop() tick from a continuously-updating median, so without
+    // this throttle "3 consecutive candidates" could be satisfied by
+    // evaluating the SAME unchanged median dozens of times within
+    // milliseconds, not 3 genuinely distinct observations (the same bug
+    // class already fixed for the water-refill threshold confirmation
+    // counters - see readWaterLevel()'s own comment).
     unsigned long lastPhStepEvalAt = 0;
 
     // HC-SR04 read scheduling and transient-failure tolerance, mirroring the
@@ -289,8 +342,8 @@ private:
     // waterLevelLow on and off within one debounce window. A true median
     // (not an average) rejects an outlier sample instead of smoothing it
     // away, which would lag a real level change; cleared on
-    // confirmed-unavailable so a recovery doesn't median against stale
-    // pre-outage readings.
+    // confirmed-unavailable so a recovery doesn't median against stale pre-
+    // outage readings.
     float waterLevelDistanceHistory[5] = {NAN, NAN, NAN, NAN, NAN};
     uint8_t waterLevelHistoryIndex = 0;
     uint8_t waterLevelHistoryCount = 0;
@@ -298,27 +351,29 @@ private:
     // Second-stage temporal plausibility filter over the median-of-5 output -
     // see Config.h's WATER_LEVEL_STEP_ACCEPT_CM/WATER_LEVEL_STEP_CONFIRM_*
     // and readWaterLevel()'s own comment. lastAcceptedWaterDepthCm is the
-    // control-authoritative accepted value (what physicalSensors.waterLevelCm
-    // is actually set from); NAN means "no accepted depth yet" (boot, or just
-    // recovered from a confirmed sensor outage), which accepts the very next
-    // candidate immediately rather than waiting on a confirmation streak
-    // against nothing. waterLevelStepCandidateCm/waterLevelStepCandidateCount
-    // track an in-progress large-jump confirmation streak; reset to
-    // NAN/0 whenever a candidate does not agree with the pending one.
+    // control-authoritative accepted value (what
+    // physicalSensors.waterLevelCm is actually set from); NAN means "no
+    // accepted depth yet" (boot, or just recovered from a confirmed sensor
+    // outage), which accepts the very next candidate immediately rather
+    // than waiting on a confirmation streak against nothing.
+    // waterLevelStepCandidateCm/waterLevelStepCandidateCount track an
+    // in-progress large-jump confirmation streak; reset to NAN/0 whenever a
+    // candidate does not agree with the pending one.
     float lastAcceptedWaterDepthCm = NAN;
     float waterLevelStepCandidateCm = NAN;
     uint8_t waterLevelStepCandidateCount = 0;
 
-    // Large-jump quarantine fail-safe (Config.h's WATER_LEVEL_JUMP_PLAUSIBLE_
-    // MAX_CM/WATER_LEVEL_JUMP_CONFIRM_COUNT) - see readWaterLevel()'s own
-    // comment. Counts consecutive ACCEPTED-cycle readings whose candidate
-    // has been beyond WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM from the current
-    // trusted depth; a plausible reading (small change OR a large-but-
-    // plausible quarantined jump) resets it to 0. Deliberately a SEPARATE
-    // counter from waterLevelFailureStreak above (that one is for the raw
-    // HC-SR04 read itself failing/timing out) - this one is for a read that
-    // SUCCEEDED but produced a physically-implausible jump, so the two must
-    // never be conflated or reset each other.
+    // Large-jump quarantine fail-safe (Config.h's
+    // WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM/WATER_LEVEL_JUMP_CONFIRM_COUNT) -
+    // see readWaterLevel()'s own comment. Counts consecutive ACCEPTED-cycle
+    // readings whose candidate has been beyond
+    // WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM from the current trusted depth; a
+    // plausible reading (small change OR a large-but-plausible quarantined
+    // jump) resets it to 0. Deliberately a SEPARATE counter from
+    // waterLevelFailureStreak above (that one is for the raw HC-SR04 read
+    // itself failing/timing out) - this one is for a read that SUCCEEDED
+    // but produced a physically-implausible jump, so the two must never be
+    // conflated or reset each other.
     uint8_t waterLevelJumpFaultStreak = 0;
 
     // Refill threshold confirmation - see Types.h's refillStartConfirmed/
@@ -338,7 +393,7 @@ private:
     // real counter itself resets to 0, so "N/3" only prints on a genuine
     // 0->1->2->3 progression - never repeated once already at 3/3 - and a
     // later fresh episode (after the real counter resets) prints its own
-    // fresh 1/3, 2/3, 3/3 sequence again.
+    // fresh sequence again.
     uint8_t refillStartConfirmLoggedCount = 0;
     uint8_t refillStopConfirmLoggedCount = 0;
 
@@ -352,8 +407,8 @@ private:
     // Stage 2 (AlertManager sample-confirmed alerts): increments exactly
     // once per genuinely accepted new HC-SR04 depth - see
     // readWaterLevel()'s two physicalSensors.waterLevelCm write sites
-    // (baseline establishment and the normal accept/hold path - both are
-    // real processed echoes, not just re-publishing an old value). Does NOT
+    // (baseline establishment and the normal accept/hold path - both real
+    // processed echoes, not just re-publishing an old value). Does NOT
     // advance while skipped for the fogger being on, not due yet, a
     // transient failure, a confirmed failure, or while still reacquiring a
     // baseline with nothing accepted yet.
@@ -375,8 +430,8 @@ private:
     // DHT22's normal ~0.1-0.5C/~1-2%RH sample-to-sample noise was being
     // published completely raw, with no filtering at all). NaN means "no
     // filtered value yet"; reset (not blended) on a confirmed-unavailable ->
-    // recovered transition so recovery never blends against a stale
-    // pre-outage value.
+    // recovered transition so recovery never blends against a stale pre-
+    // outage value.
     float dhtTemperatureFiltered = NAN;
     float dhtHumidityFiltered = NAN;
 
@@ -413,14 +468,28 @@ private:
     void updateDynamicMockSensors();
     float boundedMockWalk(float current, float base, float envelope, float maxStep) const;
 
+    // Effective-mock-source consistency fix: prints "[MOCK] Effective
+    // source: <label>" only when the effective source category actually
+    // changes (label is one of "MOCK"/"PHYSICAL"/"INVALID_TEST_HOLD") - see
+    // lastLoggedEffectiveMockSource's own comment. Called from the three
+    // applyEffectiveSensors() branches that decide the effective source,
+    // right alongside each one's existing lastEffectiveSourceWasMock
+    // assignment, so this can never drift from what
+    // isUsingEffectiveMockSensors() actually reports.
+    void logEffectiveSourceTransition(const char* label);
+
 public:
     // Called by FirebaseManager when the authoritative remote setting is read,
     // so the next offline boot starts from the same source. Writes only on an
     // actual change.
     void persistSensorSource(bool mockEnabled);
 
-    // A complete, validated mock payload was parsed during THIS session, so a
-    // boot-restored mock source is confirmed live and stops waiting.
+    // A complete, validated mock payload was parsed. Called on EVERY
+    // successful mock poll while mock stays enabled (not just the first) -
+    // records lastMockPayloadAt unconditionally (M8 fix's freshness
+    // clock), and additionally confirms a boot-restored mock source as
+    // live/stops the one-time boot wait the first time it's called each
+    // session.
     void notifyMockPayloadReceived();
 
     // The cloud explicitly turned mock mode off; any boot wait is moot.
@@ -434,21 +503,39 @@ public:
     // does not itself change what applyEffectiveSensors() publishes.
     bool isMockBootWaiting() const { return mockBootWaitingForPayload; }
 
+    // Effective-mock-source consistency fix (targeted): the single
+    // authoritative answer to "is mock actually the CURRENT effective
+    // sensor source this tick" - true only when
+    // systemState.mockSensorsEnabled AND the payload is fresh AND
+    // applyEffectiveSensors() actually selected mock this tick (see
+    // lastEffectiveSourceWasMock's own comment). Deliberately NOT the same
+    // as systemState.mockSensorsEnabled, which only reflects the
+    // requested/cloud-configured mode and stays true through a stale-mock
+    // fallback to physical - callers that gate an automation bypass (dosing
+    // cooldown, stability requirement, STARTUP readiness, a "reading is
+    // current" check, etc.) on mock must use THIS accessor, not the raw
+    // flag, or physical sensor values can end up running with mock's
+    // bypass privileges after a fallback. Callers that only care about the
+    // requested/configured mode (UI/settings/Firebase reporting) should
+    // keep using systemState.mockSensorsEnabled directly - not a
+    // replacement for that, only for automation-behavior consumers.
+    bool isUsingEffectiveMockSensors() const { return lastEffectiveSourceWasMock; }
+
     // True exactly when the most recent pH/EC stability-window evaluation
-    // passed its tolerance check - see StabilityWindow::currentlyStable's own
-    // comment. AutomationManager gates every NEW pH/EC correction start on
-    // this (not just on sensors.ph/ec being non-NaN), so a retry after
+    // passed its tolerance check - see StabilityWindow::currentlyStable's
+    // own comment. AutomationManager gates every NEW pH/EC correction start
+    // on this (not just on sensors.ph/ec being non-NaN), so a retry after
     // dosing waits for a freshly reconfirmed reading rather than acting on
     // the pre-dose value Firebase/display are still (correctly) showing.
     //
     // pH also requires the temporal step filter above to have NO unconfirmed
     // jump in progress (phStepCandidate is NAN exactly when no confirmation
-    // streak is active) - phStabilityWindow.currentlyStable alone is not
+    // streak is active) - phStabilityWindow.currentlyStable alone isn't
     // enough, since that window only ever sees candidates the step filter
     // has already trusted; while a jump is pending, the window keeps
     // reporting whatever it last decided (unchanged - it received no new
-    // sample), so this composes in the step filter's own pending state
-    // directly so a large unconfirmed jump can never be reported as
+    // sample), so this composes in the step filter's pending state
+    // directly, so a large unconfirmed jump can never be reported as
     // "currently stable enough to dose from".
     bool isPhCurrentlyStable() const { return phStabilityWindow.currentlyStable && isnan(phStepCandidate); }
     bool isEcCurrentlyStable() const { return ecStabilityWindow.currentlyStable; }
@@ -462,7 +549,7 @@ public:
     // SENSOR_READY_MAX_MS). isPhConfirming() is true while a jump is
     // pending (the same phStepCandidate state isPhCurrentlyStable() already
     // reads) - published so Android can show "pH is being confirmed"
-    // instead of silently freezing on the old value with no explanation.
+    // instead of silently freezing on the old value.
     bool hasPhTelemetry() const { return !isnan(lastAcceptedPhCandidate); }
     bool isPhConfirming() const { return !isnan(phStepCandidate); }
 
@@ -471,10 +558,10 @@ public:
     // sensors.ph/ec are intentionally held NaN this whole time (see
     // applyEffectiveSensors()), which for readiness purposes IS a known,
     // explicit "not yet available" state, not an unknown one - so pH/EC
-    // readiness does not have to wait out the full ~20s settle window
-    // before being considered observed, matching every other sensor's
-    // valid-OR-explicitly-unavailable rule (sensorState.ready refinement,
-    // see FirebaseManager::writeSensors()). Once settled, hasPhTelemetry()/
+    // readiness doesn't have to wait out the full ~20s settle window before
+    // being considered observed, matching every other sensor's valid-OR-
+    // explicitly-unavailable rule (sensorState.ready refinement, see
+    // FirebaseManager::writeSensors()). Once settled, hasPhTelemetry()/
     // isEcStateKnown() below take over as the real observed signal.
     bool isPhEcAnalogSettling() const { return millis() - physicalPhEcSettledAt < PH_EC_ANALOG_SETTLE_TIME; }
 
@@ -486,11 +573,11 @@ public:
     // readWaterTemperature()/readWaterLevel() already use to decide
     // dhtAvailable/dhtStale/NaN themselves - not a new, separate fault
     // concept). EC has no distinct failure path in the current firmware
-    // (readEC() always produces a candidate once sampled), so its own
-    // "known" state is simply having a first candidate, or the shared
-    // pH/EC analog settle window above. None of these require a
-    // genuinely failing sensor to become valid before readiness fires -
-    // see FirebaseManager::writeSensors().
+    // (readEC() always produces a candidate once sampled), so its "known"
+    // state is simply having a first candidate, or the shared pH/EC analog
+    // settle window above. None of these require a genuinely failing
+    // sensor to become valid before readiness fires - see
+    // FirebaseManager::writeSensors().
     bool isDhtStateKnown() const;
     bool isWaterTempStateKnown() const;
     bool isWaterLevelStateKnown() const;
@@ -507,8 +594,8 @@ public:
     // gating confirmation on loop() ticks or a fixed interval, so a sensor
     // that fails, holds a stale value, or intentionally skips acquisition
     // (e.g. the HC-SR04 while the fogger is on) can never fake a
-    // confirmation. See each counter's own declaration-site comment above
-    // for exactly where it advances.
+    // confirmation. See each counter's declaration-site comment above for
+    // exactly where it advances.
     uint32_t getPhSampleVersion() const { return phSampleVersion; }
     uint32_t getEcSampleVersion() const { return ecSampleVersion; }
     uint32_t getDhtSampleVersion() const { return dhtSampleVersion; }

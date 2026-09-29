@@ -14,8 +14,8 @@ void HarvestScheduleCache::applySnapshot(const String& newCycleId, int newCycleN
                    (newCycleNumber != cycleNumber) || (newNextHarvestAtEpoch != nextHarvestAtEpoch);
     if (!changed)
     {
-        // Silent by design. This is the steady state of a poll that now runs
-        // every few seconds; only real transitions are worth a line.
+        // Silent by design - the steady state of a poll running every few
+        // seconds; only real transitions are worth a line.
         return;
     }
 

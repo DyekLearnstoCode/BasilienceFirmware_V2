@@ -50,10 +50,9 @@ void AnalogSampler::update()
         samples[sampleIndex] =
             analogRead(pin);
 
-        // Same physical conversion this branch already performs - no extra
-        // ADC transaction needed, just also keep it in rawSamples[] so
-        // rawMedian() works uniformly regardless of mode (see its own
-        // comment in AnalogSampler.h).
+        // Same conversion this branch already performs - just also keep it
+        // in rawSamples[] so rawMedian() works uniformly regardless of mode
+        // (see its own comment in AnalogSampler.h).
         rawSamples[sampleIndex] = samples[sampleIndex];
 
         break;
@@ -63,15 +62,15 @@ void AnalogSampler::update()
         samples[sampleIndex] =
             analogReadMilliVolts(pin);
 
-        // A second, separate ADC conversion from analogReadMilliVolts()'s
-        // own internal one, microseconds apart on the same pin - negligible
-        // for this purpose (rail-fault detection looks for a condition
-        // sustained across many SECONDS of samples, not sub-millisecond
-        // precision), but real: rawSamples[i] and samples[i] are not
-        // guaranteed to be the exact same physical sample instant in this
-        // mode. Avoids reaching into the ESP-IDF calibration internals
-        // (esp_adc_cal_raw_to_voltage()) that analogReadMilliVolts() itself
-        // uses, which would be a larger, riskier change for the same result.
+        // A second, separate ADC conversion from analogReadMilliVolts()'s own
+        // internal one, microseconds apart on the same pin - negligible here
+        // (rail-fault detection looks for a condition sustained across many
+        // SECONDS of samples, not sub-millisecond precision), but real:
+        // rawSamples[i] and samples[i] aren't guaranteed the exact same
+        // physical sample instant in this mode. Avoids reaching into the
+        // ESP-IDF calibration internals (esp_adc_cal_raw_to_voltage()) that
+        // analogReadMilliVolts() itself uses, a larger, riskier change for
+        // the same result.
         rawSamples[sampleIndex] =
             analogRead(pin);
 

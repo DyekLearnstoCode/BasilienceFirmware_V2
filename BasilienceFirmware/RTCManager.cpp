@@ -58,16 +58,15 @@ void RTCManager::begin()
         Serial.println(
             "DS3231 FOUND");
 
-        // One-time boot diagnostic - not repeated in update() (there is no
-        // per-loop RTC logging in this firmware). lostPower() reflects the
-        // DS3231's own oscillator-stop flag: true means the chip has never
-        // been set, or lost backup power since it last was. It proves the
-        // absence of a power-loss condition, not that the retained time is
-        // actually correct - phrased that way deliberately, not as "proof
-        // of a trusted time." A real unit showed lostPower()==false with a
-        // 2000-00-00 calendar, which is why hasPlausibleCalendarTime() is
-        // logged as its own separate line below rather than folded silently
-        // into "valid".
+        // One-time boot diagnostic - not repeated in update() (no per-loop
+        // RTC logging in this firmware). lostPower() reflects the DS3231's
+        // own oscillator-stop flag: true means the chip has never been set,
+        // or lost backup power since. It proves the absence of a power-loss
+        // condition, not that the retained time is correct - phrased that
+        // way deliberately, not as "proof of a trusted time." A real unit
+        // showed lostPower()==false with a 2000-00-00 calendar, which is why
+        // hasPlausibleCalendarTime() is logged as its own line below rather
+        // than folded silently into "valid".
         const bool lostPower = rtc.lostPower();
         Serial.print("[RTC] connected=true lostPower=");
         Serial.println(lostPower ? "true" : "false");
@@ -98,10 +97,10 @@ void RTCManager::begin()
         else if (!lostPower && !calendarPlausible)
         {
             // The specific case this task exists to fix: chip reports no
-            // power-loss condition, but the retained calendar is not
-            // usable. Printed once at boot so it is unambiguous from the
-            // "lostPower==true" invalid case (also possible, logged as
-            // above with no further detail needed).
+            // power-loss condition, but the retained calendar is not usable.
+            // Printed once at boot so it is unambiguous from the
+            // "lostPower==true" invalid case (also possible, logged above
+            // with no further detail needed).
             char localTime[24];
             snprintf(localTime, sizeof(localTime), "%04u-%02u-%02u %02u:%02u:%02u",
                       now.year(), now.month(), now.day(),
@@ -122,9 +121,9 @@ void RTCManager::update()
 {
     // Bounded, backoff-gated NTP recovery. Only ever considered while the
     // RTC is actually invalid - a DS3231 that already has a plausible
-    // retained time is never rewritten here (see the resync-policy
-    // reasoning in the RTC finalization report: invalid-on-boot recovery
-    // only, no periodic drift-correction resync).
+    // retained time is never rewritten here (invalid-on-boot recovery only,
+    // no periodic drift-correction resync - see the RTC finalization
+    // report).
     if (!connected) return;
     if (hasValidTime())
     {
@@ -159,11 +158,11 @@ void RTCManager::update()
 
 // Critical verification report, Priority 2: kicks off SNTP and returns
 // immediately. configTime() itself only starts the SNTP client - it was
-// never the blocking call. Actual completion is polled non-blockingly by
+// never the blocking call. Completion is polled non-blockingly by
 // pollNetworkTimeSync() below, once per update() tick, instead of the
 // previous single call to getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS),
 // which blocked the calling loop() iteration for up to NTP_SYNC_TIMEOUT_MS
-// by looping internally on time()/delay(10) (confirmed directly against the
+// by looping internally on time()/delay(10) (confirmed against the
 // installed ESP32 core's own esp32-hal-time.c implementation).
 void RTCManager::startNetworkTimeSync()
 {
@@ -206,9 +205,9 @@ void RTCManager::pollNetworkTimeSync()
     Serial.println("[RTC] Network time acquired");
 
     // Reject an obviously-wrong value rather than adjusting the DS3231 to
-    // something that could be worse than simply staying invalid - e.g. the
-    // C library's time struct defaulting to an early epoch before SNTP has
-    // genuinely locked on.
+    // something worse than simply staying invalid - e.g. the C library's
+    // time struct defaulting to an early epoch before SNTP has genuinely
+    // locked on.
     const int year = timeinfo.tm_year + 1900;
     if (year < 2025)
     {
@@ -238,9 +237,9 @@ void RTCManager::pollNetworkTimeSync()
 
     // Log the values just written, not a fresh rtc.now() read-back over I2C -
     // a re-read immediately after adjust() can occasionally catch a
-    // transient/garbled register value (observed on real hardware as a
-    // nonsensical printed line, e.g. a minute above 59) even though the
-    // write itself (confirmed by the lostPower() check above) landed fine.
+    // transient/garbled register value (a nonsensical printed line, e.g. a
+    // minute above 59) even though the write itself (confirmed by the
+    // lostPower() check above) landed fine.
     char localTime[20];
     snprintf(localTime, sizeof(localTime), "%04u-%02u-%02u %02u:%02u:%02u",
               (unsigned)year, (unsigned)(timeinfo.tm_mon + 1), (unsigned)timeinfo.tm_mday,
@@ -253,8 +252,8 @@ const char* RTCManager::getSyncSourceName()
 {
     // Always re-derived from hasValidTime() (the single source of truth for
     // both the lostPower and calendar-plausibility checks) rather than
-    // reproducing either check here - so a DS3231 that reports lost power,
-    // or one whose calendar has become implausible, is never reported as
+    // reproducing either check here - so a DS3231 reporting lost power, or
+    // one whose calendar has become implausible, is never reported as
     // "NTP"/"RTC_RETAINED" after the fact.
     if (!hasValidTime()) return "INVALID";
     return syncSource == SyncSource::NTP ? "NTP" : "RTC_RETAINED";
@@ -287,21 +286,20 @@ uint32_t RTCManager::getEpochTime()
     DateTime now = rtc.now();
 
     // CONFIRMED BUG FIX (RTC epoch semantics audit): verified directly
-    // against RTClib.cpp's actual DateTime::unixtime() implementation -
-    // it applies no timezone conversion whatsoever, it just packs the
-    // stored Y/M/D/H/M/S fields as though they were UTC. Since those
-    // fields are this firmware's Asia/Manila LOCAL time (UTC+08:00, no
-    // DST), the raw value is 8 hours AHEAD of the true UTC instant. This
-    // is the single point where that correction is applied - every other
-    // getter in this class deliberately returns the unconverted local
-    // fields, since local-hour consumers (grow-light scheduling) need
-    // exactly those.
+    // against RTClib.cpp's actual DateTime::unixtime() implementation - it
+    // applies no timezone conversion whatsoever, just packs the stored
+    // Y/M/D/H/M/S fields as though they were UTC. Since those fields are
+    // this firmware's Asia/Manila LOCAL time (UTC+08:00, no DST), the raw
+    // value is 8 hours AHEAD of the true UTC instant. This is the single
+    // point where that correction is applied - every other getter in this
+    // class deliberately returns the unconverted local fields, since
+    // local-hour consumers (grow-light scheduling) need exactly those.
     const uint32_t localCalendarEpoch = now.unixtime();
 
     // Guards unsigned underflow. Cannot actually occur in practice - RTClib
     // enforces a year-2000 floor, so unixtime() can never be smaller than
-    // ~31 years worth of seconds, let alone smaller than 8 hours - but
-    // checked explicitly rather than relying on that indirectly.
+    // ~31 years of seconds, let alone smaller than 8 hours - but checked
+    // explicitly rather than relying on that indirectly.
     if (localCalendarEpoch < (uint32_t)TIMEZONE_OFFSET_SECONDS)
     {
         return 0;
