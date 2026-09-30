@@ -452,6 +452,7 @@ private:
     String preflightHosts[PREFLIGHT_HOST_COUNT];
     // Written by the task only, before it signals done.
     int8_t preflightDns[PREFLIGHT_HOST_COUNT];       // 1 ok, 0 failed, -1 not attempted
+    uint32_t preflightDnsMs[PREFLIGHT_HOST_COUNT] = { 0 };
     char preflightDnsIp[PREFLIGHT_HOST_COUNT][40];
     // Real TLS handshakes, no data sent: [0] = the auth host (preflightHosts[0]),
     // [1] = the database host (preflightHosts[2]). The second is only tried
@@ -489,7 +490,11 @@ private:
         const String& path,
         FirebaseJson& json);
 
-    void logFirebaseDuration(const char* operation, unsigned long durationMs) const;
+    void logFirebaseDuration(const char* operation, unsigned long durationMs);
+    void logAuthDiagnostics(const char* reason) const;
+    void logSocketDiagnostics(const char* point);
+    void logAuthDiagnostics(const char* reason) const;
+    void logSocketDiagnostics(const char* point) const;
     bool isSensorUploadDue() const;
     bool shouldDeferOptionalJobsForControlResponse();
     void runOneOptionalFirebaseJob(bool sensorTestMode, bool deferLowPriorityJobs,

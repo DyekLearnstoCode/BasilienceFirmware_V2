@@ -829,6 +829,7 @@ void FirebaseManager::validateCloudSession()
 
     if (answered)
     {
+        logSocketDiagnostics("successful-recovery");
         // The first real success of this recovery: this is where the health
         // streak clears (DEGRADED -> HEALTHY) and the retry backoff resets.
         recordFirebaseResult(true);
@@ -1036,10 +1037,12 @@ bool FirebaseManager::startPreflight()
         preflightHosts[count++] = bootstrapHost;
     }
     preflightHostCount = count;
+    logAuthDiagnostics("preflight");
 
     for (uint8_t i = 0; i < PREFLIGHT_HOST_COUNT; i++)
     {
         preflightDns[i] = -1;
+        preflightDnsMs[i] = 0;
         preflightDnsIp[i][0] = '\0';
     }
     for (uint8_t i = 0; i < PREFLIGHT_TLS_TARGETS; i++)
@@ -1095,6 +1098,7 @@ void FirebaseManager::preflightTaskFn(void* arg)
         for (uint8_t i = 0; i < count; i++) hosts[i] = self->preflightHosts[i];
 
         int8_t dns[PREFLIGHT_HOST_COUNT];
+        uint32_t dnsMs[PREFLIGHT_HOST_COUNT] = { 0 };
         char ips[PREFLIGHT_HOST_COUNT][40];
         for (uint8_t i = 0; i < PREFLIGHT_HOST_COUNT; i++)
         {
@@ -1109,7 +1113,10 @@ void FirebaseManager::preflightTaskFn(void* arg)
         for (uint8_t i = 0; i < count && !dnsFailed; i++)
         {
             IPAddress ip;
-            if (WiFi.hostByName(hosts[i].c_str(), ip) == 1)
+            const unsigned long dnsStartedAt = millis();
+            const int dnsResult = WiFi.hostByName(hosts[i].c_str(), ip);
+            dnsMs[i] = millis() - dnsStartedAt;
+            if (dnsResult == 1)
             {
                 dns[i] = 1;
                 strncpy(ips[i], ip.toString().c_str(), sizeof(ips[i]) - 1);
@@ -1170,6 +1177,7 @@ void FirebaseManager::preflightTaskFn(void* arg)
         for (uint8_t i = 0; i < PREFLIGHT_HOST_COUNT; i++)
         {
             self->preflightDns[i] = dns[i];
+            self->preflightDnsMs[i] = dnsMs[i];
             memcpy(self->preflightDnsIp[i], ips[i], sizeof(ips[i]));
         }
         for (uint8_t t = 0; t < PREFLIGHT_TLS_TARGETS; t++)
@@ -1209,32 +1217,23 @@ bool FirebaseManager::evaluatePreflightResult()
 
     for (uint8_t i = 0; i < preflightHostCount; i++)
     {
-        if (preflightDns[i] == 1)
+        if (verbose)
         {
-            if (verbose)
-            {
-                debugManager.printLogPrefix("NET");
-                Serial.print("DNS ");
-                Serial.print(preflightHosts[i]);
-                Serial.print(" -> ");
-                Serial.println(preflightDnsIp[i]);
-            }
+            debugManager.printLogPrefix("NET-DIAG");
+            Serial.print(" DNS host=");
+            Serial.print(preflightHosts[i]);
+            Serial.print(" result=");
+            if (preflightDns[i] == 1) Serial.print(preflightDnsIp[i]);
+            else if (preflightDns[i] == 0) Serial.print("FAIL");
+            else Serial.print("NOT_RUN");
+            Serial.print(" elapsed=");
+            Serial.print(preflightDnsMs[i]);
+            Serial.println("ms");
         }
-        else if (preflightDns[i] == 0)
+        if (preflightDns[i] == 0 && i < GATING_HOST_COUNT && gatingDnsOk)
         {
-            if (verbose)
-            {
-                debugManager.printLogPrefix("NET");
-                Serial.print("DNS FAILED ");
-                Serial.print(preflightHosts[i]);
-                if (i >= GATING_HOST_COUNT) Serial.print(" (bootstrap endpoint)");
-                Serial.println();
-            }
-            if (i < GATING_HOST_COUNT && gatingDnsOk)
-            {
-                gatingDnsOk = false;
-                failedHost = preflightHosts[i].c_str();
-            }
+            gatingDnsOk = false;
+            failedHost = preflightHosts[i].c_str();
         }
     }
 
@@ -1272,18 +1271,16 @@ bool FirebaseManager::evaluatePreflightResult()
         const bool ok = preflightTls[t] == 1;
         if (verbose)
         {
-            debugManager.printLogPrefix("NET");
-            Serial.print("TLS ");
+            debugManager.printLogPrefix("NET-DIAG");
+            Serial.print(" TLS host=");
             Serial.print(preflightHosts[tlsHostIndex[t]]);
-            Serial.print(ok ? " OK (" : " FAILED (");
+            Serial.print(" result=");
+            Serial.print(ok ? "OK" : "FAIL");
+            Serial.print(" elapsed=");
             Serial.print(preflightTlsMs[t]);
-            Serial.print("ms)");
-            if (!ok)
-            {
-                Serial.print(" err=");
-                Serial.print(preflightTlsError[t]);
-            }
-            Serial.println();
+            Serial.print("ms client_error=");
+            Serial.print(preflightTlsError[t]);
+            Serial.println(" tcp_stage=not_exposed_by_NetworkClientSecure");
         }
         if (!ok && tlsOk)
         {
@@ -4100,6 +4097,18 @@ void FirebaseManager::recordFirebaseResult(bool success)
     }
 
     String reason = fbdo.errorReason();
+    Serial.print("[FIREBASE-DIAG] operation failure path=");
+    Serial.print(fbdo.dataPath());
+    Serial.print(" http_code=");
+    Serial.print(fbdo.httpCode());
+    Serial.print(" error_code=");
+    Serial.print(fbdo.errorCode());
+    Serial.print(" tcp_connected=");
+    Serial.print((unsigned)fbdo.tcpClient.connected());
+    Serial.print(" firebase_error=");
+    Serial.println(reason);
+    logAuthDiagnostics("firebase-operation-failure");
+
     if (!isTransportFailureReason(reason))
     {
         // Application-level failure (permission denied, missing optional
@@ -4108,7 +4117,9 @@ void FirebaseManager::recordFirebaseResult(bool success)
         return;
     }
 
+    const bool firstTransportFailure = transportFailureStreak == 0;
     transportFailureStreak++;
+    if (firstTransportFailure) logSocketDiagnostics("first-failure");
     Serial.print("[FIREBASE-HEALTH] transport failure #");
     Serial.print(transportFailureStreak);
     Serial.print(": ");
@@ -4180,6 +4191,7 @@ void FirebaseManager::beginFirebaseRecovery()
 {
     firebaseHealth = FirebaseHealthState::RECOVERING;
     Serial.println("[FIREBASE-HEALTH] Recovery attempt");
+    logAuthDiagnostics("recovery");
 
     // Close/release the possibly-stuck internal SSL client before
     // re-establishing a session - fbdo.stopWiFiClient() is the verified
@@ -4189,6 +4201,7 @@ void FirebaseManager::beginFirebaseRecovery()
     // losing credentials").
     fbdo.stopWiFiClient();
     fbdo.clear();
+    logSocketDiagnostics("before-retry");
 
     // Same reasoning as FirebaseManager::begin(): WiFiManager, not this
     // library, owns Wi-Fi reconnection - this only permits the library to
@@ -6437,11 +6450,60 @@ bool FirebaseManager::updateJson(
 // readActuatorCommands(), sensor/status/telemetry uploads, etc. - is upgraded
 // without needing to touch each call site individually. Threshold and which
 // operations get timed are unchanged.
+void FirebaseManager::logAuthDiagnostics(const char* reason) const
+{
+    const firebase_auth_token_status status = config.signer.tokens.status;
+    const firebase_auth_token_type type = config.signer.tokens.token_type;
+    const time_t now = time(nullptr);
+    const uint32_t expires = config.signer.tokens.expires;
+    const uint32_t refreshLead = config.signer.preRefreshSeconds;
+    bool refreshDueKnown = type == token_type_legacy_token ||
+                           (type != token_type_undefined &&
+                            (expires == 0 || now > (time_t)FIREBASE_DEFAULT_TS));
+    bool refreshDue = type != token_type_legacy_token &&
+                      type != token_type_undefined && expires == 0;
+    if (type != token_type_legacy_token && expires > 0 &&
+        now > (time_t)FIREBASE_DEFAULT_TS)
+    {
+        const uint32_t boundedLead = refreshLead > expires ? expires : refreshLead;
+        refreshDue = now >= (time_t)(expires - boundedLead);
+    }
+
+    Serial.printf("[AUTH-DIAG] reason=%s deviceCloudReady=%u tokenStatus=%u tokenType=%u refreshDue=",
+                  reason ? reason : "unknown",
+                  systemState.firebaseConnected ? 1U : 0U,
+                  (unsigned)status, (unsigned)type);
+    if (!refreshDueKnown) Serial.print("UNKNOWN");
+    else Serial.print(refreshDue ? "1" : "0");
+    Serial.printf(" refreshActive=%u tokenLastRequestAgeMs=%lu\n",
+                  status == token_status_on_refresh ? 1U : 0U,
+                  (unsigned long)(millis() - config.signer.tokens.last_millis));
+}
+
+void FirebaseManager::logSocketDiagnostics(const char* point)
+{
+    Serial.printf("[SOCKET-DIAG] point=%s tcp_connected=%u\n",
+                  point ? point : "unknown",
+                  (unsigned)fbdo.tcpClient.connected());
+}
+
 void FirebaseManager::logFirebaseDuration(
     const char* operation,
-    unsigned long durationMs) const
+    unsigned long durationMs)
 {
     debugManager.logFirebaseDuration(operation, durationMs);
+    if (durationMs < 2000UL || !debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+        return;
+
+    logAuthDiagnostics("slow-operation");
+    const int httpCode = fbdo.httpCode();
+    const int errorCode = fbdo.errorCode();
+    const bool completed = errorCode == 0 && httpCode >= 200 && httpCode < 300;
+    Serial.printf("[FIREBASE-DIAG] slow operation=%s elapsed=%lums result=%s http_code=%d error=%d tcp_connected=%u available=not_sampled connection_origin=UNKNOWN token_status=%u token_type=%u refresh_active_at_end=%u refresh_completed_during=UNKNOWN\n",
+                  operation, durationMs, completed ? "OK" : "CHECK",
+                  httpCode, errorCode, (unsigned)fbdo.tcpClient.connected(),
+                  (unsigned)config.signer.tokens.status, (unsigned)config.signer.tokens.token_type,
+                  config.signer.tokens.status == token_status_on_refresh ? 1U : 0U);
 }
 
 void FirebaseManager::loadDeviceId()
