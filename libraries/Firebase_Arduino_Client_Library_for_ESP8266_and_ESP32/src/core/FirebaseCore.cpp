@@ -1645,6 +1645,33 @@ bool FirebaseCore::reconnect(Firebase_TCP_Client *client, firebase_session_info_
         {
             if (session)
             {
+                const unsigned long elapsedMs = millis() - dataTime;
+                const firebase_auth_token_status tokenStatus = config
+                    ? config->signer.tokens.status : token_status_uninitialized;
+                const firebase_auth_token_type tokenType = config
+                    ? config->signer.tokens.token_type : token_type_undefined;
+                const uint32_t tokenExpires = config ? config->signer.tokens.expires : 0;
+                const uint32_t refreshLead = config ? config->signer.preRefreshSeconds : 0;
+                const time_t now = time(nullptr);
+                const bool refreshDueKnown = tokenType == token_type_legacy_token ||
+                    (tokenType != token_type_undefined &&
+                     (tokenExpires == 0 || now > (time_t)FIREBASE_DEFAULT_TS));
+                bool refreshDue = tokenType != token_type_legacy_token &&
+                                  tokenType != token_type_undefined && tokenExpires == 0;
+                if (tokenType != token_type_legacy_token && tokenExpires > 0 &&
+                    now > (time_t)FIREBASE_DEFAULT_TS)
+                {
+                    const uint32_t boundedLead = refreshLead > tokenExpires ? tokenExpires : refreshLead;
+                    refreshDue = now >= (time_t)(tokenExpires - boundedLead);
+                }
+                Serial.printf("[FIREBASE-DIAG] response timeout path=%s elapsed=%lums http_code=%d firebase_error=%d:response_payload_read_timed_out tcp_connected=%u token_status=%u token_type=%u token_expired_due=%s refresh_active=%u token_last_request_age_ms=%lu available=not_sampled\n",
+                              session->rtdb.path.c_str(), elapsedMs, session->http_code,
+                              FIREBASE_ERROR_TCP_RESPONSE_PAYLOAD_READ_TIMED_OUT,
+                              client->connected() ? 1U : 0U,
+                              (unsigned)tokenStatus, (unsigned)tokenType,
+                              refreshDueKnown ? (refreshDue ? "1" : "0") : "UNKNOWN",
+                              tokenStatus == token_status_on_refresh ? 1U : 0U,
+                              (unsigned long)(millis() - (config ? config->signer.tokens.last_millis : 0)));
                 session->response.code = FIREBASE_ERROR_TCP_RESPONSE_PAYLOAD_READ_TIMED_OUT;
                 errorToString(session->response.code, session->error);
                 closeSession(client, session);

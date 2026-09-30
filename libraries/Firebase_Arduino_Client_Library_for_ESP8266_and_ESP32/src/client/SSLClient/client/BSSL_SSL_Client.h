@@ -313,6 +313,8 @@ private:
     int _debug_level = 0;
 
     bool _is_connected = false;
+    uint32_t _lastTcpConnectMs = 0;
+    bool _lastTcpConnectWasNew = false;
 
     //  store the index of where we are writing in the buffer
     //  so we can send our records all at once to prevent

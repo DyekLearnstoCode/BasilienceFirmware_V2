@@ -680,7 +680,7 @@ constexpr float TARGET_MIN_AIR_TEMP = 20.0f;
 constexpr float TARGET_MAX_AIR_TEMP = 32.0f;
 
 constexpr float TARGET_MIN_HUMIDITY = 60.0f;
-constexpr float TARGET_MAX_HUMIDITY = 75.0f;
+constexpr float TARGET_MAX_HUMIDITY = 80.0f;
 
 constexpr float TARGET_MIN_WATER_TEMP = 18.0f;
 constexpr float TARGET_MAX_WATER_TEMP = 28.0f;
@@ -709,8 +709,8 @@ constexpr float TARGET_MAX_WATER_LEVEL = 25.0f;
 
 constexpr float HIGH_AIR_TEMP = 32.0f;
 constexpr float AIR_TEMP_RELEASE = 26.0f;
-constexpr float HIGH_HUMIDITY = 75.0f;
-constexpr float HUMIDITY_RELEASE = 70.0f;
+constexpr float HIGH_HUMIDITY = 80.0f;
+constexpr float HUMIDITY_RELEASE = 75.0f;
 
 // Canopy Fan's own cold-side control pair, symmetric with
 // HIGH_AIR_TEMP/AIR_TEMP_RELEASE above: demand engages below LOW_AIR_TEMP

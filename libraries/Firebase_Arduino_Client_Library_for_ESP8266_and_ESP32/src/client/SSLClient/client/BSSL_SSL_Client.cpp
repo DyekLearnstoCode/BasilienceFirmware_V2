@@ -462,8 +462,22 @@ int BSSL_SSL_Client::connectSSL(IPAddress ip, uint16_t port)
     if (!mIsClientInitialized(true))
         return 0;
 
-    if (!_basic_client->connected() && !mConnectBasicClient(nullptr, ip, port))
-        return 0;
+    const bool tcpWasAlreadyConnected = _basic_client->connected();
+    _lastTcpConnectWasNew = !tcpWasAlreadyConnected;
+    _lastTcpConnectMs = 0;
+    if (!tcpWasAlreadyConnected)
+    {
+        const unsigned long tcpStartedAt = millis();
+        if (!mConnectBasicClient(nullptr, ip, port))
+        {
+            _lastTcpConnectMs = millis() - tcpStartedAt;
+            const String host = ip.toString();
+            Serial.printf("[NET-DIAG] TCP host=%s port=%u result=FAIL elapsed=%lums socket_errno=NA client_error=%d\n",
+                          host.c_str(), (unsigned)port, (unsigned long)_lastTcpConnectMs, getWriteError());
+            return 0;
+        }
+        _lastTcpConnectMs = millis() - tcpStartedAt;
+    }
 
     _ip = ip;
     _port = port;
@@ -478,8 +492,21 @@ int BSSL_SSL_Client::connectSSL(const char *host, uint16_t port)
     if (!mIsClientInitialized(true))
         return 0;
 
-    if (!_basic_client->connected() && !mConnectBasicClient(host, IPAddress(), port))
-        return 0;
+    const bool tcpWasAlreadyConnected = _basic_client->connected();
+    _lastTcpConnectWasNew = !tcpWasAlreadyConnected;
+    _lastTcpConnectMs = 0;
+    if (!tcpWasAlreadyConnected)
+    {
+        const unsigned long tcpStartedAt = millis();
+        if (!mConnectBasicClient(host, IPAddress(), port))
+        {
+            _lastTcpConnectMs = millis() - tcpStartedAt;
+            Serial.printf("[NET-DIAG] TCP host=%s port=%u result=FAIL elapsed=%lums socket_errno=NA client_error=%d\n",
+                          host ? host : "unknown", (unsigned)port, (unsigned long)_lastTcpConnectMs, getWriteError());
+            return 0;
+        }
+        _lastTcpConnectMs = millis() - tcpStartedAt;
+    }
 
     _host = host;
     _port = port;
@@ -1590,8 +1617,21 @@ int BSSL_SSL_Client::mConnectSSL(const char *host)
     esp_ssl_debug_print(PSTR("Wait for SSL handshake."), _debug_level, esp_ssl_debug_info, __func__);
 #endif
 
+    const unsigned long tlsStartedAt = millis();
     if (mRunUntil(BR_SSL_SENDAPP, _handshake_timeout) < 0)
     {
+        const unsigned long tlsElapsed = millis() - tlsStartedAt;
+        const String tlsHost = host ? String(host) : (_connect_with_ip ? _ip.toString() : _host);
+        Serial.printf("[NET-DIAG] TCP host=%s port=%u result=OK elapsed=%lums reused=%u\n",
+                      tlsHost.c_str(), (unsigned)_port, (unsigned long)_lastTcpConnectMs,
+                      _lastTcpConnectWasNew ? 0U : 1U);
+        Serial.printf("[TLS-DIAG] handshake result=FAIL host=%s elapsed=%lums bearssl=%d state=0x%08lx tcp_connected=%u available=%d socket_errno=NA client_error=%d\n",
+                      tlsHost.c_str(), tlsElapsed,
+                      _eng ? br_ssl_engine_last_error(_eng) : 0,
+                      (unsigned long)(_eng ? br_ssl_engine_current_state(_eng) : 0),
+                      _basic_client ? (unsigned)_basic_client->connected() : 0U,
+                      _basic_client ? _basic_client->available() : -1,
+                      getWriteError());
 #if defined(ESP_SSLCLIENT_ENABLE_DEBUG)
         esp_ssl_debug_print(PSTR("Failed to initlalize the SSL layer."), _debug_level, esp_ssl_debug_error, __func__);
         mPrintSSLError(br_ssl_engine_last_error(_eng), esp_ssl_debug_error, __func__);
@@ -1613,6 +1653,9 @@ int BSSL_SSL_Client::mConnectSSL(const char *host)
 #endif
             _basic_client->stop();
         }
+        Serial.printf("[SOCKET-DIAG] point=after_tls_cleanup tcp_connected=%u available=%d\n",
+                      _basic_client ? (unsigned)_basic_client->connected() : 0U,
+                      _basic_client ? _basic_client->available() : -1);
 
         mFreeSSL();
         return 0;

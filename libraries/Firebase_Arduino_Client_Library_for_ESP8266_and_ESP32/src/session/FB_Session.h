@@ -750,6 +750,8 @@ public:
   bool isKeepAlive();
 
   Firebase_TCP_Client tcpClient;
+  // Diagnostic snapshot set by FB_RTDB::rescon() for the most recent request.
+  bool lastRequestReusedConnection = false;
 
 #if defined(FIREBASE_ESP32_CLIENT) || defined(FIREBASE_ESP8266_CLIENT)
 #if defined(ENABLE_FCM) || defined(FIREBASE_ENABLE_FCM)

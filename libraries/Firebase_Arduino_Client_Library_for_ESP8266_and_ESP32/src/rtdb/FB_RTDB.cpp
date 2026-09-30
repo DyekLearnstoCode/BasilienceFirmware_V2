@@ -1621,6 +1621,10 @@ void FB_RTDB::rescon(FirebaseData *fbdo, const char *host, firebase_rtdb_request
         fbdo->setSecure();
     }
 
+    // Snapshot whether this request will ride an already-connected session;
+    // no request is logged here, so ordinary successful traffic stays quiet.
+    fbdo->lastRequestReusedConnection = fbdo->tcpClient.connected();
+
     fbdo->session.host = host;
     fbdo->session.con_mode = req->method == rtdb_stream ? firebase_con_mode_rtdb_stream : firebase_con_mode_rtdb;
 
