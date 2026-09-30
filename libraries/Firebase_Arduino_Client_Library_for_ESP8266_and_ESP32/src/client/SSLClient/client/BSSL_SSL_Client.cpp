@@ -1596,6 +1596,24 @@ int BSSL_SSL_Client::mConnectSSL(const char *host)
         esp_ssl_debug_print(PSTR("Failed to initlalize the SSL layer."), _debug_level, esp_ssl_debug_error, __func__);
         mPrintSSLError(br_ssl_engine_last_error(_eng), esp_ssl_debug_error, __func__);
 #endif
+        // mFreeSSL() below only clears SSL/BearSSL state (and leaves _secure
+        // false) - it does not touch the underlying TCP socket. stop() can't
+        // clean this up after the fact either, since it opens with
+        // `if (!_secure) return;`. Left alone, a failed handshake can leave
+        // _basic_client still connected() at the TCP level while _secure is
+        // false, and the connected()-check elsewhere in this class can then
+        // treat that stale TCP socket as good enough to skip establishing a
+        // fresh TLS connection on the next attempt. Explicitly stopping the
+        // TCP socket here, before freeing SSL state, guarantees the next
+        // connect() call starts a genuinely fresh TCP+TLS connection.
+        if (_basic_client)
+        {
+#if defined(ESP_SSLCLIENT_ENABLE_DEBUG)
+            esp_ssl_debug_print(PSTR("Closing stale TCP socket after failed TLS handshake."), _debug_level, esp_ssl_debug_error, __func__);
+#endif
+            _basic_client->stop();
+        }
+
         mFreeSSL();
         return 0;
     }
