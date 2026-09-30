@@ -493,8 +493,6 @@ private:
     void logFirebaseDuration(const char* operation, unsigned long durationMs);
     void logAuthDiagnostics(const char* reason) const;
     void logSocketDiagnostics(const char* point);
-    void logAuthDiagnostics(const char* reason) const;
-    void logSocketDiagnostics(const char* point) const;
     bool isSensorUploadDue() const;
     bool shouldDeferOptionalJobsForControlResponse();
     void runOneOptionalFirebaseJob(bool sensorTestMode, bool deferLowPriorityJobs,

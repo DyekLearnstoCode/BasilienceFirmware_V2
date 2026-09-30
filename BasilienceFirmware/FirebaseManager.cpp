@@ -6499,9 +6499,10 @@ void FirebaseManager::logFirebaseDuration(
     const int httpCode = fbdo.httpCode();
     const int errorCode = fbdo.errorCode();
     const bool completed = errorCode == 0 && httpCode >= 200 && httpCode < 300;
-    Serial.printf("[FIREBASE-DIAG] slow operation=%s elapsed=%lums result=%s http_code=%d error=%d tcp_connected=%u available=not_sampled connection_origin=UNKNOWN token_status=%u token_type=%u refresh_active_at_end=%u refresh_completed_during=UNKNOWN\n",
+    Serial.printf("[FIREBASE-DIAG] slow operation=%s elapsed=%lums result=%s http_code=%d error=%d tcp_connected=%u available=not_sampled connection_origin=%s token_status=%u token_type=%u refresh_active_at_end=%u refresh_completed_during=UNKNOWN\n",
                   operation, durationMs, completed ? "OK" : "CHECK",
                   httpCode, errorCode, (unsigned)fbdo.tcpClient.connected(),
+                  fbdo.lastRequestReusedConnection ? "reused" : "new",
                   (unsigned)config.signer.tokens.status, (unsigned)config.signer.tokens.token_type,
                   config.signer.tokens.status == token_status_on_refresh ? 1U : 0U);
 }
