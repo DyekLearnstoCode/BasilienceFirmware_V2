@@ -5,6 +5,7 @@
 #include <NetworkClientSecure.h>
 #include <esp_mac.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <time.h>
 
 namespace
@@ -282,6 +283,184 @@ bool floatValuesDiffer(float left, float right)
         return !(isnan(left) && isnan(right));
 
     return fabsf(left - right) > 0.001f;
+}
+
+//==================================================
+// [DNS-PROBE] diagnostic-only raw DNS comparison
+//==================================================
+// Diagnostic task: distinguish an ESP32/lwIP resolver-state problem, a
+// hotspot/router DNS-forwarder problem, and a broader upstream path
+// problem for a Firebase hostname whose NORMAL resolution
+// (WiFi.hostByName(), FirebaseManager::preflightTaskFn below) has already
+// failed. Fires ONLY after that normal lookup has already failed - never
+// on a successful lookup. NEVER used as a fallback resolver: the parsed
+// answer is only ever printed, never written back into preflightTaskFn's
+// IPAddress/hosts[]/preflightDnsIp[], and never influences preflight
+// pass/fail, Firebase retry/backoff, or anything recovery-related. Never
+// touches WiFi.config()/dns_setserver()/the lwIP resolver cache - this
+// sends its own raw UDP packet with the standard, public WiFiUDP API, the
+// same one any sketch can use, nothing lwIP-internal or private. Runs on
+// preflightTaskFn's own background FreeRTOS task, never the main loop
+// task, and each server probe is bounded to DNS_PROBE_TIMEOUT_MS so it
+// cannot meaningfully extend that task's runtime.
+constexpr unsigned long DNS_PROBE_TIMEOUT_MS = 700UL;
+
+void logDnsProbeNetworkState()
+{
+    Serial.print("[DNS-PROBE] state wifi_status=");
+    Serial.print((int)WiFi.status());
+    Serial.print(" ip=");
+    Serial.print(WiFi.localIP());
+    Serial.print(" gateway=");
+    Serial.print(WiFi.gatewayIP());
+    Serial.print(" dns0=");
+    Serial.print(WiFi.dnsIP(0));
+    Serial.print(" dns1=");
+    Serial.print(WiFi.dnsIP(1));
+    Serial.print(" rssi=");
+    Serial.print(WiFi.RSSI());
+    Serial.print(" freeHeap=");
+    Serial.println(ESP.getFreeHeap());
+}
+
+// Sends one minimal DNS A-record query directly to `server`, polls for a
+// reply matching this probe's own transaction ID (so a stray/late packet
+// on the same ephemeral port - e.g. a slow answer from an earlier probe -
+// can never be mistaken for this one's result) for up to
+// DNS_PROBE_TIMEOUT_MS, then logs exactly one [DNS-PROBE] line covering
+// every exit path (build/send failure, timeout, or a real response) so the
+// three failure classes above stay distinguishable from the log alone.
+void runRawDnsProbe(const char* hostname, IPAddress server, const char* serverLabel)
+{
+    const unsigned long startedAt = millis();
+
+    auto logResult = [&](const char* result, int rcode, int answers)
+    {
+        Serial.print("[DNS-PROBE] host=");
+        Serial.print(hostname);
+        Serial.print(" server=");
+        Serial.print(serverLabel);
+        Serial.print(":");
+        Serial.print(server);
+        Serial.print(" result=");
+        Serial.print(result);
+        if (rcode >= 0)
+        {
+            Serial.print(" rcode=");
+            Serial.print(rcode);
+        }
+        if (answers >= 0)
+        {
+            Serial.print(" answers=");
+            Serial.print(answers);
+        }
+        Serial.print(" elapsed=");
+        Serial.print(millis() - startedAt);
+        Serial.println("ms");
+    };
+
+    WiFiUDP udp;
+    if (!udp.begin(0))
+    {
+        logResult("SEND_FAILED", -1, -1);
+        return;
+    }
+
+    // Minimal DNS query: 12-byte header + QNAME (length-prefixed labels,
+    // zero-terminated) + QTYPE(A)/QCLASS(IN). hostname is always one of
+    // this firmware's own fixed Firebase hostnames (never user- or
+    // network-supplied input), so this fixed-size buffer is always large
+    // enough - qnameOk below is a defensive bound check, not expected to
+    // ever actually trip.
+    uint8_t packet[96];
+    size_t len = 0;
+
+    const uint16_t txId = (uint16_t)micros();
+    packet[len++] = (uint8_t)(txId >> 8);
+    packet[len++] = (uint8_t)(txId & 0xFF);
+    packet[len++] = 0x01; // flags hi byte: RD=1 (recursion desired)
+    packet[len++] = 0x00; // flags lo byte
+    packet[len++] = 0x00; packet[len++] = 0x01; // QDCOUNT = 1
+    packet[len++] = 0x00; packet[len++] = 0x00; // ANCOUNT = 0
+    packet[len++] = 0x00; packet[len++] = 0x00; // NSCOUNT = 0
+    packet[len++] = 0x00; packet[len++] = 0x00; // ARCOUNT = 0
+
+    const char* label = hostname;
+    bool qnameOk = true;
+    while (*label)
+    {
+        const char* dot = strchr(label, '.');
+        const size_t labelLen = dot ? (size_t)(dot - label) : strlen(label);
+        if (labelLen == 0 || labelLen > 63 || len + labelLen + 1 >= sizeof(packet) - 5)
+        {
+            qnameOk = false;
+            break;
+        }
+        packet[len++] = (uint8_t)labelLen;
+        memcpy(&packet[len], label, labelLen);
+        len += labelLen;
+        label += labelLen;
+        if (*label == '.') label++;
+    }
+
+    if (!qnameOk)
+    {
+        udp.stop();
+        logResult("BUILD_FAILED", -1, -1);
+        return;
+    }
+
+    packet[len++] = 0x00;                        // root label
+    packet[len++] = 0x00; packet[len++] = 0x01;  // QTYPE = A
+    packet[len++] = 0x00; packet[len++] = 0x01;  // QCLASS = IN
+
+    const bool sent = udp.beginPacket(server, 53) &&
+        (udp.write(packet, len) == len) &&
+        udp.endPacket();
+
+    if (!sent)
+    {
+        udp.stop();
+        logResult("SEND_FAILED", -1, -1);
+        return;
+    }
+
+    while (millis() - startedAt < DNS_PROBE_TIMEOUT_MS)
+    {
+        const int packetSize = udp.parsePacket();
+        if (packetSize >= 12)
+        {
+            uint8_t resp[12];
+            udp.read(resp, sizeof(resp));
+            const uint16_t respId = (uint16_t)((resp[0] << 8) | resp[1]);
+            if (respId == txId)
+            {
+                const int rcode = resp[3] & 0x0F;
+                const int answers = (resp[6] << 8) | resp[7];
+                udp.stop();
+                logResult("RESPONSE", rcode, answers);
+                return;
+            }
+            // Reply for a different transaction (e.g. a late answer to an
+            // earlier probe on this same ephemeral port) - discard, keep
+            // waiting within the remaining budget.
+        }
+        delay(5);
+    }
+
+    udp.stop();
+    logResult("TIMEOUT", -1, -1);
+}
+
+// Runs the configured-server and public-8.8.8.8 probes back to back for one
+// failed hostname, with the network-state snapshot the diagnostic
+// requirement asks for printed once ahead of both. Total added time is
+// bounded by roughly 2 * DNS_PROBE_TIMEOUT_MS.
+void runDnsProbeComparison(const char* hostname)
+{
+    logDnsProbeNetworkState();
+    runRawDnsProbe(hostname, WiFi.dnsIP(0), "configured");
+    runRawDnsProbe(hostname, IPAddress(8, 8, 8, 8), "public");
 }
 
 } // namespace
@@ -1082,7 +1261,14 @@ bool FirebaseManager::startPreflight()
 // Runs entirely off the main loop task. Touches only its own locals and the
 // preflight* result fields, and writes those once, right before signalling.
 // Never calls into the Firebase library and never prints (all [NET] output
-// comes from evaluatePreflightResult() on the main task, in order).
+// comes from evaluatePreflightResult() on the main task, in order) - WITH
+// ONE DELIBERATE, NARROW EXCEPTION: runDnsProbeComparison()'s [DNS-PROBE]
+// lines, which print directly from here, only in the already-rare/
+// already-degraded DNS-failure branch below. Kept as a direct print rather
+// than threaded through preflight* fields like everything else, to keep
+// this diagnostic-only addition small; the possible cost is that a
+// [DNS-PROBE] line could interleave with output from another task, never a
+// correctness issue for preflight's own pass/fail result.
 void FirebaseManager::preflightTaskFn(void* arg)
 {
     FirebaseManager* self = static_cast<FirebaseManager*>(arg);
@@ -1126,6 +1312,13 @@ void FirebaseManager::preflightTaskFn(void* arg)
             {
                 dns[i] = 0;
                 dnsFailed = true;
+
+                // Diagnostic-only, see runDnsProbeComparison()'s own
+                // comment above: fires ONLY here, right after the normal
+                // lookup for THIS host has already failed, never on a
+                // successful lookup, and never changes dns[i]/ips[i]/
+                // anything this function returns.
+                runDnsProbeComparison(hosts[i].c_str());
             }
         }
 
