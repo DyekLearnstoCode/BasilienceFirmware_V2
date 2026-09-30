@@ -1,0 +1,734 @@
+#include "NotificationManager.h"
+#include "Globals.h"
+#include "GsmManager.h"
+
+void NotificationManager::begin()
+{
+    loadQueue();
+
+    preferences.begin(NVS_NAMESPACE, true);
+    String stored = preferences.getString(NVS_HARVEST_KEY, "");
+    preferences.end();
+    strncpy(lastFiredHarvestEventId, stored.c_str(), sizeof(lastFiredHarvestEventId) - 1);
+
+    uint8_t inUseCount = 0;
+    for (uint8_t i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        if (queue[i].inUse) inUseCount++;
+    }
+    Serial.print("[NOTIFY] Queue loaded from NVS: ");
+    Serial.print(inUseCount);
+    Serial.println(" pending event(s)");
+}
+
+void NotificationManager::update()
+{
+    observeAlertTransitions();
+    observeConnectivity();
+    observeHarvestSchedule();
+    observeProvisioningMode();
+    updateSmsFanOut();
+    reapSettledSlots();
+}
+
+// A slot that was only ever needed for SMS fan-out (queuedForCloud=false -
+// either because Firestore already owns its history directly while online,
+// per observeAlertTransitions()'s own comment, or because it's one of the
+// two types that are unconditionally SMS-only) previously had no code path
+// that ever freed it once SMS finished, `inUse` is set exactly once, at
+// enqueue, and nothing but markCloudReplayAcked() (which only ever runs for
+// queuedForCloud=true entries) ever clears it. In practice every alert-
+// worthy event permanently consumed one of the 20 total slots for the life
+// of the device, confirmed by the captured boot log where the NVS-persisted
+// queue reached 20/20 and started silently dropping new events ("no low-
+// priority event to evict"). Cloud-queued entries are deliberately left
+// untouched here - markCloudReplayAcked() already owns freeing those, and
+// touching cloudReplayInFlightEventId bookkeeping from a second place would
+// risk racing FirebaseManager's job cursor.
+void NotificationManager::reapSettledSlots()
+{
+    bool freedAny = false;
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        NotificationEvent& event = queue[i];
+        if (!event.inUse || event.queuedForCloud) continue;
+
+        bool smsSettled = !event.smsEligible ||
+            event.smsStatus == SmsDeliveryStatus::DELIVERED ||
+            event.smsStatus == SmsDeliveryStatus::PARTIAL ||
+            event.smsStatus == SmsDeliveryStatus::FAILED;
+        if (!smsSettled) continue;
+
+        event = NotificationEvent();
+        freedAny = true;
+    }
+    if (freedAny) persistQueue();
+}
+
+// --------------------------------------------------------------------
+// Observation (read-only against AlertManager/SystemState/caches - never
+// modifies any of them; mirrors FirebaseManager's own lastPublishedAlerts
+// diff pattern already proven in this codebase).
+// --------------------------------------------------------------------
+
+void NotificationManager::observeAlertTransitions()
+{
+    if (!alertBaselineCaptured)
+    {
+        // Do not fire events for whatever state alerts already happen to be
+        // in at boot - only genuinely NEW transitions after this baseline.
+        lastObservedAlerts = alertState;
+        alertBaselineCaptured = true;
+        return;
+    }
+
+    // SMS is a fallback channel, not a second copy of the app notification:
+    // while online, /alerts already reaches Firestore directly via
+    // onAlertUpdated (immediate FCM + popup + history) the instant
+    // writeAlerts() publishes the same transition, so neither an SMS nor a
+    // cloud-replay queue entry is needed for these four types while the
+    // cloud is reachable. queueOfflineAlertFallback() below re-evaluates
+    // that same "is the cloud currently reachable" condition on every tick
+    // (not just the alert's own rising edge), so an alert that first became
+    // active WHILE ONLINE - and therefore never queued an SMS - still gets
+    // exactly one fallback SMS the moment connectivity is later lost, without
+    // ever sending a second one for the same continuously-active incident.
+    queueOfflineAlertFallback(NotificationEventType::LOW_WATER, NotificationSeverity::SEV_HIGH,
+        "Low Reservoir", "Water level dropped below the refill threshold.",
+        alertState.lowWater, lowWaterIncidentSmsSent);
+
+    queueOfflineAlertFallback(NotificationEventType::HIGH_WATER_TEMP, NotificationSeverity::SEV_HIGH,
+        "High Water Temperature", "Water temperature exceeded the configured limit.",
+        alertState.waterTempOutOfRange, waterTempIncidentSmsSent);
+
+    queueOfflineAlertFallback(NotificationEventType::HIGH_AIR_TEMP, NotificationSeverity::SEV_HIGH,
+        "High Air Temperature", "Air temperature exceeded the configured limit.",
+        alertState.highTemperature, airTempIncidentSmsSent);
+
+    queueOfflineAlertFallback(NotificationEventType::SENSOR_FAULT, NotificationSeverity::SEV_CRITICAL,
+        "Sensor Fault", "One or more sensors are reporting invalid readings.",
+        alertState.sensorFault, sensorFaultIncidentSmsSent);
+
+    lastObservedAlerts = alertState;
+}
+
+// See the header's own comment on lowWaterIncidentSmsSent et al. `active` is
+// this tick's current alert value, not an edge - the incident flag itself is
+// what makes this fire at most once per continuous active streak, whether
+// the alert became active while already offline (the previous rising-edge-
+// only behavior) or was already active online and the cloud dropped later
+// (the new fallback behavior). Recovery (`!active`) always rearms the flag
+// regardless of connectivity, so a later true->false->true is a new,
+// SMS-eligible incident.
+void NotificationManager::queueOfflineAlertFallback(NotificationEventType type, NotificationSeverity severity,
+                                                     const char* title, const char* message,
+                                                     bool active, bool& incidentSmsSent)
+{
+    if (!active)
+    {
+        incidentSmsSent = false;
+        return;
+    }
+
+    if (incidentSmsSent) return;
+
+    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+    if (cloudUp) return;
+
+    if (!alertNotificationAllowed(type)) return;
+
+    Serial.print("[SMS-FALLBACK] ");
+    Serial.print(notificationEventTypeName(type));
+    Serial.println(" incident requires SMS fallback");
+
+    enqueueEvent(type, severity, title, message, String(millis()), true, true);
+    incidentSmsSent = true;
+}
+
+// Admin-requested pipeline test - see the header's own comment. Deliberately
+// does not touch AlertManager/SafetyManager/automation and starts no state
+// machine; it only builds one event and hands it to the SAME enqueueEvent()
+// every real alert uses, so delivery goes through the identical durable
+// queue / recipient fan-out / GsmManager path.
+void NotificationManager::requestTestSms()
+{
+    const bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+
+    Serial.println("[SMS-TEST] Test SMS requested");
+    Serial.print("[SMS-TEST] Device status: ");
+    Serial.println(cloudUp ? "ONLINE" : "OFFLINE");
+    Serial.print("[SMS-TEST] Cached recipients: ");
+    Serial.println(smsRecipientCache.recipientCount());
+
+    const char* message = cloudUp
+        ? "The Basilience device is ONLINE. This is a test of the SMS notification system."
+        : "The Basilience device is OFFLINE. This is a test of the SMS notification system.";
+
+    // queuedForCloud=false: a manual pipeline test has no matching Firestore
+    // history contract (unlike the four real alert types above) - SMS-only,
+    // same treatment as DEVICE_UNREACHABLE/PROVISIONING_MODE/HARVEST_DUE.
+    enqueueEvent(NotificationEventType::TEST_SMS, NotificationSeverity::SEV_LOW,
+                 "Test SMS", message, String(millis()), true, false);
+}
+
+bool NotificationManager::alertNotificationAllowed(NotificationEventType type) const
+{
+    // Critical/global faults are never isolated away.
+    if(type == NotificationEventType::SENSOR_FAULT ||
+       type == NotificationEventType::DEVICE_UNREACHABLE)
+    {
+        return true;
+    }
+
+    const AutomationTestSubsystem selected = systemState.automationTestSubsystem;
+    if(type == NotificationEventType::LOW_WATER &&
+       systemState.ignoreWaterLevelAutomation)
+    {
+        return false;
+    }
+    if(selected == AutomationTestSubsystem::NONE) return true;
+
+    switch(type)
+    {
+        case NotificationEventType::LOW_WATER:
+            // The deliberate water bypass must neither notify nor enqueue a
+            // repeated LOW_WATER fallback episode while the flag is active.
+            return selected == AutomationTestSubsystem::REFILL ||
+                selected == AutomationTestSubsystem::STARTUP ||
+                selected == AutomationTestSubsystem::FOGGING;
+        case NotificationEventType::HIGH_WATER_TEMP:
+            return selected == AutomationTestSubsystem::COOLING;
+        case NotificationEventType::HIGH_AIR_TEMP:
+            return selected == AutomationTestSubsystem::CANOPY ||
+                selected == AutomationTestSubsystem::FOGGING;
+        default:
+            return false;
+    }
+}
+
+void NotificationManager::observeConnectivity()
+{
+    bool cloudUp = systemState.wifiConnected && systemState.firebaseConnected;
+
+    if (!cloudUp)
+    {
+        if (!cloudWasDown)
+        {
+            cloudDownSinceMillis = millis();
+            cloudWasDown = true;
+        }
+        else if (!deviceUnreachableEpisodeActive &&
+                 millis() - cloudDownSinceMillis >= OFFLINE_EPISODE_THRESHOLD_MS &&
+                 !wifiManager.isProvisioningMode())
+        {
+            // WiFiManager falls back to its own setup AP after just 20s of
+            // failed reconnection (RECOVERY_TIMEOUT) - well before this 2-
+            // minute threshold - so by the time this would fire, a FALLBACK
+            // episode below has essentially always already sent the more
+            // specific/actionable PROVISIONING_MODE SMS. Suppressing this
+            // one here avoids texting the farmer twice for the same root
+            // cause. A device that's connected to WiFi but only Firebase
+            // itself is unreachable (isProvisioningMode() false) still gets
+            // this alert normally.
+            deviceUnreachableEpisodeActive = true;
+            // SMS-only (queuedForCloud=false): backend already owns Device
+            // Unreachable/Back Online history via its own independent RTDB
+            // presence detection, which needs no firmware action once
+            // connectivity actually drops. Replaying this to Firestore too
+            // would risk a second, differently-worded history entry for the
+            // same outage - see the ownership decision in the task report.
+            enqueueEvent(NotificationEventType::DEVICE_UNREACHABLE, NotificationSeverity::SEV_CRITICAL,
+                         "Device Unreachable", "Basilience device lost connectivity.",
+                         String(millis()), true, false);
+        }
+    }
+    else
+    {
+        // Recovered: close the episode. Local automation is never touched by
+        // this transition - only notification bookkeeping.
+        cloudWasDown = false;
+        deviceUnreachableEpisodeActive = false;
+    }
+}
+
+// FALLBACK provisioning means WiFiManager itself gave up reconnecting with
+// its saved credentials and fell back to broadcasting its own setup AP -
+// the farmer has no way to know this happened without physically checking
+// the device, and every other notification path (FCM, popup, even
+// DEVICE_UNREACHABLE above) needs the cloud connection this device no
+// longer has. SMS is the only channel that can possibly reach them.
+// Deliberately NOT fired for MANUAL provisioning: that's a farmer-initiated
+// action (e.g. from the app), so they already know WiFi is being changed.
+//
+// One real limitation worth knowing: this only helps a device that
+// previously connected and has recipients already cached in
+// SmsRecipientCache. A brand-new, never-configured device has no assigned
+// recipients yet the very first time it enters provisioning, so there is
+// no one to text - enqueueEvent() below still runs but the SMS fan-out
+// simply finds zero recipients and settles the slot as FAILED.
+void NotificationManager::observeProvisioningMode()
+{
+    const bool inFallback = wifiManager.isProvisioningMode() &&
+        wifiManager.getProvisioningMode() == WiFiManager::ProvisioningMode::FALLBACK;
+
+    if (!inFallback)
+    {
+        provisioningNotified = false; // arm for the next FALLBACK episode
+        return;
+    }
+
+    if (provisioningNotified) return; // already notified for this episode
+    provisioningNotified = true;
+
+    enqueueEvent(NotificationEventType::PROVISIONING_MODE, NotificationSeverity::SEV_HIGH,
+                 "WiFi Setup Needed",
+                 "Lost WiFi and is broadcasting its own setup network. Connect to it to reconfigure WiFi.",
+                 String(millis()), true, false);
+}
+
+void NotificationManager::observeHarvestSchedule()
+{
+    if (!harvestScheduleCache.isActive()) return;
+    if (!rtcManager.hasValidTime()) return; // cannot safely judge "due" without a trustworthy clock
+
+    uint32_t nextHarvestAt = harvestScheduleCache.getNextHarvestAtEpoch();
+    if (nextHarvestAt == 0) return;
+
+    uint32_t nowEpoch = rtcManager.getEpochTime();
+    if (nowEpoch < nextHarvestAt) return; // not due yet
+
+    // SMS is only this device's offline fallback here too - while online,
+    // the backend's own hourly evaluateHarvestReminders cron already scans
+    // Firestore directly and reaches the app/FCM independent of this
+    // device, so there is nothing for this queue to do. Deliberately does
+    // NOT touch lastFiredHarvestEventId in that case, so if a later offline
+    // period starts while this same occurrence is still overdue, it still
+    // gets exactly one fallback SMS instead of being skipped forever.
+    if (systemState.wifiConnected && systemState.firebaseConnected) return;
+
+    String cycleId = harvestScheduleCache.getCycleId();
+    char identity[48];
+    snprintf(identity, sizeof(identity), "%s_%lu", cycleId.c_str(), (unsigned long)nextHarvestAt);
+
+    char candidateEventId[64];
+    snprintf(candidateEventId, sizeof(candidateEventId), "%s_%s",
+             notificationEventTypeName(NotificationEventType::HARVEST_DUE), identity);
+
+    if (strcmp(lastFiredHarvestEventId, candidateEventId) == 0) return; // already fired for this scheduled occurrence
+    if (findQueueSlot(candidateEventId) >= 0) return; // still queued from a previous tick
+
+    char message[160];
+    snprintf(message, sizeof(message), "Harvest for Cycle #%d is due today.",
+             harvestScheduleCache.getCycleNumber());
+
+    // Reached only while offline (see the guard above). SMS-only
+    // (queuedForCloud=false): backend already owns Harvest Due history via
+    // its own independent hourly evaluateHarvestReminders cron, which scans
+    // Firestore's nextHarvestDate directly - replaying this to Firestore
+    // too would risk a second, differently-worded history entry for the
+    // same scheduled harvest.
+    enqueueEvent(NotificationEventType::HARVEST_DUE, NotificationSeverity::SEV_MEDIUM,
+                 "Harvest Due", message, String(identity), true, false);
+
+    strncpy(lastFiredHarvestEventId, candidateEventId, sizeof(lastFiredHarvestEventId) - 1);
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putString(NVS_HARVEST_KEY, String(lastFiredHarvestEventId));
+    preferences.end();
+}
+
+// --------------------------------------------------------------------
+// Durable queue
+// --------------------------------------------------------------------
+
+void NotificationManager::enqueueEvent(NotificationEventType type, NotificationSeverity severity,
+                                        const char* title, const char* message,
+                                        const String& episodeIdentity, bool smsEligible, bool queuedForCloud)
+{
+    char eventId[40];
+    snprintf(eventId, sizeof(eventId), "%s_%s", notificationEventTypeName(type), episodeIdentity.c_str());
+
+    if (findQueueSlot(eventId) >= 0) return; // defensively idempotent
+
+    int slot = findFreeOrEvictableSlot();
+    if (slot < 0)
+    {
+        Serial.println("[QUEUE] Full - unable to add event, even after eviction attempt");
+        return;
+    }
+
+    NotificationEvent event; // default-constructed
+    event.inUse = true;
+    strncpy(event.eventId, eventId, sizeof(event.eventId) - 1);
+    event.type = type;
+    event.severity = severity;
+    strncpy(event.title, title, sizeof(event.title) - 1);
+    strncpy(event.message, message, sizeof(event.message) - 1);
+
+    if (rtcManager.hasValidTime())
+    {
+        event.occurredAtEpoch = rtcManager.getEpochTime();
+        event.timestampValid = true;
+    }
+
+    event.smsEligible = smsEligible;
+    event.smsStatus = SmsDeliveryStatus::PENDING;
+    event.enqueuedAtMillis = millis();
+    event.queuedForCloud = queuedForCloud;
+    event.cloudStatus = queuedForCloud ? CloudReplayStatus::PENDING : CloudReplayStatus::NOT_QUEUED;
+
+    queue[slot] = event;
+    persistQueue();
+
+    Serial.print("[NOTIFY] Queued ");
+    Serial.print(notificationEventTypeName(type));
+    Serial.print(" ");
+    Serial.println(eventId);
+}
+
+int NotificationManager::findQueueSlot(const char* eventId)
+{
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        if (queue[i].inUse && strcmp(queue[i].eventId, eventId) == 0) return i;
+    }
+    return -1;
+}
+
+int NotificationManager::findFreeOrEvictableSlot()
+{
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        if (!queue[i].inUse) return i;
+    }
+
+    // Full: prefer preserving HIGH/CRITICAL events - evict the first
+    // LOW/MEDIUM-severity entry found (an approximate "oldest low-severity
+    // first" scan; the queue has no separate insertion-order index, kept
+    // deliberately small per the task's "if safe and small" guidance). If
+    // nothing qualifies, refuse the new event rather than evict something
+    // important - bounded FIFO with a diagnostic, not silent corruption.
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        if (queue[i].severity == NotificationSeverity::SEV_LOW ||
+            queue[i].severity == NotificationSeverity::SEV_MEDIUM)
+        {
+            Serial.print("[QUEUE] Full - evicting low-priority ");
+            Serial.println(queue[i].eventId);
+            return i;
+        }
+    }
+
+    Serial.println("[QUEUE] Full - no low-priority event to evict, new event dropped");
+    return -1;
+}
+
+void NotificationManager::loadQueue()
+{
+    preferences.begin(NVS_NAMESPACE, true);
+    size_t expectedSize = sizeof(queue);
+    size_t actualSize = preferences.getBytesLength(NVS_QUEUE_KEY);
+    if (actualSize == expectedSize)
+    {
+        preferences.getBytes(NVS_QUEUE_KEY, queue, expectedSize);
+    }
+    // Any mismatch (first boot / no prior blob / a struct-layout change)
+    // leaves `queue` at its default-constructed, all-empty state rather than
+    // reading garbage.
+    preferences.end();
+}
+
+void NotificationManager::persistQueue()
+{
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putBytes(NVS_QUEUE_KEY, queue, sizeof(queue));
+    preferences.end();
+}
+
+// --------------------------------------------------------------------
+// SMS fan-out: one event, one recipient at a time, fully non-blocking.
+// GsmManager itself has no multi-recipient policy - that lives entirely
+// here, matching the layering the GSM foundation task established.
+// --------------------------------------------------------------------
+
+void NotificationManager::updateSmsFanOut()
+{
+    if (!smsFanOutActive)
+    {
+        startSmsFanOutIfIdle();
+        return;
+    }
+
+    if (fanOutStep == FanOutStep::RECIPIENT_DELAY)
+    {
+        if (millis() < smsFanOutRetryAt) return;
+        attemptCurrentRecipient();
+        return;
+    }
+
+    // AWAITING_RESULT
+    if (gsmManager.isBusy()) return;
+
+    NotificationEvent& event = queue[smsFanOutEventIndex];
+    GsmManager::SendResult result = gsmManager.getLastResult();
+    uint8_t r = smsFanOutRecipientIndex;
+
+    if (result == GsmManager::SendResult::SUCCESS)
+    {
+        event.recipientState[r] = (uint8_t)RecipientSmsState::SENT;
+        Serial.print("[SMS] Delivered ");
+        Serial.println(event.eventId);
+    }
+    else if (result == GsmManager::SendResult::INVALID_NUMBER)
+    {
+        // Bounded policy: no retry for a structurally invalid number.
+        event.recipientState[r] = (uint8_t)RecipientSmsState::FAILED_NO_RETRY;
+    }
+    else if (result == GsmManager::SendResult::MODULE_NOT_READY ||
+             result == GsmManager::SendResult::SIM_NOT_READY ||
+             result == GsmManager::SendResult::NOT_REGISTERED)
+    {
+        // Cellular itself unavailable - defer the WHOLE event rather than
+        // mark this one recipient failed; resumed later once ready (see
+        // startSmsFanOutIfIdle()'s freshness-gated resume).
+        event.smsStatus = SmsDeliveryStatus::DEFERRED;
+        Serial.println("[SMS] Deferred: cellular unavailable");
+        fanOutStep = FanOutStep::IDLE;
+        smsFanOutActive = false;
+        persistQueue();
+        return;
+    }
+    else // TIMEOUT / ERROR / NONE
+    {
+        if (event.recipientRetryCount[r] < 1)
+        {
+            // Bounded policy: at most one retry for TIMEOUT/ERROR.
+            event.recipientRetryCount[r]++;
+            fanOutStep = FanOutStep::RECIPIENT_DELAY;
+            smsFanOutRetryAt = millis() + SMS_RETRY_DELAY_MS;
+            return;
+        }
+        event.recipientState[r] = (uint8_t)RecipientSmsState::FAILED_RETRY_EXHAUSTED;
+    }
+
+    smsFanOutRecipientIndex++;
+    attemptCurrentRecipient();
+}
+
+void NotificationManager::startSmsFanOutIfIdle()
+{
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        NotificationEvent& event = queue[i];
+        if (!event.inUse || !event.smsEligible) continue;
+        if (event.smsStatus != SmsDeliveryStatus::PENDING &&
+            event.smsStatus != SmsDeliveryStatus::DEFERRED) continue;
+
+        if (event.smsStatus == SmsDeliveryStatus::DEFERRED)
+        {
+            if (!gsmManager.isReady()) continue; // still not registered; try a later tick
+
+            unsigned long freshnessMs = (event.type == NotificationEventType::HARVEST_DUE)
+                    ? HARVEST_DUE_SMS_FRESHNESS_MS : GENERAL_SMS_FRESHNESS_MS;
+            if (event.timestampValid && rtcManager.hasValidTime())
+            {
+                uint32_t nowEpoch = rtcManager.getEpochTime();
+                uint32_t ageSeconds = nowEpoch > event.occurredAtEpoch ? nowEpoch - event.occurredAtEpoch : 0;
+                if ((unsigned long)ageSeconds * 1000UL > freshnessMs)
+                {
+                    // Do not send a very old warning merely because cellular
+                    // recovered later - the event still replays to history
+                    // with its original occurredAt regardless.
+                    event.smsStatus = SmsDeliveryStatus::FAILED;
+                    Serial.print("[SMS] Expired before cellular recovered: ");
+                    Serial.println(event.eventId);
+                    persistQueue();
+                    continue;
+                }
+            }
+        }
+        else if (!gsmManager.isReady())
+        {
+            // Previously this just skipped forever with no bound at all on
+            // a unit whose GSM module never becomes ready (no SIM800L
+            // wired, or it never registers) - the event's slot, and by
+            // extension one of the 20 total queue slots, was held hostage
+            // permanently. Give up attempting SMS for it once it's clearly
+            // not going to happen soon; the alert itself is not lost, it
+            // still reached /alerts and Firestore through the normal online
+            // path, this only concerns the redundant SMS channel.
+            if (millis() - event.enqueuedAtMillis >= SMS_START_TIMEOUT_MS)
+            {
+                event.smsStatus = SmsDeliveryStatus::FAILED;
+                persistQueue();
+            }
+            continue;
+        }
+
+        smsFanOutActive = true;
+        smsFanOutEventIndex = (uint8_t)i;
+        smsFanOutRecipientIndex = 0;
+        event.smsStatus = SmsDeliveryStatus::IN_PROGRESS;
+        attemptCurrentRecipient();
+        return; // only start one event's fan-out per idle check
+    }
+}
+
+void NotificationManager::attemptCurrentRecipient()
+{
+    NotificationEvent& event = queue[smsFanOutEventIndex];
+
+    // Skip a recipient index whose canonical phone duplicates one already
+    // attempted for THIS event, so a number shared by two accounts (e.g.
+    // Admin and Personnel) only ever receives one physical SMS per event.
+    while (smsFanOutRecipientIndex < smsRecipientCache.recipientCount())
+    {
+        String phone = smsRecipientCache.recipientAt(smsFanOutRecipientIndex);
+        bool alreadyAttempted = false;
+        for (uint8_t j = 0; j < smsFanOutRecipientIndex; j++)
+        {
+            if (smsRecipientCache.recipientAt(j) == phone) { alreadyAttempted = true; break; }
+        }
+        if (!alreadyAttempted) break;
+        smsFanOutRecipientIndex++;
+    }
+
+    if (smsFanOutRecipientIndex >= smsRecipientCache.recipientCount())
+    {
+        finishSmsFanOut();
+        return;
+    }
+
+    String phone = smsRecipientCache.recipientAt(smsFanOutRecipientIndex);
+    String body = buildSmsBody(event);
+
+    Serial.print("[SMS] Sending ");
+    Serial.print(event.eventId);
+    Serial.print(" to ");
+    Serial.println(GsmManager::maskPhoneNumber(phone));
+
+    if (gsmManager.sendSms(phone, body))
+    {
+        fanOutStep = FanOutStep::AWAITING_RESULT;
+    }
+    else
+    {
+        // Rejected immediately (module not ready/busy) - treat as a deferred
+        // whole-event outcome rather than spin retrying within this tick.
+        event.smsStatus = SmsDeliveryStatus::DEFERRED;
+        fanOutStep = FanOutStep::IDLE;
+        smsFanOutActive = false;
+        persistQueue();
+    }
+}
+
+void NotificationManager::finishSmsFanOut()
+{
+    NotificationEvent& event = queue[smsFanOutEventIndex];
+    uint8_t total = smsRecipientCache.recipientCount();
+    uint8_t sent = 0;
+    bool anyAttempted = false;
+
+    for (uint8_t i = 0; i < total; i++)
+    {
+        if (event.recipientState[i] == (uint8_t)RecipientSmsState::SENT) sent++;
+        if (event.recipientState[i] != (uint8_t)RecipientSmsState::NOT_ATTEMPTED) anyAttempted = true;
+    }
+
+    if (total == 0)
+    {
+        // Explicit, distinct outcome from "recipients existed but delivery
+        // failed" below - never silently claimed as DELIVERED/PARTIAL.
+        Serial.print("[SMS] No recipients cached - ");
+        Serial.print(event.eventId);
+        Serial.println(" cannot be delivered");
+        event.smsStatus = SmsDeliveryStatus::FAILED;
+    }
+    else if (!anyAttempted) event.smsStatus = SmsDeliveryStatus::FAILED;
+    else if (sent == total) event.smsStatus = SmsDeliveryStatus::DELIVERED;
+    else if (sent > 0) event.smsStatus = SmsDeliveryStatus::PARTIAL;
+    else event.smsStatus = SmsDeliveryStatus::FAILED;
+
+    fanOutStep = FanOutStep::IDLE;
+    smsFanOutActive = false;
+    persistQueue();
+}
+
+String NotificationManager::buildSmsBody(const NotificationEvent& event) const
+{
+    // "Basilience: <title> - <message>", GSM-7-friendly (no emoji/curly
+    // punctuation), trimmed to stay within one ~160-char SMS segment. The
+    // same title/message is used verbatim for the later Firestore replay -
+    // wording is authored once here, never regenerated after reconnect.
+    String body = "Basilience: ";
+    body += event.title;
+    body += " - ";
+    body += event.message;
+    if (body.length() > 155) body = body.substring(0, 155);
+    return body;
+}
+
+// --------------------------------------------------------------------
+// Cloud replay integration (called from FirebaseManager's job cursor)
+// --------------------------------------------------------------------
+
+bool NotificationManager::getNextCloudReplayEvent(NotificationEvent& out)
+{
+    if (cloudReplayInFlightEventId[0] != '\0')
+    {
+        int slot = findQueueSlot(cloudReplayInFlightEventId);
+        if (slot >= 0)
+        {
+            out = queue[slot];
+            return true;
+        }
+        cloudReplayInFlightEventId[0] = '\0'; // was removed/acked elsewhere; fall through
+    }
+
+    for (int i = 0; i < NOTIFICATION_QUEUE_CAPACITY; i++)
+    {
+        if (queue[i].inUse && queue[i].queuedForCloud &&
+            queue[i].cloudStatus == CloudReplayStatus::PENDING)
+        {
+            strncpy(cloudReplayInFlightEventId, queue[i].eventId, sizeof(cloudReplayInFlightEventId) - 1);
+            cloudReplaySubmittedAtMillis = 0;
+            out = queue[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+bool NotificationManager::isCloudReplayStale(const char* eventId, unsigned long staleAfterMs)
+{
+    if (strcmp(cloudReplayInFlightEventId, eventId) != 0) return true; // nothing submitted for it yet
+    if (cloudReplaySubmittedAtMillis == 0) return true;
+    return millis() - cloudReplaySubmittedAtMillis >= staleAfterMs;
+}
+
+void NotificationManager::markCloudReplaySubmitted(const char* eventId)
+{
+    int slot = findQueueSlot(eventId);
+    if (slot < 0) return;
+    queue[slot].cloudStatus = CloudReplayStatus::IN_PROGRESS;
+    cloudReplaySubmittedAtMillis = millis();
+    persistQueue();
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[QUEUE] Replaying ");
+        Serial.println(eventId);
+    }
+}
+
+void NotificationManager::markCloudReplayAcked(const char* eventId)
+{
+    int slot = findQueueSlot(eventId);
+    if (slot < 0) return;
+    if (debugManager.shouldPrintDebug(DebugCategory::NOTIFICATION))
+    {
+        Serial.print("[QUEUE] Cloud ack ");
+        Serial.println(eventId);
+    }
+    queue[slot] = NotificationEvent(); // clears inUse too
+    cloudReplayInFlightEventId[0] = '\0';
+    persistQueue();
+}

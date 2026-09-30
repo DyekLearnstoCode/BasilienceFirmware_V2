@@ -463,6 +463,10 @@ void SensorManager::logEffectiveSourceTransition(const char* label)
 
 void SensorManager::applyEffectiveSensors()
 {
+    // Reset every tick; only the INVALID_TEST_HOLD branch below sets this
+    // true again, for exactly the tick(s) that branch is actually taken.
+    automationTestInputHeld = false;
+
     // Evaluated before the source is selected below, so the tick that times
     // out already publishes physical readings rather than waiting one more.
     updateMockBootWait();
@@ -585,6 +589,7 @@ void SensorManager::applyEffectiveSensors()
             sensors = SensorData();
             sensors.waterLevel = NAN;
             lastEffectiveSourceWasMock = false;
+            automationTestInputHeld = true;
             logEffectiveSourceTransition("INVALID_TEST_HOLD");
             return;
         }
@@ -2414,33 +2419,26 @@ void SensorManager::readEC()
     const float voltage = medianMv / 1000.0f;
     physicalSensors.ecVoltage = voltage;
 
-    // === EC calibration (EC_CAL_* constants, Calibration.h) ===
-    // Replaces the previous borrowed DFRobot TDS-sensor polynomial + fixed
-    // EC_FACTOR multiplier (that curve was fit to a different probe/
-    // front-end and never matched this hardware - a confirmed 12.88 mS/cm
-    // solution read only ~1.69 mS/cm through it, an error not uniform
-    // enough across the range for a single output multiplier to safely
-    // correct). See Calibration.h's own "EC Calibration" section for the
-    // full reasoning; this only implements it: two-point linear once a
-    // genuine second point is confirmed, gracefully degrading to a
-    // one-point proportional (through-origin) fit using only the confirmed
-    // 12.88 mS/cm anchor until then - never fabricating a second point
-    // that hasn't actually been measured.
-    float uncompensatedEc;
-    const char* calibrationModel;
-    if (isfinite(EC_CAL_2_VOLTAGE) && isfinite(EC_CAL_2_EC) &&
-        EC_CAL_2_VOLTAGE != EC_CAL_1_VOLTAGE)
-    {
-        const float slope =
-            (EC_CAL_2_EC - EC_CAL_1_EC) / (EC_CAL_2_VOLTAGE - EC_CAL_1_VOLTAGE);
-        uncompensatedEc = EC_CAL_1_EC + (voltage - EC_CAL_1_VOLTAGE) * slope;
-        calibrationModel = "two-point linear";
-    }
-    else
-    {
-        uncompensatedEc = EC_CAL_1_EC * (voltage / EC_CAL_1_VOLTAGE);
-        calibrationModel = "one-point proportional (unvalidated near 0 / cultivation range)";
-    }
+    // === EC calibration (DFRobot TDS-to-EC conversion, Calibration.h) ===
+    // Replaces the EC_CAL_* two-point anchor model - the buffer-solution
+    // readings it was fit against were judged unreliable, and being fit to
+    // only two close-together voltages made it oversensitive to ordinary
+    // ADC noise within the real cultivation range (see Calibration.h's own
+    // "EC Calibration" sections for the full history of both retirements).
+    // This instead uses the DFRobot Gravity-TDS-sensor's own polynomial,
+    // unmodified and uncalibrated - no per-device anchor points, no
+    // EC_FACTOR multiplier - trading a better fit at two specific buffer
+    // readings for a conversion that isn't sensitive to how reliable those
+    // readings were. TDS is computed from the RAW (not temperature-
+    // compensated) voltage - see the "TDS must NOT depend on Water
+    // Temperature" note below - then EC is the vendor's own TDS/500 ratio.
+    const float tds =
+        (133.42f * voltage * voltage * voltage -
+         255.86f * voltage * voltage +
+         857.39f * voltage) *
+        0.5f;
+    const float uncompensatedEc = tds / 500.0f;
+    const char* calibrationModel = "DFRobot TDS-to-EC (uncalibrated)";
 
     // A NaN water temperature must never reach the compensation formula - it
     // would make EC itself go NaN even though the EC sensor is fine. Fall
@@ -2481,15 +2479,18 @@ void SensorManager::readEC()
         lastEcCompensationSource = compensationSource;
     }
 
-    // === Temperature compensation - applied to the calibrated EC value,
-    // not the raw voltage (physically, this normalizes the MEASURED
-    // conductivity to a 25C reference, the standard water-quality
-    // convention - not a correction to the sensor's electrical signal, so
-    // it belongs after conversion, not before. The old polynomial
-    // compensated voltage first only because that particular nonlinear
-    // curve made the two orders genuinely different; with this linear
-    // calibration model they're mathematically identical either way, so
-    // this reordering changes clarity, not behavior). ===
+    // === Temperature compensation - applied to the computed EC value, not
+    // the raw voltage feeding the polynomial above. Physically this
+    // normalizes the MEASURED conductivity to a 25C reference (the standard
+    // water-quality convention), not a correction to the sensor's
+    // electrical signal - so it belongs after the TDS/EC conversion, not
+    // before. This is a deliberate difference from the DFRobot vendor
+    // example (which compensates the voltage before the polynomial): doing
+    // it that way here would also shift TDS with water temperature, which
+    // the next paragraph's requirement forbids. Because the polynomial is
+    // nonlinear, compensating the input voltage vs. the output EC are NOT
+    // numerically identical - this order is the one that keeps TDS
+    // temperature-independent while still giving EC a 25C-normalized value.
     const float compensationCoefficient =
         1.0f + 0.02f * (compensationTemp - 25.0f);
     const float compensatedEc = uncompensatedEc / compensationCoefficient;
@@ -2500,27 +2501,23 @@ void SensorManager::readEC()
     physicalSensors.ec = compensatedEc;
 
     // TDS must NOT depend on Water Temperature (explicit requirement, kept
-    // from the prior pass) - derived from the calibrated but uncompensated
-    // EC using the standard 0.5 ppm/(uS/cm) convention already implicit in
-    // the old polynomial's own /500 step (TDS(ppm) = EC(mS/cm) * 500), so
-    // this is the same conversion convention as before, just no longer
-    // riding on the retired polynomial/EC_FACTOR to get there.
-    physicalSensors.tds = uncompensatedEc * 500.0f;
+    // from the prior pass) - already true here since `tds` above was
+    // computed from the raw, uncompensated voltage, before temperature
+    // compensation is applied to derive physicalSensors.ec.
+    physicalSensors.tds = tds;
 
-    // Fail-safe EC plausibility check (Config.h's EC_CAL_VOLTAGE_MARGIN_V) -
-    // separate from the rail-proximity fault detector above (electrically-
-    // implausible voltage at/near the ADC's own physical rails). This
-    // instead catches a voltage that's electrically ordinary (nowhere near
-    // either rail, so the rail check above never flags it) but falls far
-    // outside the domain the EC_CAL_1_*/EC_CAL_2_* two-point line
-    // (Calibration.h) was actually fit against, or that the line
-    // extrapolates into a physically impossible negative EC - the
-    // real-hardware finding this guards against: a ~365-400mV reading, far
-    // below EC_CAL_2_VOLTAGE, extrapolating through the steep two-point
-    // slope into roughly -63 mS/cm with nothing to catch it. Does NOT touch
-    // EC_CAL_1_*/EC_CAL_2_*/the two-point formula themselves, and does NOT
-    // clamp uncompensatedEc/compensatedEc to zero or any other value - only
-    // judges whether THIS reading is trustworthy enough to publish.
+    // Fail-safe EC plausibility check - separate from the rail-proximity
+    // fault detector above (electrically-implausible voltage at/near the
+    // ADC's own physical rails). This instead catches a voltage that's
+    // electrically ordinary (nowhere near either rail, so the rail check
+    // above never flags it) but the DFRobot polynomial still turns into a
+    // physically impossible negative EC. Unlike the retired EC_CAL_*
+    // two-point model, this conversion has no per-device calibration
+    // domain to fall outside of - it was fit by the vendor across a fixed
+    // voltage range - so the only thing left to guard against is
+    // non-finite/negative output. Does NOT clamp uncompensatedEc/
+    // compensatedEc to zero or any other value - only judges whether THIS
+    // reading is trustworthy enough to publish.
     //
     // Evaluated EVERY tick (not just on the throttled confirm-streak cadence
     // below) and cached in ecImplausibleThisSample - applyEffectiveSensors()
@@ -2535,14 +2532,9 @@ void SensorManager::readEC()
     // is UNCHANGED - it still, and only, controls when this graduates from
     // "this one observation is untrustworthy" to "the sensor itself is
     // persistently faulted".
-    const float ecCalVoltageLow = min(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) - EC_CAL_VOLTAGE_MARGIN_V;
-    const float ecCalVoltageHigh = max(EC_CAL_1_VOLTAGE, EC_CAL_2_VOLTAGE) + EC_CAL_VOLTAGE_MARGIN_V;
-
     ecImplausibleThisSample =
         !isfinite(compensatedEc) ||
-        compensatedEc < 0.0f ||
-        voltage < ecCalVoltageLow ||
-        voltage > ecCalVoltageHigh;
+        compensatedEc < 0.0f;
 
     // Own separate streak/field (ecCalibrationFaultStreak/
     // physicalSensors.ecCalibrationFault) from the rail detector above -
@@ -2575,7 +2567,7 @@ void SensorManager::readEC()
                     Serial.print(voltage, 4);
                     Serial.print(" uncompensatedEC=");
                     Serial.print(uncompensatedEc, 3);
-                    Serial.println(" outside usable calibrated model");
+                    Serial.println(" non-finite/negative");
                 }
             }
         }
@@ -2592,7 +2584,7 @@ void SensorManager::readEC()
                     ecCalibrationFaultRecoveryStreak = 0;
                     if (debugManager.shouldPrintDebug(DebugCategory::EC))
                     {
-                        Serial.println("[EC-FAULT] calibration-implausible recovered - voltage back within usable calibrated model");
+                        Serial.println("[EC-FAULT] calibration-implausible recovered - computed EC finite and non-negative again");
                     }
                 }
             }

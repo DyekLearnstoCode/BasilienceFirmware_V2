@@ -10,6 +10,27 @@
 
 #include "Types.h"
 
+// This firmware must be built against the Basilience-patched copy of the
+// Firebase Arduino Client Library that lives in this repository
+// (libraries/Firebase_Arduino_Client_Library_for_ESP8266_and_ESP32, see
+// BASILIENCE_PATCH.md in that folder). Upstream 4.4.17 lets a single connection
+// attempt block loop() for 30s (TCP connect) plus 60s (TLS handshake); the patch
+// replaces those two defaults with the values below and defines these macros.
+// If either macro is missing, the compiler picked up an unpatched copy (for
+// example the arduino-cli user-library folder instead of this repo's), and
+// building anyway would silently bring the long stalls back.
+#if !defined(BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS) || \
+    !defined(BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS)
+#error "Unpatched Firebase Arduino Client Library. Build with the copy in <repo>/libraries (see BASILIENCE_PATCH.md), or apply that patch to the library you are building against."
+#endif
+
+// Acceptance limit for one Firebase connection attempt (TCP connect + TLS
+// handshake, excluding DNS and the response wait). Raising either patched value
+// past this must be a deliberate decision, so it is enforced at build time.
+static_assert(BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS +
+                  BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS <= 5000,
+              "Firebase TCP connect + TLS handshake timeouts must total 5000 ms or less");
+
 class FirebaseManager
 {
 public:
@@ -113,6 +134,10 @@ private:
 
     unsigned long lastSettingsRead = 0;
     unsigned long lastSensorUploadAttempt = 0;
+    // CONFIRMED BUG FIX (effective sensor data vs Firebase sensor sync):
+    // tracks the mock/physical edge across writeSensors() calls - see its
+    // own comment where this is read.
+    bool lastPublishedSourceWasMock = false;
     uint8_t optionalFirebaseJobCursor = 0;
     // Timestamp of the last time any low-priority cloud-maintenance job
     // (telemetry, device info, diagnostic sensors, SMS recipients, harvest
@@ -151,6 +176,15 @@ private:
     // directly.
     bool wasWifiConnectedForLog = true;
     bool suspendedForProvisioning = false;
+    // Set when commands/startProvisioning was observed true but deleteNode()
+    // could not confirm the node was actually removed. While true, the next
+    // successful commands poll re-checks the raw snapshot instead of trusting
+    // the earlier ambiguous result: still-true retries the delete, absent is
+    // treated as the earlier delete having taken effect after all. Either way
+    // manual provisioning is only entered once the command is confirmed gone,
+    // so a delete that failed to ack can never replay AP mode after a
+    // reconnect or reboot. See beginManualProvisioningAfterCommandConsumed().
+    bool provisioningCommandPendingDelete = false;
     bool hasPublishedHeartbeat = false;
     bool heartbeatResumePending = false;
     unsigned long lastSuccessfulSensorUpload = 0;
@@ -220,6 +254,20 @@ private:
     void noteCloudUnavailable();
     void noteCloudAvailable();
 
+    // STA self-heal escalation (see checkStaRecovery()). Separate from
+    // cloudUnavailableSince above on purpose: this clock only counts time the
+    // cloud has been not READY WHILE Wi-Fi is associated, and restarts from
+    // zero on any Wi-Fi loss (including the forced reconnect itself), so a
+    // real Wi-Fi outage never counts toward it and each forced reconnect
+    // needs its own fresh 30s of associated outage. lastStaRecoveryAt is the
+    // absolute 60s cooldown and is never reset by recovery. 0 = not running /
+    // never forced.
+    unsigned long staRecoveryOutageSince = 0;
+    unsigned long lastStaRecoveryAt = 0;
+    bool staRecoverySuppressedLogged = false;
+    bool checkStaRecovery();
+    void resetStaRecoveryStage();
+
     // Developer/test command nodes (commands/automationTestMode,
     // commands/ignoreWaterLevelAutomation, commands/mockSensors) are level
     // flags that stay in RTDB. They must never survive a device reboot, so
@@ -254,9 +302,10 @@ private:
 
     // PREFLIGHT       - a background task proves DNS + a TLS handshake work
     //                   BEFORE any Firebase library HTTPS call is made from the
-    //                   main loop task. The library's own connect/handshake
-    //                   waits are not bounded tightly enough to risk on a
-    //                   network that has not been proven reachable.
+    //                   main loop task. The library's connect and handshake are
+    //                   now bounded (patched to 2s + 3s), but its DNS lookup is
+    //                   not, and a path that has not been proven reachable is
+    //                   still not worth even a few seconds of the main loop.
     // AUTHENTICATING  - the existing auth state machine (startAuthAttempt() /
     //                   pollAuthStateMachine()), one bounded step per update().
     // INIT_STEPS      - post-auth database initialization, one small step per
@@ -317,6 +366,34 @@ private:
     // the last preflight is stale (see CLOUD_PATH_FRESH_MS in the .cpp).
     bool cloudPathVerified = false;
     unsigned long cloudPathVerifiedAt = 0;
+
+    // "The Firebase LIBRARY has completed a real RTDB operation on the current
+    // path verification." cloudPathVerified only says the network looked usable
+    // (an independent DNS + TLS probe); it says nothing about the library's own
+    // TLS session, which can still fail on the very first call. So after every
+    // fresh preflight this goes false, and only validateCloudSession() - one
+    // small read - or a completed startup sets it true again. Firebase READY,
+    // "Firebase RESTORED", the heartbeat, DEGRADED -> HEALTHY and every normal
+    // cloud call wait for it. Only meaningful in the COMPLETE phase: earlier
+    // phases prove the session with their own (real) authentication and
+    // initialization calls.
+    bool cloudSessionValidated = false;
+    void validateCloudSession();
+
+    // One blocking library transaction per update() tick in normal operation.
+    // Every RTDB call reports its result to recordFirebaseResult(), which counts
+    // it here; update() stops handing out further cloud work once one has run
+    // (or the path was withdrawn). Before this, a single healthy tick could run
+    // command reads, an actuator write, an alert write, a heartbeat and an
+    // optional job back to back, so on a slow link their waits stacked into one
+    // multi-second stall. Nothing is dropped: whatever did not run is still due
+    // on the next tick, and every function keeps its own cadence gate.
+    uint8_t cloudCallsThisTick = 0;
+    bool cloudTickBudgetSpent() const { return !cloudPathVerified || cloudCallsThisTick >= 1; }
+    // An alert transition writes /alerts and then owes /sensors one forced
+    // refresh. That second call now runs at the head of the next tick instead
+    // of in the same one.
+    bool alertHeartbeatPending = false;
 
     enum class PreflightPoll : uint8_t
     {
@@ -438,6 +515,12 @@ private:
 
     void readCommands();
     void readActuatorCommands();
+    // Shared tail for both the fresh-request and pending-retry paths in
+    // readActuatorCommands()'s startProvisioning handling - only ever called
+    // once the command node is confirmed consumed. See
+    // provisioningCommandPendingDelete's comment for why that confirmation
+    // matters.
+    void beginManualProvisioningAfterCommandConsumed();
     void primeActuatorCommands();
     bool applyAutomationTestModeCommand(FirebaseJson& snapshot);
     void setAutomationTestMode(AutomationTestSubsystem subsystem,

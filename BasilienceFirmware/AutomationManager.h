@@ -115,11 +115,12 @@ private:
     // automatic-refill trigger site must use, so "eligible to auto-refill"
     // can never be judged differently in two places. Requires the TRUSTED
     // HC-SR04 confirmation (sensors.refillStartConfirmed - 3 consecutive
-    // ACCEPTED readings, see SensorManager::readWaterLevel()), not merely
-    // the debounced alertState.lowWater flag alone: a low-water ALERT can
-    // legitimately stay true across many ticks off a single accepted
-    // reading, sufficient to notify a user but not sufficient to open the
-    // solenoid.
+    // ACCEPTED readings, see SensorManager::readWaterLevel()) AND a finite
+    // current depth at or below refillStartLevelCm. It deliberately does NOT
+    // read the latched alertState.lowWater flag: that alert can stay true
+    // across many ticks off a single accepted reading (and is strict where
+    // this rule is inclusive), which is enough to notify a user but not to
+    // decide whether to open the solenoid.
     bool autoRefillEligible() const;
 
     enum class AutomaticRefillPhase : uint8_t
@@ -173,15 +174,6 @@ private:
     bool highHumidityDemandActive = false;
     bool lowAirDemandActive = false;
 
-    // Manual root-fogging pairing state (processManualFogPairing()). Tracks
-    // FOGGER's manually-running status across ticks purely to edge-detect
-    // when a manual root-fogging request stops, so the BLOWER_PURGE_MS
-    // clearing purge starts exactly once per stop, and whether that purge is
-    // currently in its 30-second window.
-    bool wasManualFoggerRunning = false;
-    bool manualFogPurgeActive = false;
-    unsigned long manualFogPurgeStart = 0;
-
     // Last AUTOMATIC canopy fan speed actually commanded from a fresh DHT
     // reading (handleCanopyClimate()) - see the automation resilience pass
     // report. Retained (not reset to 100%) whenever DHT becomes unavailable,
@@ -214,6 +206,15 @@ private:
     // Same anchor, same reasoning, for STABILIZING_EC - see
     // phStabilizationCirculationConfirmedAt's own comment above.
     unsigned long ecStabilizationCirculationConfirmedAt = 0;
+
+    // Isolated PH Automation Test Mode hold (see checkPhTestHold()). True
+    // for exactly the ticks a temporary Firebase outage is holding the mock
+    // pH input invalid (SensorManager::isAutomationTestInputHeld()) while a
+    // DOSING_PH/STABILIZING_PH episode is in progress - stops both pH pumps
+    // and freezes every PH timing reference instead of letting
+    // SafetyManager::canDosePH() abort the episode as a sensor fault.
+    bool phTestHoldActive = false;
+    unsigned long phTestHoldStartedAt = 0;
 
     //==================================================
     // Serial Monitor Focus Mode - compact per-controller dependency
@@ -332,13 +333,6 @@ private:
 
     void processFogCycle();
 
-    // Manual root-fogging redesign: coordinates the root-zone Blower with a
-    // manually-requested Fogger (Fogger + Blower together represent one
-    // manual root-fogging operation, not raw Fogger-only testing), including
-    // the fan-assisted-demand blower speed and the stop/purge sequence. See
-    // AutomationManager.cpp for the full design note.
-    void processManualFogPairing();
-
     //==================================================
     // Scheduling
     //==================================================
@@ -374,6 +368,16 @@ private:
     void handleDosingPH();
 
     void handleStabilizingPH();
+
+    // Called first thing by both handlers above. Returns true if PH
+    // Automation Test Mode's isolated hold is active this tick (caller must
+    // return immediately without touching pumps/timers itself) or if it just
+    // ended (in which case a DOSING_PH episode is routed to STABILIZING_PH
+    // to force a fresh-reading redose/complete decision rather than blindly
+    // resuming the pre-outage pump direction - see the .cpp for the full
+    // reasoning). Returns false when PH Test Hold was never relevant this
+    // tick, in which case the caller proceeds exactly as before.
+    bool checkPhTestHold();
 
     void handleDosingEC();
 

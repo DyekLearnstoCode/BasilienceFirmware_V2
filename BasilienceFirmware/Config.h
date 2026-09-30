@@ -330,9 +330,9 @@ constexpr float WATER_LEVEL_CM_ALERT_HYSTERESIS = 0.3f;     // refillStartLevelC
 // AutomationManager/AlertManager/SafetyManager/Firebase publication all
 // consume) accept a new value; an unstable window keeps the previous
 // accepted value instead of publishing/acting on the fluctuation.
-// Calibration (PH_SLOPE/PH_OFFSET, EC_FACTOR - Calibration.h) is untouched
-// by this filter; it only decides when an already-calibrated reading is
-// trustworthy enough to act on.
+// Calibration/conversion (PH_SLOPE/PH_OFFSET, the EC TDS-to-EC conversion -
+// Calibration.h) is untouched by this filter; it only decides when an
+// already-converted reading is trustworthy enough to act on.
 //
 // Sampling cadence: readPH()/readEC() recompute their rolling average every
 // loop() tick, but the underlying ring buffer only advances by one raw ADC
@@ -532,29 +532,18 @@ constexpr uint8_t EC_FAULT_CONFIRM_COUNT = 8;
 constexpr uint8_t PH_FAULT_RECOVERY_COUNT = 8;
 constexpr uint8_t EC_FAULT_RECOVERY_COUNT = 8;
 
-// EC calibration-plausibility fault (SensorManager::readEC(), fail-safe
-// added after a real-hardware finding: a voltage nowhere near either
-// electrical rail above - e.g. ~365-400mV - can still fall so far outside
-// the domain EC_CAL_1_VOLTAGE/EC_CAL_2_VOLTAGE (Calibration.h) were actually
-// fit against that the two-point line extrapolates it into a physically
-// impossible negative EC, which the rail check alone never catches. Does
-// NOT change the calibration anchors or the two-point formula itself - it
-// only judges whether a reading is far enough outside that model's
-// validated domain to be untrustworthy. Margin (not a hard clamp at the two
-// anchor voltages) because only two solutions were ever captured and real
-// cultivation-range EC can legitimately sit a bit outside that narrow
-// 2.142-2.440V span; 0.3V is generous enough to cover normal probe/solution
-// variation while still catching a reading this far off (the diagnosed
-// 365-400mV case is roughly 1.5V past this margin, not a borderline call).
-// Same EC_FAULT_CONFIRM_COUNT/EC_FAULT_RECOVERY_COUNT/EC_FAULT_CHECK_INTERVAL_MS
-// debounce shape as the rail check above, but its own separate streak state
-// (SensorManager's ecCalibrationFaultStreak/ecCalibrationFaultRecoveryStreak)
-// and its own fault field (physicalSensors.ecCalibrationFault) - kept
-// independent of the rail detector's own ecFaultStreak/physicalSensors.ecFault
-// so the two confirm/recovery debounces can never race each other into
-// clearing a fault the other is still confirming; applyEffectiveSensors()
-// ORs both into the one published ecFault flag/NaN override.
-constexpr float EC_CAL_VOLTAGE_MARGIN_V = 0.3f;
+// Retired: was the margin around EC_CAL_1_VOLTAGE/EC_CAL_2_VOLTAGE
+// (Calibration.h) that SensorManager::readEC()'s EC calibration-plausibility
+// check used to decide whether a voltage had strayed too far outside the
+// retired two-point model's validated domain to be trustworthy. That model
+// is retired (see Calibration.h - buffer-solution readings judged
+// unreliable), and its DFRobot TDS-to-EC replacement has no per-device
+// calibration domain to define a margin around, so readEC() now only
+// guards the plausibility check against a non-finite/negative EC directly.
+// Kept as a record of the value that was in use (0.3V was generous enough
+// to cover normal probe/solution variation while still catching the
+// diagnosed ~365-400mV rail-adjacent case, roughly 1.5V past this margin).
+// constexpr float EC_CAL_VOLTAGE_MARGIN_V = 0.3f;
 
 // Throttle for updateStabilityWindow()'s periodic diagnostic dump (real-
 // hardware pre-integration follow-up, Part A) - independent of

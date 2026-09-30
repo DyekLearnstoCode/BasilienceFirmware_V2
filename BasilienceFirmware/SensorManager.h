@@ -104,6 +104,15 @@ private:
     // fallback persists.
     bool lastEffectiveSourceWasMock = false;
 
+    // True only while applyEffectiveSensors() is currently in the
+    // INVALID_TEST_HOLD branch (isolated Automation Test Mode + stale mock).
+    // Distinct from lastEffectiveSourceWasMock, which is also false for this
+    // case (see that field's own comment) and therefore cannot tell
+    // AutomationManager whether sensors.ph is NaN because of an intentional
+    // test hold versus a genuine physical sensor fault. See
+    // isAutomationTestInputHeld().
+    bool automationTestInputHeld = false;
+
     // Edge-detection for the "[MOCK] Effective source: ..." transition log
     // (effective-mock-source consistency fix). Separate from
     // lastEffectiveSourceWasMock above: that plain bool cannot by itself
@@ -242,10 +251,10 @@ private:
     uint8_t ecFaultStreak = 0;
     uint8_t ecFaultRecoveryStreak = 0;
 
-    // EC calibration-plausibility fault (Config.h's EC_CAL_VOLTAGE_MARGIN_V,
-    // fail-safe over the EC_CAL_* two-point model - see readEC()'s own
-    // comment and physicalSensors.ecCalibrationFault's declaration-site
-    // comment in Types.h). A SEPARATE streak/throttle from
+    // EC calibration-plausibility fault - fail-safe over the DFRobot
+    // TDS-to-EC conversion (Calibration.h) - see readEC()'s own comment and
+    // physicalSensors.ecCalibrationFault's declaration-site comment in
+    // Types.h. A SEPARATE streak/throttle from
     // ecFaultStreak/ecFaultRecoveryStreak/lastEcFaultCheckAt above -
     // deliberately not shared, so this detector's confirm/recovery debounce
     // can never race the rail detector's into clearing a fault the other is
@@ -257,8 +266,7 @@ private:
     // Per-observation plausibility result, recomputed EVERY readEC() tick
     // (unlike ecCalibrationFaultStreak above, which only advances on the
     // throttled EC_FAULT_CHECK_INTERVAL_MS cadence) - true when THIS
-    // sample's compensatedEc/voltage is non-finite, negative, or outside the
-    // EC_CAL_VOLTAGE_MARGIN_V-widened calibration domain. Lets
+    // sample's compensatedEc is non-finite or negative. Lets
     // applyEffectiveSensors() invalidate sensors.ec immediately for a
     // single bad observation without waiting on EC_FAULT_CONFIRM_COUNT
     // consecutive confirmations - that streak still, and only, controls the
@@ -520,6 +528,19 @@ public:
     // keep using systemState.mockSensorsEnabled directly - not a
     // replacement for that, only for automation-behavior consumers.
     bool isUsingEffectiveMockSensors() const { return lastEffectiveSourceWasMock; }
+
+    // True only while sensors are being held explicitly invalid because
+    // isolated Automation Test Mode's mock payload went stale
+    // (applyEffectiveSensors()'s INVALID_TEST_HOLD branch) - never true for a
+    // genuine physical sensor fault, and never inferable from sensors.ph
+    // being NaN alone (a real disconnected probe also produces NaN and must
+    // NOT be treated this way). AutomationManager's PH state handlers use
+    // this - combined with systemState.automationTestSubsystem == PH - to
+    // freeze the active correction instead of letting
+    // SafetyManager::canDosePH() abort it as a sensor fault. Deliberately
+    // NOT a general-purpose "sensors are currently invalid" flag: it says
+    // nothing about EC/refill/cooling, which this pass does not touch.
+    bool isAutomationTestInputHeld() const { return automationTestInputHeld; }
 
     // True exactly when the most recent pH/EC stability-window evaluation
     // passed its tolerance check - see StabilityWindow::currentlyStable's

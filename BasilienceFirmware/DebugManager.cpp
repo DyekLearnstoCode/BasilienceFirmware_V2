@@ -21,14 +21,15 @@ namespace
     // Section 6: loop-gap stall threshold. Chosen against this firmware's own
     // bounded worst cases rather than an arbitrary guess - a Firebase RTDB call
     // on an already-open session is capped at ~4000ms by
-    // config.timeout.serverResponse (see FirebaseManager::begin() for exactly
-    // what that setting does and does not cover; a call that must open a NEW
-    // connection is not capped by it, which is why those are gated behind the
-    // background preflight) and the DS18B20 conversion no longer blocks loop()
-    // at all. 5000ms sits just above that single-call cap, so an ordinary,
-    // already-expected worst-case Firebase timeout does NOT itself trigger a
-    // STALL warning, while two such calls stacking in one iteration - or any
-    // other unexpected block - does.
+    // config.timeout.serverResponse, and one that must open a NEW connection
+    // adds at most 5000ms (2000ms TCP connect + 3000ms TLS handshake, both set
+    // in the patched vendored library) on top of the DNS lookup. See
+    // FirebaseManager::begin() for the full breakdown. The DS18B20 conversion no
+    // longer blocks loop() at all. 5000ms sits just above the established-
+    // session cap, so an ordinary, already-expected worst-case Firebase timeout
+    // does NOT itself trigger a STALL warning. A session rebuild that has to
+    // wait out its full connect or handshake bound WILL show up as a STALL, on
+    // purpose: it is the one event this line exists to make visible.
     constexpr unsigned long LOOP_STALL_THRESHOLD_MS = 5000UL;
 
     // Section 11: how often an unchanged, still-active safety block reprints
@@ -377,13 +378,17 @@ void DebugManager::printBootSummary()
     Serial.println(rtcManager.hasValidTime() ? "YES" : "NO");
     Serial.print("Settings source: ");
     Serial.println(firebaseManager.settingsRestoredFromNvs ? "NVS" : "defaults");
-    // Fixed text, not read back from FirebaseManager's config object - the
-    // response figure is the value R1 set in FirebaseManager::begin()
-    // (config.timeout.serverResponse), and R2's setWaitForConversion(false).
-    // The connect/handshake phases are deliberately NOT listed as 4000ms: the
-    // library does not apply socketConnection to them (see the comment in
-    // FirebaseManager::begin()).
-    Serial.println("Firebase timeout: response=4000ms (new connections gated by network preflight)");
+    // The connect and handshake figures are the macros the patched vendored
+    // Firebase library actually compiled with (FirebaseManager.h refuses to
+    // build without them), so this line cannot drift from what runs. The
+    // response figure is fixed text for the value FirebaseManager::begin() sets
+    // (config.timeout.serverResponse); R2's setWaitForConversion(false) is the
+    // next line. DNS is not bounded by either (see FirebaseManager::begin()).
+    Serial.print("Firebase timeouts: tcp-connect=");
+    Serial.print(BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS);
+    Serial.print("ms tls-handshake=");
+    Serial.print(BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS);
+    Serial.println("ms response=4000ms (DNS: lwIP retries, unbounded)");
     Serial.println("DS18B20: async conversion");
     Serial.println("==============================================");
 }

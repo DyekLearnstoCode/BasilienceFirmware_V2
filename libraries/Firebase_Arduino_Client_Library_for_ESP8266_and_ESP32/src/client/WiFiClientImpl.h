@@ -33,6 +33,16 @@
 #if !defined(WIFICLIENT_IMPL_H) && defined(ESP32)
 #define WIFICLIENT_IMPL_H
 
+// BASILIENCE PATCH 1/3 (see BASILIENCE_PATCH.md in the library root).
+// TCP connect timeout, in milliseconds, for EVERY connection this library
+// opens - RTDB and authentication/token refresh both create their socket from
+// this class and nothing in the library ever overrides it. Upstream default:
+// 30000. Also serves as the marker that lets Basilience's FirebaseManager.h
+// refuse to build against an unpatched copy of the library.
+#ifndef BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS
+#define BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS 2000
+#endif
+
 #include <lwip/sockets.h>
 class WiFiClientImpl : public Client
 {
@@ -249,7 +259,7 @@ public:
 
 private:
     int _socket = -1;
-    int _timeout = 30000;
+    int _timeout = BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS; // BASILIENCE PATCH 1/3 (upstream: 30000)
     size_t _rxBuffSize = 2048;
     uint8_t *_rxBuff = nullptr;
     size_t _fillPos = 0;

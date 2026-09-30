@@ -547,6 +547,17 @@ void ActuatorManager::requestCommand(Actuator actuator, bool state, const String
         return;
     }
 
+    // UPDATED REQUIREMENT (manual fogger/blower independence): manual BLOWER
+    // control is simply 100% ON or OFF, never a variable speed - normalized
+    // here so any manual-source BLOWER command always drives it at 100%
+    // regardless of what speed value a caller passed. Automatic BLOWER speed
+    // (PWM tiers, hot-air/humidity overrides, processFogCycle()'s own speed
+    // selection) is untouched - this only applies to a manual source.
+    if (actuator == BLOWER && isManualSource(source))
+    {
+        speed = 100;
+    }
+
     commands[actuator].isPending = true;
     commands[actuator].targetState = state;
     commands[actuator].speed = speed;
@@ -929,14 +940,15 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             break;
         case FOGGER:
             // CONFIRMED FIX (manual root-fogging redesign): canFog() used to
-            // gate only automatic-source Fogger commands. A normal Admin
-            // manual Fogger request now represents the complete root-fogging
-            // operation (paired with the Blower - see
-            // AutomationManager::processManualFogPairing()), not raw
-            // hardware-only testing, so it must clear the same hard gates as
-            // automatic fogging: safety lock, water level, the >maxWaterTemp
-            // nutrient-solution suspension, and valid/in-range pH and EC -
-            // see SafetyManager::canFog()'s own comment for the full list.
+            // gate only automatic-source Fogger commands. A manual Fogger
+            // request runs the same physical hardware under the same real
+            // hazards as automatic fogging (nutrient solution over the water
+            // level/temperature/pH/EC it was mixed for), independent of
+            // whether Blower is also running - see UPDATED REQUIREMENT
+            // (manual fogger/blower independence): Fogger and Blower are
+            // fully independent manual actuators now, but each still needs
+            // its own real safety gate. See SafetyManager::canFog()'s own
+            // comment for the full list.
             {
                 SafetyResult fogSafety = safetyManager.canFog();
                 if (fogSafety != SafetyResult::SAFE)
@@ -1021,13 +1033,10 @@ void ActuatorManager::update()
         static const Actuator explicitStopOnExpiry[] =
             { FOGGER, SOLENOID, GROW_PUMP, BLOOM_PUMP, PH_UP_PUMP, PH_DOWN_PUMP, PELTIER };
 
-        // Stopped BEFORE manualMode flips false: a manual FOGGER OFF here
+        // Stopped BEFORE manualMode flips false: each explicit stop here
         // still needs manualMode==true to be honored the same way an
-        // Admin-initiated stop is (see processManualFogPairing()'s purge,
-        // which itself commands the Blower ON for BLOWER_PURGE_MS - an ON
-        // request is rejected by validateCommand() when manualMode is
-        // already false). The OFF requests below are unaffected either way:
-        // validateCommand() never gates an OFF on manualMode.
+        // Admin-initiated stop is. The OFF requests below are unaffected
+        // either way: validateCommand() never gates an OFF on manualMode.
         for (Actuator a : explicitStopOnExpiry)
         {
             if (manuallyOverridden[a])

@@ -12,13 +12,42 @@
 #include "MixingManager.h"
 #include "SafetyManager.h"
 #include "DebugManager.h"
+#include <esp_system.h>
 
 bool firebaseInitialized = false;
+
+// Boot diagnostic only. The ROM banner cannot tell a brownout from a plain
+// software reset (both print "rst:0x3 (SW_RESET)"), but esp_reset_reason()
+// can, so this names the cause in plain text on every boot.
+static const char* resetReasonName(esp_reset_reason_t reason)
+{
+    switch (reason)
+    {
+        case ESP_RST_POWERON:   return "ESP_RST_POWERON";
+        case ESP_RST_EXT:       return "ESP_RST_EXT";
+        case ESP_RST_SW:        return "ESP_RST_SW";
+        case ESP_RST_PANIC:     return "ESP_RST_PANIC";
+        case ESP_RST_INT_WDT:   return "ESP_RST_INT_WDT";
+        case ESP_RST_TASK_WDT:  return "ESP_RST_TASK_WDT";
+        case ESP_RST_WDT:       return "ESP_RST_WDT";
+        case ESP_RST_DEEPSLEEP: return "ESP_RST_DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "ESP_RST_BROWNOUT";
+        case ESP_RST_SDIO:      return "ESP_RST_SDIO";
+        case ESP_RST_UNKNOWN:   return "ESP_RST_UNKNOWN";
+        default:                return "OTHER";
+    }
+}
 
 void setup()
 {
 
     Serial.begin(115200);
+
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.print("[BOOT] Reset reason raw=");
+    Serial.print((int)resetReason);
+    Serial.print(" name=");
+    Serial.println(resetReasonName(resetReason));
 
     // Local plant protection is initialized before any network or TLS path.
     // Defaults/persisted settings, safe GPIO states, sensors, RTC, safety, and

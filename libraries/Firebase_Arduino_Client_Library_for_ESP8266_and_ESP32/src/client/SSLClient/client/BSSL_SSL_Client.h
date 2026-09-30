@@ -40,6 +40,15 @@
 #include "../ESP_SSLClient_FS.h"
 #include "../ESP_SSLClient_Const.h"
 
+// BASILIENCE PATCH 2/3 (see BASILIENCE_PATCH.md in the library root).
+// TLS handshake timeout, in milliseconds, for EVERY connection this library
+// opens. Upstream default: 60000, and nothing in the library ever calls
+// setHandshakeTimeout() (FirebaseConfig::timeout.sslHandshake exists but is
+// never read in 4.4.17). Also a marker, like the TCP one in WiFiClientImpl.h.
+#ifndef BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS
+#define BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS 3000
+#endif
+
 #if defined(USE_EMBED_SSL_ENGINE) && !defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_NANO_RP2040_CONNECT)
 #define EMBED_SSL_ENGINE_BASE_OVERRIDE override
 #else
@@ -368,7 +377,7 @@ private:
     size_t _recvapp_len;
     // Renameing from _timeout which also defined in parent's Stream class.
     unsigned long _timeout_ms = 15000;
-    unsigned long _handshake_timeout = 60000;
+    unsigned long _handshake_timeout = BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS; // BASILIENCE PATCH 2/3 (upstream: 60000)
     unsigned long _tcp_session_timeout = 0;
     unsigned long _session_ts = 0;
     bool _isSSLEnabled = false;

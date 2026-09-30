@@ -65,6 +65,17 @@ public:
     bool hasCredentials() const;
 
     bool isConnected() const;
+
+    // Non-blocking forced STA reconnect for a cloud outage that persists while
+    // the link still reports associated. Only drops the current association;
+    // the existing update() state machine then handles it exactly like any
+    // other link drop (CONNECTED -> RETRY_WAIT -> startConnectionAttempt()).
+    // Never erases credentials, never enters provisioning itself, never
+    // restarts. Returns false (and does nothing) unless currently CONNECTED
+    // with saved credentials and not in provisioning mode. Unrelated to the
+    // legacy blocking reconnect() above.
+    bool requestReconnect();
+
     bool isProvisioningMode() const;
     ProvisioningMode getProvisioningMode() const;
     bool consumeFirebaseResumePending();
@@ -160,6 +171,13 @@ private:
     static constexpr unsigned long AP_RECONNECT_INTERVAL = 30000;
 
     ProvisioningMode provisioningMode = ProvisioningMode::NONE;
+
+    // True from requestReconnect() (a firmware-forced cloud-recovery drop)
+    // until the saved network reassociates, the credentials are cleared, or
+    // manual provisioning is explicitly requested. While true, RETRY_WAIT
+    // keeps retrying the saved network and does not fall back to setup mode
+    // after RECOVERY_TIMEOUT. A normal link drop never sets it.
+    bool forcedRecoveryReconnectActive = false;
     bool manualReachabilityLogged = false;
     bool recoveryInProgress = false;
     bool apReconnectInProgress = false;

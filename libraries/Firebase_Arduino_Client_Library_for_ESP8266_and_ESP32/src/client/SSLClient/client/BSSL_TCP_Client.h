@@ -441,7 +441,7 @@ private:
     Client *_basic_client = nullptr;
     // Renameing from _timeout which also defined in parent's Stream class.
     unsigned long _timeout_ms = 15000;
-    unsigned long _handshake_timeout = 60000;
+    unsigned long _handshake_timeout = BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS; // BASILIENCE PATCH 3/3 (upstream: 60000; only re-applied by operator=)
     unsigned long _tcp_session_timeout = 0;
 
     char *mStreamLoad(Stream &stream, size_t size);

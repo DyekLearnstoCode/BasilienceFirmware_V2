@@ -62,12 +62,11 @@ struct SensorData
     bool ecFault = false;
 
     // True once SensorManager::readEC()'s SEPARATE calibration-plausibility
-    // fault detector (Config.h's EC_CAL_VOLTAGE_MARGIN_V) has CONFIRMED the
-    // computed EC is negative/non-finite, or the underlying voltage sits far
-    // outside the domain the EC_CAL_1_*/EC_CAL_2_* two-point line was
-    // actually fit against - a reading electrically ordinary enough that
-    // ecFault's own rail-proximity check above never flags it, yet still not
-    // a value the calibration model can be trusted to represent. Kept as its
+    // fault detector has CONFIRMED the computed EC is negative/non-finite -
+    // a reading electrically ordinary enough that ecFault's own
+    // rail-proximity check above never flags it, yet still not a value the
+    // DFRobot TDS-to-EC conversion (Calibration.h) can be trusted to
+    // represent. Kept as its
     // own field/streak rather than folded into ecFault above so the two
     // independent detectors' confirm/recovery debounces can never race each
     // other; applyEffectiveSensors() ORs both into the one published

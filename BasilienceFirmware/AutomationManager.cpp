@@ -32,6 +32,23 @@ namespace
         if (isnan(a) != isnan(b)) return true;
         return a != b;
     }
+
+    // Raw validity of the reading an automatic pH/EC DECISION is about to be
+    // made from. Same conditions SafetyManager's validPH()/validEC() start
+    // from, but WITHOUT their multi-tick debounce: that debounce exists so a
+    // single bad tick does not abort a running dose, whereas a decision must
+    // never be taken from an invalid value at all. Every comparison against
+    // NaN is false, so checking this first is what keeps a NaN reading from
+    // falling through a "value < min ? A : B" style ternary into the B branch.
+    bool isValidPhReading(float ph)
+    {
+        return isfinite(ph) && ph >= 0.0f && ph <= 14.0f;
+    }
+
+    bool isValidEcReading(float ec)
+    {
+        return isfinite(ec) && ec >= 0.0f;
+    }
 }
 
 void AutomationManager::begin()
@@ -344,13 +361,6 @@ void AutomationManager::update()
     // full reasoning and how ending a cycle mid-cooling safely returns the
     // pulse state machine to IDLE.
     updateCooling();
-
-    // Manual root fogging (processManualFogPairing()) must likewise run
-    // regardless of cultivation state, OperationRequest lifecycle, or RTC
-    // sync below - manual root-fogging is testable at any time, matching
-    // every other manual actuator - see item 11 of the confirmed Manual
-    // Mode audit.
-    processManualFogPairing();
 
     // Observes the active-cycle flag and acts on its transitions. Also runs
     // ahead of the operation lifecycle below so a chemistry dose that must not
@@ -1085,7 +1095,12 @@ void AutomationManager::changeState(SystemMode newMode)
         }
         else if (oldMode == STABILIZING_PH && newMode == NORMAL)
         {
-            Serial.print("PH COMPLETE | pH=");
+            // "COMPLETE" only when the operation really completed (the reading
+            // is inside the accepted range). A failure, safety abort, invalid
+            // sensor, low-water stop or cycle stop lands here too and must not
+            // read as success, e.g. "PH COMPLETE | pH=nan".
+            Serial.print(systemState.operationRequest.state == RequestState::COMPLETED
+                ? "PH COMPLETE | pH=" : "PH STOPPED, NOT COMPLETE | pH=");
             Serial.println(sensors.ph, 2);
         }
         else if (newMode == DOSING_EC)
@@ -1099,12 +1114,16 @@ void AutomationManager::changeState(SystemMode newMode)
         }
         else if (oldMode == STABILIZING_EC && newMode == NORMAL)
         {
-            Serial.print("EC COMPLETE | EC=");
+            // See the PH branch above.
+            Serial.print(systemState.operationRequest.state == RequestState::COMPLETED
+                ? "EC COMPLETE | EC=" : "EC STOPPED, NOT COMPLETE | EC=");
             Serial.println(sensors.ec, 2);
         }
         else if (oldMode == REFILLING && newMode == NORMAL)
         {
-            Serial.print("REFILL COMPLETE | level=");
+            // See the PH branch above.
+            Serial.print(systemState.operationRequest.state == RequestState::COMPLETED
+                ? "REFILL COMPLETE | level=" : "REFILL STOPPED, NOT COMPLETE | level=");
             Serial.print(sensors.waterLevelCm, 2);
             Serial.println("cm");
         }
@@ -1936,8 +1955,27 @@ void AutomationManager::updateCooling()
     }
     else if (temperatureBand == -1)
     {
+        // CONFIRMED BUG FIX (manual Peltier / circulation demand
+        // oscillation): temperatureBand is the AUTOMATIC cooling decision
+        // (water already <= coolerOffTemp, so automatic cooling doesn't need
+        // the Peltier) - it says nothing about whether an unrelated manual
+        // Peltier session is currently active. This branch runs every tick
+        // the water stays below coolerOffTemp, so clearing
+        // manualCoolingDemandActive here fired on every single tick during a
+        // manual Peltier run in cool water: validateCommand()'s PELTIER case
+        // (ActuatorManager.cpp) re-asserts the manual demand right back to
+        // true on the very next re-validation, producing the demonstrated
+        // 0->1/1->0 oscillation. It also directly contradicted this
+        // function's own documented design (the PELTIER manual-ownership
+        // comment above: the soft "water already within target" rule was
+        // deliberately removed for manual so an explicit manual command
+        // can't be silently overridden by the automatic target) and the
+        // "manualCoolingDemandActive is entirely unaffected by this" comment
+        // a few lines below in this same function. Only the automatic
+        // demand is this branch's concern; manual demand is released solely
+        // by its own dedicated paths (manual OFF, the manual Peltier
+        // deadline, a genuine safety rejection, or Manual Mode cleanup).
         coolingDemandActive = false;
-        setManualCoolingDemand(false, "released");
     }
 
     // Serial Monitor Focus Mode: [TEMP] is COOLING's own decision log.
@@ -2607,6 +2645,15 @@ bool AutomationManager::processPHCorrection()
     if(systemState.phSubsystemLocked)
         return false;
 
+    // Validity FIRST, before any threshold comparison or direction choice.
+    // alertState.phOutOfRange can still be latched from earlier valid
+    // readings, so it is not a substitute for checking the reading itself.
+    if(!isValidPhReading(sensors.ph))
+    {
+        logPHDecisionLine("[PH-BLOCK] pH unavailable");
+        return false;
+    }
+
     if(!alertState.phOutOfRange)
     {
         logPHDecisionLine(
@@ -2616,18 +2663,28 @@ bool AutomationManager::processPHCorrection()
         return false;
     }
 
+    // phOutOfRange is only the debounced trigger. It latches with
+    // PH_ALERT_HYSTERESIS, so after a low reading it stays true until pH
+    // reaches minPH + 0.1, i.e. it can still be true for readings that are
+    // already inside the acceptable range [minPH, maxPH]. The reading itself
+    // decides whether and which way to dose: below minPH -> PH_UP, above
+    // maxPH -> PH_DOWN, anywhere in between -> no correction. (Previously any
+    // reading not below minPH fell through to PH_DOWN, so 5.50 to 5.59 after
+    // a low episode started a PH_DOWN dose from inside the range.)
+    const bool phBelowRange = sensors.ph < systemState.minPH;
+    const bool phAboveRange = sensors.ph > systemState.maxPH;
+
+    if(!phBelowRange && !phAboveRange)
+        return false;
+
     if(!canStartNewPHCorrection())
     {
         logPHDecisionLine("[PH-BLOCK] pH unstable");
         return false;
     }
 
-    // sensors.ph is the stable-value filter's authoritative output (see
-    // SensorManager::applyEffectiveSensors()) - the same value phOutOfRange
-    // above was derived from, so this plain comparison against minPH can't
-    // disagree with the trigger it's gated behind.
     systemState.phDirection =
-        sensors.ph < systemState.minPH ? PH_UP : PH_DOWN;
+        phBelowRange ? PH_UP : PH_DOWN;
 
     systemState.phDoseTime =
         PH_DOSING_TIME;
@@ -2730,6 +2787,15 @@ bool AutomationManager::processECCorrection()
     if(systemState.ecSubsystemLocked)
         return false;
 
+    // Validity FIRST, before any threshold comparison or direction choice -
+    // see processPHCorrection()'s matching comment. NaN must never reach the
+    // dilution branch.
+    if(!isValidEcReading(sensors.ec))
+    {
+        logECDecisionLine("[EC-BLOCK] EC unavailable");
+        return false;
+    }
+
     if(!alertState.ecLow && !alertState.ecHigh)
     {
         logECDecisionLine(
@@ -2739,13 +2805,27 @@ bool AutomationManager::processECCorrection()
         return false;
     }
 
+    // ecLow/ecHigh are only the debounced trigger. They latch with
+    // EC_ALERT_HYSTERESIS, so ecLow stays true until EC reaches minEC + 0.1
+    // and ecHigh until it falls to maxEC - 0.1: both can still be true for a
+    // reading already inside [minEC, maxEC]. The reading itself decides
+    // whether and which way to correct: below minEC -> nutrient dose, above
+    // maxEC -> dilution, anywhere in between -> no correction. (Previously
+    // ecLow ? RAISE : DILUTE, so a latched ecHigh at 1.95 diluted from inside
+    // the range and a latched ecLow at 1.25 dosed from inside it.)
+    const bool ecBelowRange = sensors.ec < systemState.minEC;
+    const bool ecAboveRange = sensors.ec > systemState.maxEC;
+
+    if(!ecBelowRange && !ecAboveRange)
+        return false;
+
     if(!canStartNewECCorrection())
     {
         logECDecisionLine("[EC-BLOCK] EC unstable");
         return false;
     }
 
-    systemState.ecDirection = alertState.ecLow ? EC_RAISE : EC_DILUTE;
+    systemState.ecDirection = ecBelowRange ? EC_RAISE : EC_DILUTE;
 
     SafetyResult result = systemState.ecDirection == EC_RAISE
         ? safetyManager.canDoseEC()
@@ -3301,96 +3381,6 @@ void AutomationManager::processFogCycle()
             fogCycleOn = true;
             fogTimerStart = millis();
             activeFogStrategy = "";
-        }
-    }
-}
-
-// Manual root-fogging redesign: a normal Admin manual Fogger request
-// represents the complete root-fogging function (Fogger + root-zone Blower
-// together), not raw Fogger-only hardware testing. This does NOT touch
-// fogCycleOn/fogTimerStart/activeFogStrategy - the automatic fog-cycle
-// timer keeps running (or not) exactly as it already does under any other
-// manual override, so a manual root-fogging request can never start or
-// corrupt the automatic cycle's own state; ActuatorManager::
-// requestCommand()'s existing manual-outranks-automatic guard is what
-// prevents the automatic FOGGER/BLOWER commands from taking effect while
-// manually held.
-//
-// Reads FOGGER's own already-validated status this same tick (FOGGER
-// precedes BLOWER in ActuatorManager's array-index order, so by the time
-// this runs next tick its status already reflects that tick's
-// validateCommand() outcome, now gated by canFog() for manual too) rather
-// than blindly mirroring the request, so a rejected or not-yet-running
-// manual Fogger command never drags the Blower on with it.
-void AutomationManager::processManualFogPairing()
-{
-    const ActuatorStatus foggerStatus = actuatorManager.getStatus(FOGGER);
-    const bool foggerManuallyRunning =
-        foggerStatus.source == "manual" &&
-        foggerStatus.running &&
-        foggerStatus.state == ActuatorCommandState::RUNNING;
-
-    if (foggerManuallyRunning)
-    {
-        manualFogPurgeActive = false;
-        wasManualFoggerRunning = true;
-
-        // Base manual root-fogging blower speed is the same fixed
-        // automatic fogging speed (systemState.blowerSpeedPercent, default
-        // 65% - see Config.h). Existing fan-assisted environmental demand
-        // still takes priority for maximum airflow (100%):
-        //
-        // - Temperature: CONFIRMED FIX - compared directly against
-        //   systemState.hotFogTemperature (the same authoritative Hot
-        //   fogging threshold processFogCycle() uses to pick "hot" cadence,
-        //   >=32C by default), using this tick's live sensors.temperature.
-        //   Deliberately NOT highAirDemandActive: that's CANOPY_FAN's own,
-        //   differently-thresholded (>highAirTemp trigger /
-        //   <=airTempRelease release) hysteresis latch, which can sit well
-        //   below (or, once released, well after) the Hot fogging
-        //   threshold and would give the wrong 100%/65% decision here.
-        //   This check has no hysteresis of its own by design - a plain
-        //   >=/< comparison re-evaluated fresh every tick, exactly
-        //   matching how processFogCycle() itself selects hot/normal/cold
-        //   cadence. Gated on sensors.dhtAvailable so a stale/unavailable
-        //   reading is never treated as a fresh >=hotFogTemperature
-        //   reading - falls through to the humidity check (and otherwise
-        //   the 65% baseline) instead.
-        // - Humidity: unchanged, still highHumidityDemandActive (trigger
-        //   >75% RH / release <=70% RH, preserved as-is, including that it
-        //   stays latched at its last value while DHT is unavailable).
-        const bool freshHotAirTemp =
-            sensors.dhtAvailable && sensors.temperature >= systemState.hotFogTemperature;
-        const uint8_t rootBlowerSpeed =
-            (freshHotAirTemp || highHumidityDemandActive) ? 100 : systemState.blowerSpeedPercent;
-
-        actuatorManager.requestCommand(
-            BLOWER, true, "manual", millis(), rootBlowerSpeed);
-        return;
-    }
-
-    if (wasManualFoggerRunning)
-    {
-        // Manual Fogger just stopped (Admin request, its own manual deadline,
-        // or Manual Mode expiry) - begin the same BLOWER_PURGE_MS clearing
-        // purge the automatic fog cycle already performs, at a fixed 100%
-        // (see processFogCycle()'s matching purge comment), before turning
-        // the root blower off.
-        wasManualFoggerRunning = false;
-        manualFogPurgeActive = true;
-        manualFogPurgeStart = millis();
-    }
-
-    if (manualFogPurgeActive)
-    {
-        if (millis() - manualFogPurgeStart < BLOWER_PURGE_MS)
-        {
-            actuatorManager.requestCommand(BLOWER, true, "manual", millis(), 100);
-        }
-        else
-        {
-            manualFogPurgeActive = false;
-            actuatorManager.requestCommand(BLOWER, false, "manual", millis());
         }
     }
 }
@@ -4012,8 +4002,19 @@ bool AutomationManager::shouldAutoRefill() const
 // exactly as both trigger sites already required it.
 bool AutomationManager::autoRefillEligible() const
 {
-    return alertState.lowWater &&
-        sensors.refillStartConfirmed &&
+    // The CURRENT depth reading decides, not the latched alert. lowWater is
+    // strict (depth < start when it rises) yet stays true until depth is above
+    // start + WATER_LEVEL_CM_ALERT_HYSTERESIS, so it disagreed with the
+    // inclusive rule "depth <= start -> refill" at both ends: exactly
+    // refillStartLevelCm never raised it, and 2.1cm could still hold it.
+    // refillStartConfirmed already is the debounce (3 consecutive accepted
+    // echoes, the same count the alert used), so it replaces the alert here.
+    // It only refreshes once per accepted echo, so the live depth is checked
+    // as well, and isfinite() comes first so an invalid depth is never one
+    // comparison away from starting the solenoid.
+    return sensors.refillStartConfirmed &&
+        isfinite(sensors.waterLevelCm) &&
+        sensors.waterLevelCm <= systemState.refillStartLevelCm &&
         shouldAutoRefill();
 }
 
@@ -4218,9 +4219,77 @@ void AutomationManager::logECDecisionLine(const String& line)
     debugManager.logSafetyBlock(SafetyLogChannel::EC, "EC", reason);
 }
 
+bool AutomationManager::checkPhTestHold()
+{
+    const bool holdNow =
+        systemState.automationTestSubsystem == AutomationTestSubsystem::PH &&
+        sensorManager.isAutomationTestInputHeld();
+
+    if(holdNow)
+    {
+        if(!phTestHoldActive)
+        {
+            phTestHoldActive = true;
+            phTestHoldStartedAt = millis();
+            Serial.println("[TEST-HOLD] PH paused | mock input stale");
+            Serial.println("[TEST-HOLD] PH dosing outputs stopped");
+        }
+
+        // Reasserted every held tick (not just on entry) - cheap, and covers
+        // the independent esp_timer deadline (handleDosingPH()'s own
+        // forcedOffByDeadline check) or any other path leaving a pump
+        // commanded on right as the hold began.
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
+        return true;
+    }
+
+    if(!phTestHoldActive) return false;
+
+    // Hold just ended this tick - shift every PH timing reference forward by
+    // exactly how long it lasted, so the outage contributes zero elapsed
+    // time to dose duration, the stabilization settle window, and the
+    // overall correction-episode budget. This is the "pause" for each of
+    // these plain millis()-delta timers: nothing reads a duration across the
+    // hold without going through one of these three references first.
+    const unsigned long holdDuration = millis() - phTestHoldStartedAt;
+    systemState.stateStartTime += holdDuration;
+    systemState.correctionCycleStartAt += holdDuration;
+    if(phStabilizationCirculationConfirmedAt != 0)
+    {
+        phStabilizationCirculationConfirmedAt += holdDuration;
+    }
+    phTestHoldActive = false;
+
+    Serial.print("[TEST-HOLD] PH resumed | hold=");
+    Serial.print(holdDuration);
+    Serial.println("ms");
+    Serial.print("[TEST-HOLD] PH fresh value=");
+    Serial.print(sensors.ph, 2);
+    Serial.println(" | re-evaluating");
+
+    if(systemState.currentMode == DOSING_PH)
+    {
+        // Do not blindly resume dosing in the direction decided before the
+        // outage - force the same read-and-decide path STABILIZING_PH
+        // already uses for every redose, which picks in-range/redose/
+        // reverse-direction fresh from the current sensors.ph. changeState()
+        // resets phStabilizationCirculationConfirmedAt/stateStartTime for
+        // this fresh entry, superseding the shift above for those two.
+        actuatorManager.requestCommand(PH_UP_PUMP, false, "automatic", millis());
+        actuatorManager.requestCommand(PH_DOWN_PUMP, false, "automatic", millis());
+        changeState(STABILIZING_PH);
+        return true;
+    }
+
+    return false;
+}
+
 //handle ph dosing
 void AutomationManager::handleDosingPH()
 {
+    if(checkPhTestHold()) return;
+
     alertManager.update();
     logPHInputSummary();
 
@@ -4325,6 +4394,8 @@ void AutomationManager::handleDosingPH()
 //handle ph stabilization
 void AutomationManager::handleStabilizingPH()
 {
+    if(checkPhTestHold()) return;
+
     alertManager.update();
     logPHInputSummary();
 
@@ -4397,6 +4468,13 @@ void AutomationManager::handleStabilizingPH()
             millis() - systemState.correctionCycleStartAt >=
             PH_EC_CORRECTION_STALL_TIMEOUT_MS;
 
+        // SafetyManager tolerates a few invalid ticks before canDosePH()
+        // reports SENSOR_FAULT (and the check at the top of this function
+        // aborts). Until then the reading is NaN, and NaN must not be judged
+        // "reached" or "not reached": skip every reading-based decision below
+        // for the tick. The time budget above is still enforced.
+        const bool phReadingValid = isValidPhReading(sensors.ph);
+
         // Stable-hold bookkeeping: tracks how long the reading has sat
         // continuously inside SensorManager's own stability window,
         // independent of the trend re-sample below - this eventually
@@ -4419,7 +4497,8 @@ void AutomationManager::handleStabilizingPH()
             systemState.phStableCheckpointPublished = false;
         }
 
-        if(systemState.phStableSince != 0 &&
+        if(phReadingValid &&
+           systemState.phStableSince != 0 &&
            !systemState.phStableCheckpointPublished &&
            millis() - systemState.phStableSince >=
            PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
@@ -4448,10 +4527,24 @@ void AutomationManager::handleStabilizingPH()
                 // still-configurable setting used only by manual/override
                 // dosing (see ActuatorManager's runningValidation check),
                 // which this spec paragraph doesn't describe.
+                //
+                // AUTOMATIC: success means the CURRENT valid reading is inside
+                // the whole accepted range, whichever way this correction was
+                // pushing. Crossing only the near boundary (PH_UP reaching
+                // minPH, or PH_DOWN reaching maxPH) is not success when the
+                // dose has overshot: PH_UP ending at 7.0 is not an acceptable
+                // pH. An overshoot falls through to the retry branch below,
+                // which reverses direction inside the same time budget.
+                // A MANUAL (admin-requested) correction keeps its original
+                // directional completion: it does one requested action and
+                // must not start reversing on its own.
                 const bool targetReached =
-                    systemState.phDirection == PH_UP
-                        ? sensors.ph >= systemState.minPH
-                        : sensors.ph <= systemState.maxPH;
+                    systemState.correctionMode == CorrectionMode::AUTOMATIC
+                        ? (sensors.ph >= systemState.minPH &&
+                           sensors.ph <= systemState.maxPH)
+                        : (systemState.phDirection == PH_UP
+                            ? sensors.ph >= systemState.minPH
+                            : sensors.ph <= systemState.maxPH);
 
                 if(targetReached)
                 {
@@ -4503,7 +4596,8 @@ void AutomationManager::handleStabilizingPH()
         // actively moving, before it ever settles into a stable plateau
         // (the block above only fires once SensorManager's own window
         // confirms no movement for a full stability-window duration).
-        if(millis() - systemState.phLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
+        if(phReadingValid &&
+           millis() - systemState.phLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
         {
             systemState.phLastTrendCheckAt = millis();
 
@@ -4805,6 +4899,12 @@ void AutomationManager::handleStabilizingEC()
             millis() - systemState.correctionCycleStartAt >=
             PH_EC_CORRECTION_STALL_TIMEOUT_MS;
 
+        // See handleStabilizingPH()'s matching comment: an invalid (NaN)
+        // reading is never judged reached / not reached, and SafetyManager's
+        // debounced SENSOR_FAULT abort at the top of this function is what
+        // ends the correction if it stays invalid.
+        const bool ecReadingValid = isValidEcReading(sensors.ec);
+
         // Stable-hold bookkeeping - see handleStabilizingPH()'s matching
         // comment. Automation-only since Stage 1 of the sensor architecture
         // redesign - Firebase telemetry no longer holds on this timer.
@@ -4821,7 +4921,8 @@ void AutomationManager::handleStabilizingEC()
             systemState.ecStableCheckpointPublished = false;
         }
 
-        if(systemState.ecStableSince != 0 &&
+        if(ecReadingValid &&
+           systemState.ecStableSince != 0 &&
            !systemState.ecStableCheckpointPublished &&
            millis() - systemState.ecStableSince >=
            PH_EC_STABLE_HOLD_FOR_PUBLISH_MS)
@@ -4846,10 +4947,20 @@ void AutomationManager::handleStabilizingEC()
                 // completion here. ecTargetMin/ecTargetMax remain a separate,
                 // still-configurable setting used only by manual/override
                 // dosing, which this spec paragraph does not describe.
+                //
+                // AUTOMATIC: success means the CURRENT valid reading is inside
+                // the whole accepted range, whichever way this correction was
+                // pushing - see handleStabilizingPH()'s matching comment. An
+                // overshoot falls through to the retry branch below, which
+                // reverses direction inside the same time budget. A MANUAL
+                // correction keeps its original directional completion.
                 const bool targetReached =
-                    systemState.ecDirection == EC_RAISE
-                        ? sensors.ec >= systemState.minEC
-                        : sensors.ec <= systemState.maxEC;
+                    systemState.correctionMode == CorrectionMode::AUTOMATIC
+                        ? (sensors.ec >= systemState.minEC &&
+                           sensors.ec <= systemState.maxEC)
+                        : (systemState.ecDirection == EC_RAISE
+                            ? sensors.ec >= systemState.minEC
+                            : sensors.ec <= systemState.maxEC);
 
                 // Water-level dilution-progress check (report-only - see
                 // ecDilutionNoRiseStreak's own comment in Types.h). The
@@ -4905,6 +5016,15 @@ void AutomationManager::handleStabilizingEC()
                     // handleStabilizingPH()'s matching comment.
                     systemState.ecAttempts++;
 
+                    // Not in range yet. Continue the same way if still on the
+                    // near side, reverse if the dose overshot past the far
+                    // boundary (the pH branch does the same). Decided BEFORE
+                    // the dilution baseline below, which depends on it.
+                    if(systemState.ecDirection == EC_RAISE && sensors.ec > systemState.maxEC)
+                        systemState.ecDirection = EC_DILUTE;
+                    else if(systemState.ecDirection == EC_DILUTE && sensors.ec < systemState.minEC)
+                        systemState.ecDirection = EC_RAISE;
+
                     systemState.firstCorrectionCycle = false;
 
                     // Fresh baseline for the next interval - the streak
@@ -4925,7 +5045,8 @@ void AutomationManager::handleStabilizingEC()
         }
 
         // Trend re-sample - see handleStabilizingPH()'s matching comment.
-        if(millis() - systemState.ecLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
+        if(ecReadingValid &&
+           millis() - systemState.ecLastTrendCheckAt >= PH_EC_RECHECK_INTERVAL_MS)
         {
             systemState.ecLastTrendCheckAt = millis();
 
@@ -4964,6 +5085,12 @@ void AutomationManager::handleStabilizingEC()
                     if(!budgetExpired && canStartNewECCorrection())
                     {
                         systemState.ecAttempts++;
+
+                        // Same direction rule as the plateau-retry branch above.
+                        if(systemState.ecDirection == EC_RAISE && sensors.ec > systemState.maxEC)
+                            systemState.ecDirection = EC_DILUTE;
+                        else if(systemState.ecDirection == EC_DILUTE && sensors.ec < systemState.minEC)
+                            systemState.ecDirection = EC_RAISE;
 
                         systemState.firstCorrectionCycle = false;
 

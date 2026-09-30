@@ -100,6 +100,13 @@ void WiFiManager::begin()
     // no other cached fallback able to take effect.
     WiFi.persistent(false);
 
+    // A/B test: disable STA modem sleep (WIFI_PS_NONE). Set here, before any
+    // WiFi.mode() call, because the core stores this as a static preference
+    // and re-applies it on every ARDUINO_EVENT_WIFI_STA_START (STA.cpp) - so
+    // it covers the boot connection, every retry/reconnect, and AP_STA
+    // provisioning/self-heal, not just the first association.
+    WiFi.setSleep(false);
+
     preferences.begin("wifi", false);
     firebaseResumePending = preferences.getBool("resumeFirebase", false);
     if (firebaseResumePending)
@@ -186,6 +193,10 @@ void WiFiManager::enterConnectedState()
     // outage starts measuring from scratch.
     recoveryStartedAt = 0;
     systemState.wifiConnected = true;
+
+    // A forced cloud-recovery reconnect has succeeded; any later link drop is
+    // an ordinary one again, with the normal setup-mode fallback.
+    forcedRecoveryReconnectActive = false;
 
     if (recoveryInProgress)
     {
@@ -522,6 +533,9 @@ void WiFiManager::clearCredentials()
     ssid.clear();
     password.clear();
 
+    // No saved network left to retry - the forced-recovery hold is moot.
+    forcedRecoveryReconnectActive = false;
+
     Serial.println("WiFi credentials cleared.");
 }
 
@@ -534,6 +548,22 @@ bool WiFiManager::hasCredentials() const
 bool WiFiManager::isConnected() const
 {
     return WiFi.status() == WL_CONNECTED;
+}
+
+bool WiFiManager::requestReconnect()
+{
+    if (isProvisioningMode() || !hasCredentials()) return false;
+    if (wifiState != WifiState::CONNECTED || WiFi.status() != WL_CONNECTED) return false;
+
+    // disconnect(false, false): radio stays on, no stored AP config is
+    // erased, and the in-memory/NVS credentials are untouched. The next
+    // update() sees the link down and runs the ordinary CONNECTED ->
+    // RETRY_WAIT -> startConnectionAttempt() path with the saved network.
+    // Marked forced so that path keeps retrying the saved network instead of
+    // falling back to setup mode after RECOVERY_TIMEOUT - see update().
+    forcedRecoveryReconnectActive = true;
+    disconnectRadio(false, false);
+    return true;
 }
 
 bool WiFiManager::isProvisioningMode() const
@@ -762,7 +792,12 @@ void WiFiManager::update()
             // unreachable for the whole recovery window hands over to the
             // existing provisioning AP, so a device whose stored SSID/password
             // has gone stale can still be recovered without a re-flash.
-            if (recoveryStartedAt != 0 &&
+            // Skipped while a forced cloud-recovery reconnect is in progress:
+            // those credentials were associated moments before the firmware
+            // dropped the link itself, so they are not stale - keep retrying
+            // the saved network on the RECONNECT_INTERVAL below instead.
+            if (!forcedRecoveryReconnectActive &&
+                recoveryStartedAt != 0 &&
                 now - recoveryStartedAt >= RECOVERY_TIMEOUT)
             {
                 Serial.println("[WIFI] Saved network unavailable");
@@ -803,6 +838,10 @@ void WiFiManager::enterAutomaticProvisioningMode()
 
 void WiFiManager::startManualProvisioning()
 {
+    // A genuine user/app request for setup mode always wins over a forced
+    // cloud-recovery reconnect.
+    forcedRecoveryReconnectActive = false;
+
     if (provisioningMode == ProvisioningMode::MANUAL) return;
     if (isProvisioningMode()) stopAP();
     Serial.println("[WIFI] Provisioning mode: MANUAL");
