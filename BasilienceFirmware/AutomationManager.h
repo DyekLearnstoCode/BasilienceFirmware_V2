@@ -139,6 +139,18 @@ private:
     void completeRefillSuccess();
     int8_t lastWaterTemperatureBand = -2;
     bool coolingDemandActive = false;
+    // Latched type of the current automatic cooling episode - see
+    // updateCooling(). Chosen when the episode starts, kept until it ends.
+    enum class CoolingEpisodeMode : uint8_t
+    {
+        NONE,
+        NORMAL_PREVENTIVE,
+        HIGH_TEMP_RECOVERY
+    };
+    CoolingEpisodeMode coolingEpisodeMode = CoolingEpisodeMode::NONE;
+    // False only between the end of a HIGH_TEMP_RECOVERY episode and the
+    // water next dropping below highWaterTemp.
+    bool preventiveCoolingArmed = true;
     bool manualCoolingDemandActive = false;
 
     // Pulse-cooling task: FILL/FLUSH-internal sub-phase and when it started.

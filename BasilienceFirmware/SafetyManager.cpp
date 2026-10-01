@@ -255,33 +255,14 @@ SafetyResult SafetyManager::canFog() const
         return SafetyResult::SENSOR_FAULT;
     }
 
-    // Cooling/fogging architecture update: nutrient-solution temperature
-    // above the maximum acceptable ceiling (systemState.maxWaterTemp, 28.0C
-    // default) suspends root fogging as a safety response, independent of
-    // cooling's own automatic-Peltier gate below - the single authoritative
-    // fogging gate the task calls for, not a check scattered into
-    // AutomationManager::processFogCycle()'s own state machine. Deliberately
-    // no separate validWaterTemperature()/SENSOR_FAULT check here: an
-    // invalid (NaN) reading makes this comparison false by IEEE-754
-    // definition, so an untrustworthy DS18B20 does not itself suspend
-    // fogging through this gate - DS18B20 validity continues to affect only
-    // cooling (SafetyManager::canCool()). Strict > (not >=): exactly 28.0C
-    // is still the normal "allowed" side, matching the existing
-    // waterTempOutOfRange alert's own > comparison
-    // (AlertManager::updateWaterTemperatureAlert()) - only a genuine
-    // excursion ABOVE the ceiling suspends fogging. No separate release
-    // hysteresis is added for the resume condition (waterTemp <=
-    // maxWaterTemp) - canFog() is already re-evaluated fresh every tick with
-    // a plain threshold for every other condition here (pH/EC/water level
-    // all use plain thresholds, no decision-layer hysteresis - see the pH
-    // comment below), so a different pattern for this one check would be
-    // inconsistent with the existing architecture, not a missing margin.
-    if(sensors.waterTemp > systemState.maxWaterTemp)
-    {
-        return SafetyResult::HIGH_WATER_TEMP;
-    }
+    // Water temperature is deliberately NOT a fogging gate. A hot reservoir is
+    // handled by monitoring, the waterTempOutOfRange alert and automatic
+    // Peltier/circulation cooling (canCool()/updateCooling()), none of which
+    // depend on this function. Suppressing fogging for as long as the water
+    // stays hot would stop the root-zone function the whole system exists for
+    // whenever the cooler cannot pull the temperature down quickly.
 
-    // pH/EC validity and in-range checks were REMOVED from this gate: root
+    // pH/EC validity and in-range checks are NOT part of this gate: root
     // fogging is what keeps the roots alive, and a chemistry fault (probe
     // failure, a correction that exhausted its budget, an empty dosing
     // bottle) must not by itself switch it off for as long as the fault
@@ -289,24 +270,22 @@ SafetyResult SafetyManager::canFog() const
     // is blocked by canDosePH()/canDoseEC()/canDiluteEC(), and the pH/EC
     // alerts and subsystem locks still raise the fault. What stays here are
     // the genuine fogging safety gates: safety lock, water level
-    // validity/low water, water temperature above the maximum, and the
-    // dosing/mixing window below.
+    // validity/low water, and the active-correction window below.
 
-    // Still block fogging while a correction is actively dosing or during
-    // the initial silent settle window (the just-dosed solution is still
-    // mixing), and let it resume once handleStabilizingPH()/
-    // handleStabilizingEC() mark themselves purely watching
-    // (phWatchPhaseActive/ecWatchPhaseActive). A mode gate, not a range
-    // gate: a correction that fails or completes returns the mode to
-    // NORMAL, which releases it regardless of the reading.
+    // Fogging is held off for the ENTIRE active correction episode: dosing
+    // AND the whole stabilization state (the silent settle window and the
+    // watch phase that follows it). A mode gate, not a range gate: a
+    // correction that completes, fails, times out or locks its subsystem
+    // returns the mode to NORMAL, which releases fogging regardless of
+    // whether the reading is still out of range.
     if(systemState.currentMode == DOSING_PH ||
-       (systemState.currentMode == STABILIZING_PH && !systemState.phWatchPhaseActive))
+       systemState.currentMode == STABILIZING_PH)
     {
         return SafetyResult::INVALID_PH;
     }
 
     if(systemState.currentMode == DOSING_EC ||
-       (systemState.currentMode == STABILIZING_EC && !systemState.ecWatchPhaseActive))
+       systemState.currentMode == STABILIZING_EC)
     {
         return SafetyResult::INVALID_EC;
     }

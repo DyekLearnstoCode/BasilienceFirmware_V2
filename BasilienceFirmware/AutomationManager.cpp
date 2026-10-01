@@ -367,6 +367,43 @@ void AutomationManager::update()
     // continue is stopped before its state handler can command a pump.
     updateCultivationGate();
 
+    // Grow-light RTC scheduling is independent of the chemistry/refill state
+    // machine and of cloud connectivity. It runs here - ahead of the operation
+    // lifecycle and RTC-sync early returns below - so it is evaluated every
+    // tick in every state (SENSOR_STABILIZATION, STARTUP, NORMAL, REFILLING,
+    // DOSING/STABILIZING_PH/EC), not only from handleNormal(). Inputs are all
+    // local: the cached cultivation flag (NVS), the DS3231 RTC and NVS
+    // settings. Manual ownership is untouched: ActuatorManager::requestCommand()
+    // drops an automatic request while the light is manually held, and
+    // handleCultivationPaused() still forces it OFF with no active cycle.
+    // Isolated GROW_LIGHT test mode keeps its previous no-cycle-required
+    // behaviour. Skipped only while the global safety lock owns the actuators.
+    if(systemState.currentMode != SAFETY_LOCK &&
+       automationAllowed(AutomationTestSubsystem::GROW_LIGHT) &&
+       (harvestScheduleCache.isActive() ||
+        systemState.automationTestSubsystem == AutomationTestSubsystem::GROW_LIGHT))
+    {
+        updateGrowLightSchedule();
+    }
+
+    // Canopy-fan climate control is independent support automation: it
+    // follows only air temperature/humidity (handleCanopyClimate(), logic
+    // unchanged) and is NOT coupled to the Fogger, root Blower, pH/EC state,
+    // water temperature, Peltier/cooling or Firebase. Like the grow light it
+    // is evaluated every tick in every FSM state, ahead of the operation
+    // lifecycle early returns, while a cultivation cycle is active (or
+    // isolated CANOPY test mode). Manual ownership is untouched:
+    // requestCommand() drops this automatic request while the fan is
+    // manually held in Manual Mode; with no active cycle
+    // handleCultivationPaused() still commands it OFF.
+    if(systemState.currentMode != SAFETY_LOCK &&
+       automationAllowed(AutomationTestSubsystem::CANOPY) &&
+       (harvestScheduleCache.isActive() ||
+        systemState.automationTestSubsystem == AutomationTestSubsystem::CANOPY))
+    {
+        handleCanopyClimate();
+    }
+
     //--------------------------------------------------
     // Operation lifecycle
     //--------------------------------------------------
@@ -1454,11 +1491,8 @@ void AutomationManager::handleStartup()
 //Normal Operation
 void AutomationManager::handleNormal()
 {
-    if(automationAllowed(AutomationTestSubsystem::GROW_LIGHT))
-    {
-        updateGrowLightSchedule();
-    }
-
+    // Grow-light scheduling no longer lives here: it is reconciled every
+    // update() tick, independent of the FSM state (see update()).
     alertManager.update();
 
     // Diagnostics only - see the header's own comment. No-ops unless
@@ -1470,11 +1504,8 @@ void AutomationManager::handleNormal()
     const bool fogCycleAllowed =
         fogControllerAllowed && validateNormalOperation();
 
-    if(automationAllowed(AutomationTestSubsystem::CANOPY))
-    {
-        handleCanopyClimate();
-    }
-
+    // Canopy-fan climate control is reconciled every update() tick, independent
+    // of the FSM state (see update()).
     // Automatic re-arm for a max-attempt bounded-refill failure lock. The
     // only place that ever sets refillSubsystemLocked for a REFILL
     // operation is handleBoundedAutomaticRefill()'s MAX_REFILL_ATTEMPTS
@@ -1776,15 +1807,9 @@ bool AutomationManager::validateNormalOperation()
                         Serial.print(" <= ");
                         Serial.println(systemState.refillStartLevelCm, 2);
                         break;
-                    case SafetyResult::HIGH_WATER_TEMP:
-                        Serial.print("water temperature above maximum: ");
-                        Serial.print(sensors.waterTemp, 2);
-                        Serial.print(" > ");
-                        Serial.println(systemState.maxWaterTemp, 2);
-                        break;
                     // canFog() only reports these while a pH/EC correction is
-                    // actively dosing or still in its silent mixing window -
-                    // a pH/EC reading being out of range no longer blocks fogging.
+                    // actively dosing or stabilizing (the whole active episode) -
+                    // a pH/EC reading being out of range alone never blocks fogging.
                     case SafetyResult::INVALID_PH:
                         Serial.println("pH correction dosing/mixing in progress");
                         break;
@@ -1826,21 +1851,9 @@ bool AutomationManager::validateNormalOperation()
     diagnosticInitialized = true;
     lastDiagnosticResult = SafetyResult::SAFE;
 
-    // REMOVED (cooling/fogging architecture update, confirmed design):
-    // fogging used to also stay off for the ENTIRE duration
-    // coolingDemandActive was true - the whole band from the preventive
-    // cooling trigger down to the release threshold, not just above the
-    // 28C safety ceiling. That directly contradicted the confirmed design:
-    // normal cooling between the preventive trigger (26.5C) and the
-    // maximum (28C) must NOT suspend the programmed fog cadence - cooling
-    // and fogging are independent through that whole band. The only
-    // water-temperature condition that suspends fogging now is
-    // SafetyManager::canFog()'s own SafetyResult::HIGH_WATER_TEMP check
-    // (waterTemp > maxWaterTemp, the separate 28C safety ceiling), already
-    // evaluated above via the `result` this function returned early on if
-    // unsafe - so fogging suspension above 28C is still fully enforced,
-    // just through the single authoritative gate instead of this second,
-    // broader, now-incorrect one.
+    // Water temperature never suspends fogging (neither the cooling band
+    // nor the 28C alert ceiling): cooling, the waterTempOutOfRange alert
+    // and fogging are fully independent. See SafetyManager::canFog().
 
     // canFog() already confirmed no dosing/mixing window is active (pH/EC
     // being in range is deliberately NOT part of that gate). A
@@ -1890,9 +1903,9 @@ void AutomationManager::updateCooling()
     //     "Water Temperature" maximum in the target-range sense, but no
     //     longer feeds cooling's own thresholds - now used exclusively as
     //     the separate upper SAFETY ceiling (28.0C default): the
-    //     waterTempOutOfRange alert's own threshold, and (as of this
-    //     change) SafetyManager::canFog()'s water-temperature suspension
-    //     gate. 28C is "is this acceptable at all", 26.5/25.5C are "should
+    //     waterTempOutOfRange alert threshold only; it does NOT gate
+    //     fogging (SafetyManager::canFog() has no water-temperature check).
+    //     28C is "is this acceptable at all", 26.5/25.5C are "should
     //     the cooler be running right now" - genuinely different
     //     questions, no longer sharing one number.
     // Both highWaterTemp/coolerOffTemp are NO LONGER overwritten from
@@ -1936,46 +1949,96 @@ void AutomationManager::updateCooling()
         debugManager.logSafetyBlock(SafetyLogChannel::COOL, "COOL", "");
     }
 
-    // Original if/else-if/else-if branching, unchanged - only the two
-    // setManualCoolingDemand() calls were routed through the logged setter
-    // (Serial Diagnostics / Observability pass, section 7) instead of a
-    // direct field assignment, so each edge is visible the same way the F4
-    // fix's own clear is. Same values written either way.
+    // Two-tier cooling episodes. The episode type is LATCHED when the episode
+    // starts (coolingEpisodeMode) and its release target is fixed for that
+    // episode - it is never recomputed from the current temperature, so a
+    // recovery that began above the ceiling cannot silently turn into a
+    // preventive run toward coolerOffTemp. Only coolingDemandActive (consumed,
+    // unchanged, by the FILL/COOL_SOAK/FLUSH pulse state machine) is driven here.
+    //   HIGH_TEMP_RECOVERY: starts when waterTemp > maxWaterTemp (28.0C),
+    //     releases at waterTemp <= maxWaterTemp.
+    //   NORMAL_PREVENTIVE:  starts when waterTemp >= highWaterTemp (26.5C)
+    //     while armed, releases at waterTemp <= coolerOffTemp (25.5C).
+    // Re-arm: NORMAL_PREVENTIVE is disarmed when a HIGH_TEMP_RECOVERY episode
+    // ends and is re-armed only once waterTemp falls below highWaterTemp
+    // (26.5C), so the recovery's own end point (28.0C, above 26.5C) cannot
+    // chain straight into a preventive episode. A new reading above 28.0C
+    // always starts a fresh HIGH_TEMP_RECOVERY regardless of arming.
+    // manualCoolingDemandActive is deliberately untouched by episode release:
+    // it is released only by its own paths (manual OFF, manual Peltier
+    // deadline, a genuine safety rejection, or Manual Mode cleanup).
+    const float waterTemp = sensors.waterTemp;
     if (!automaticCoolingAllowed || coolingSafety != SafetyResult::SAFE)
     {
         coolingDemandActive = false;
+        coolingEpisodeMode = CoolingEpisodeMode::NONE;
         if (coolingSafety != SafetyResult::SAFE)
         {
             setManualCoolingDemand(false, "cooling unsafe");
         }
     }
-    else if (temperatureBand == 1)
+    else
     {
-        coolingDemandActive = true;
-    }
-    else if (temperatureBand == -1)
-    {
-        // CONFIRMED BUG FIX (manual Peltier / circulation demand
-        // oscillation): temperatureBand is the AUTOMATIC cooling decision
-        // (water already <= coolerOffTemp, so automatic cooling doesn't need
-        // the Peltier) - it says nothing about whether an unrelated manual
-        // Peltier session is currently active. This branch runs every tick
-        // the water stays below coolerOffTemp, so clearing
-        // manualCoolingDemandActive here fired on every single tick during a
-        // manual Peltier run in cool water: validateCommand()'s PELTIER case
-        // (ActuatorManager.cpp) re-asserts the manual demand right back to
-        // true on the very next re-validation, producing the demonstrated
-        // 0->1/1->0 oscillation. It also directly contradicted this
-        // function's own documented design (the PELTIER manual-ownership
-        // comment above: the soft "water already within target" rule was
-        // deliberately removed for manual so an explicit manual command
-        // can't be silently overridden by the automatic target) and the
-        // "manualCoolingDemandActive is entirely unaffected by this" comment
-        // a few lines below in this same function. Only the automatic
-        // demand is this branch's concern; manual demand is released solely
-        // by its own dedicated paths (manual OFF, the manual Peltier
-        // deadline, a genuine safety rejection, or Manual Mode cleanup).
-        coolingDemandActive = false;
+        if (waterTemp < systemState.highWaterTemp)
+        {
+            preventiveCoolingArmed = true;
+        }
+
+        if (!coolingDemandActive)
+        {
+            coolingEpisodeMode = CoolingEpisodeMode::NONE;
+
+            if (waterTemp > systemState.maxWaterTemp)
+            {
+                coolingEpisodeMode = CoolingEpisodeMode::HIGH_TEMP_RECOVERY;
+                coolingDemandActive = true;
+            }
+            else if (waterTemp >= systemState.highWaterTemp && preventiveCoolingArmed)
+            {
+                coolingEpisodeMode = CoolingEpisodeMode::NORMAL_PREVENTIVE;
+                coolingDemandActive = true;
+            }
+
+            if (coolingDemandActive && debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+            {
+                const bool recovery = coolingEpisodeMode == CoolingEpisodeMode::HIGH_TEMP_RECOVERY;
+                debugManager.printLogPrefix("COOL");
+                Serial.print("START ");
+                Serial.print(recovery ? "HIGH_TEMP_RECOVERY" : "NORMAL_PREVENTIVE");
+                Serial.print(" | WT=");
+                Serial.print(waterTemp, 1);
+                Serial.print("C release=");
+                Serial.print(recovery ? systemState.maxWaterTemp : systemState.coolerOffTemp, 1);
+                Serial.println("C");
+            }
+        }
+        else
+        {
+            const bool recovery = coolingEpisodeMode == CoolingEpisodeMode::HIGH_TEMP_RECOVERY;
+            const float releaseTemp = recovery ? systemState.maxWaterTemp : systemState.coolerOffTemp;
+
+            if (waterTemp <= releaseTemp)
+            {
+                coolingDemandActive = false;
+                coolingEpisodeMode = CoolingEpisodeMode::NONE;
+                if (recovery)
+                {
+                    preventiveCoolingArmed = false;
+                }
+
+                if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                {
+                    debugManager.printLogPrefix("COOL");
+                    Serial.print("STOP ");
+                    Serial.print(recovery ? "HIGH_TEMP_RECOVERY" : "NORMAL_PREVENTIVE");
+                    Serial.print(" | WT=");
+                    Serial.print(waterTemp, 1);
+                    Serial.print("C release=");
+                    Serial.print(releaseTemp, 1);
+                    Serial.println("C");
+                }
+            }
+        }
     }
 
     // Serial Monitor Focus Mode: [TEMP] is COOLING's own decision log.
@@ -1990,35 +2053,10 @@ void AutomationManager::updateCooling()
 
     if (temperatureBand != lastWaterTemperatureBand)
     {
-        // Serial Diagnostics / Observability pass (section 8): START/STOP are
-        // the same edge this [TEMP] block already detects (temperatureBand
-        // crossing highWaterTemp/coolerOffTemp) - reformatted/promoted to
-        // LEVEL_NORMAL so a cooling episode's boundaries are visible without
-        // needing the raw [TEMP]/COOLING category enabled. The original
-        // [TEMP] lines are unchanged, at LEVEL_VERBOSE, for deeper tracing.
-        if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-        {
-            if (temperatureBand == 1 && automaticCoolingAllowed &&
-                coolingSafety == SafetyResult::SAFE)
-            {
-                debugManager.printLogPrefix("COOL");
-                Serial.print("START | WT=");
-                Serial.print(sensors.waterTemp, 1);
-                Serial.print("C trigger=");
-                Serial.print(systemState.highWaterTemp, 1);
-                Serial.println("C");
-            }
-            else if (temperatureBand == -1)
-            {
-                debugManager.printLogPrefix("COOL");
-                Serial.print("STOP | WT=");
-                Serial.print(sensors.waterTemp, 1);
-                Serial.print("C release=");
-                Serial.print(systemState.coolerOffTemp, 1);
-                Serial.println("C");
-            }
-        }
 
+        // Cooling episode START/STOP (with the latched episode mode) is
+        // logged where the episode actually starts/ends, above - the band
+        // edge here only drives the raw [TEMP] trace below.
         // dbgCoolingDecision (shouldPrintDebug(COOLING)) already requires
         // LEVEL_VERBOSE on its own when no subsystem is isolated, and stays
         // unconditionally true during an isolated COOLING bench test
@@ -2030,10 +2068,9 @@ void AutomationManager::updateCooling()
             Serial.print("[TEMP] water="); Serial.print(sensors.waterTemp, 2);
             Serial.print(" high="); Serial.print(systemState.highWaterTemp, 2);
             Serial.print(" coolerOff="); Serial.println(systemState.coolerOffTemp, 2);
-            if (temperatureBand == 1 && automaticCoolingAllowed &&
-                coolingSafety == SafetyResult::SAFE)
+            if (coolingDemandActive)
                 Serial.println("[TEMP] Peltier requested");
-            else if (temperatureBand == -1 || coolingSafety != SafetyResult::SAFE)
+            else
                 Serial.println("[TEMP] Peltier OFF requested");
         }
         lastWaterTemperatureBand = temperatureBand;
@@ -2264,7 +2301,7 @@ void AutomationManager::updateCooling()
 // cooling - this function only decides what that place should do next tick.
 //
 // Deliberately reuses existing mechanisms instead of inventing new ones:
-//   - coolingDemandActive/systemState.coolerOffTemp's existing hysteresis
+//   - coolingDemandActive (episode start/release decided in updateCooling() from the latched CoolingEpisodeMode)
 //     (computed just above in updateCooling(), unchanged) decides WHEN a
 //     cycle should be running at all and when FLUSH has released - not
 //     re-implemented here.
@@ -2547,8 +2584,8 @@ void AutomationManager::updateCoolingPulseStateMachine(bool automaticCoolingAllo
                     if (millis() - coolingPulsePhaseStartedAt >= COOLING_PULSE_FLUSH_DURATION_MS_TEMP)
                     {
                         // Reuse the existing hysteresis flag (coolingDemandActive,
-                        // computed once above from sensors.waterTemp vs.
-                        // systemState.coolerOffTemp) rather than re-comparing
+                        // computed once above from the latched episode type: release at
+                        // maxWaterTemp for HIGH_TEMP_RECOVERY, coolerOffTemp for NORMAL_PREVENTIVE) rather than re-comparing
                         // the reading ourselves - one definition of the
                         // release threshold.
                         if (!coolingDemandActive)
@@ -4446,23 +4483,11 @@ void AutomationManager::handleStabilizingPH()
        millis() - phStabilizationCirculationConfirmedAt >=
        PH_STABILIZATION_TIME)
     {
-        // Past the initial silent settle window and purely watching now -
-        // let fogging resume (SafetyManager::canFog() only allows it once
-        // this is true AND pH is confirmed within [minPH, maxPH], which
-        // canFog() checks independently). Mirrors handleNormal()'s own
-        // fogControllerAllowed/validateNormalOperation()/processFogCycle()
-        // sequence - reusing validateNormalOperation() here re-derives
-        // canFog() (and therefore this same watch-phase/range check) fresh
-        // every tick, so fogging still stops immediately if pH drifts back
-        // out of range or a redose starts.
+        // Past the initial silent settle window. Published for the app only
+        // (phWatchPhaseActive); it no longer influences fogging - Fogger/Blower
+        // stay OFF for this whole state (SafetyManager::canFog()) and resume
+        // only when the episode returns to NORMAL.
         systemState.phWatchPhaseActive = true;
-
-        const bool fogControllerAllowed =
-            automationAllowed(AutomationTestSubsystem::FOGGING);
-        if(fogControllerAllowed && validateNormalOperation())
-        {
-            processFogCycle();
-        }
 
         const bool budgetExpired =
             millis() - systemState.correctionCycleStartAt >=
@@ -4884,16 +4909,11 @@ void AutomationManager::handleStabilizingEC()
     {
         alertManager.update();
 
-        // Past the initial silent settle window - let fogging resume. See
-        // handleStabilizingPH()'s matching comment.
+        // Past the initial silent settle window. Published for the app only
+        // (ecWatchPhaseActive); it no longer influences fogging - Fogger/Blower
+        // stay OFF for this whole state (SafetyManager::canFog()) and resume
+        // only when the episode returns to NORMAL.
         systemState.ecWatchPhaseActive = true;
-
-        const bool fogControllerAllowed =
-            automationAllowed(AutomationTestSubsystem::FOGGING);
-        if(fogControllerAllowed && validateNormalOperation())
-        {
-            processFogCycle();
-        }
 
         const bool budgetExpired =
             millis() - systemState.correctionCycleStartAt >=

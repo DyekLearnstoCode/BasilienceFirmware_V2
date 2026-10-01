@@ -19,16 +19,29 @@ void GsmManager::begin()
     beginSerial();
     stageStartedAt = millis();
     sendCommand("AT");
+    logAtProbeAttempt();
 }
 
-// Opens the GSM UART at the bench-confirmed GSM_BAUD_RATE (Config.h). This
-// specific SIM800L V2 unit only ever answers at 9600 - see the GSM physical
-// validation report - so there is nothing to probe for; a single fixed rate
-// is both simpler and avoids repeatedly tearing down/reconfiguring the UART
-// peripheral the way multi-baud cycling used to.
+// Opens the GSM link at the bench-confirmed GSM_BAUD_RATE (Config.h) on
+// GSM_RX_PIN/GSM_TX_PIN - unchanged by the UART investigation's
+// HardwareSerial->SoftwareSerial swap (see `serial`'s own declaration-site
+// comment in GsmManager.h for why). This specific SIM800L V2 unit only
+// ever answers at 9600 - see the GSM physical validation report - so
+// there is nothing to probe for; a single fixed rate is both simpler and
+// avoids repeatedly tearing down/reconfiguring the link the way multi-baud
+// cycling used to. SWSERIAL_8N1 is EspSoftwareSerial's own config enum,
+// the SoftwareSerial equivalent of HardwareSerial's SERIAL_8N1 macro - same
+// 8 data bits/no parity/1 stop bit framing, just a different library's
+// spelling of it.
 void GsmManager::beginSerial()
 {
-    serial.begin(GSM_BAUD_RATE, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    serial.begin(
+        GSM_BAUD_RATE,
+        EspSoftwareSerial::SWSERIAL_8N1,
+        GSM_RX_PIN,
+        GSM_TX_PIN,
+        false
+    );
     if (debugManager.shouldPrintDebug(DebugCategory::GSM))
     {
         Serial.print("[GSM] UART open at ");
@@ -98,6 +111,7 @@ bool GsmManager::checkForModemRestart(unsigned long now)
     rxBuffer = "";
     stageStartedAt = now;
     sendCommand("AT");
+    logAtProbeAttempt();
     return true;
 }
 
@@ -157,6 +171,46 @@ GsmManager::SendResult GsmManager::getLastResult() const
     return lastResult;
 }
 
+const char* GsmManager::stateName() const
+{
+    switch (state)
+    {
+        case State::WAITING_FOR_MODULE:    return "WAITING_FOR_MODULE";
+        case State::CHECKING_SIM:          return "CHECKING_SIM";
+        case State::CHECKING_REGISTRATION: return "CHECKING_REGISTRATION";
+        case State::READY:                 return "READY";
+        case State::SENDING_SMS:           return "SENDING_SMS";
+    }
+    return "UNKNOWN";
+}
+
+void GsmManager::logAtProbeAttempt()
+{
+    atProbeAttempts++;
+    if (debugManager.shouldPrintDebug(DebugCategory::GSM))
+    {
+        Serial.print("[GSM-UART] TX AT attempt=");
+        Serial.println(atProbeAttempts);
+    }
+}
+
+String GsmManager::sanitizeForLog(const String& raw, size_t maxLen)
+{
+    String out;
+    size_t limit = raw.length() < maxLen ? raw.length() : maxLen;
+    out.reserve(limit);
+    for (size_t i = 0; i < limit; i++)
+    {
+        char c = raw.charAt(i);
+        out += (c >= 32 && c < 127) ? c : '.';
+    }
+    if (raw.length() > maxLen)
+    {
+        out += "...";
+    }
+    return out;
+}
+
 bool GsmManager::isValidCanonicalPhilippineMobile(const String& phoneNumber)
 {
     // Structural-only: '+', "63", then exactly 10 digits starting with '9'.
@@ -175,6 +229,7 @@ bool GsmManager::isValidCanonicalPhilippineMobile(const String& phoneNumber)
 
 void GsmManager::drainSerial()
 {
+    size_t bytesReadThisCall = 0;
     while (serial.available() > 0)
     {
         if (rxBuffer.length() >= RX_BUFFER_CAP)
@@ -185,6 +240,24 @@ void GsmManager::drainSerial()
             rxBuffer = "";
         }
         rxBuffer += static_cast<char>(serial.read());
+        bytesReadThisCall++;
+    }
+
+    // GSM send-path audit (UART investigation) - part 2/3: confirms
+    // whether ANY bytes are actually arriving on GSM_RX_PIN at all,
+    // independent of whether they happen to contain a recognized token.
+    // Scoped to WAITING_FOR_MODULE only - that's the state under
+    // investigation, and logging every RX byte in every other state
+    // (SENDING_SMS especially, which carries the SMS body/+CMGS result)
+    // would be far noisier than useful here.
+    if (bytesReadThisCall > 0 && state == State::WAITING_FOR_MODULE &&
+        debugManager.shouldPrintDebug(DebugCategory::GSM))
+    {
+        Serial.print("[GSM-UART] RX bytes=");
+        Serial.print(bytesReadThisCall);
+        Serial.print(" data=\"");
+        Serial.print(sanitizeForLog(rxBuffer, 64));
+        Serial.println("\"");
     }
 }
 
@@ -214,12 +287,30 @@ void GsmManager::updateWaitingForModule(unsigned long now)
 
     if (now - stageStartedAt >= MODULE_PROBE_RETRY_INTERVAL_MS)
     {
+        // GSM send-path audit (UART investigation) - part 3/3: whatever
+        // arrived (or didn't) since the LAST "AT" was sent, right before
+        // it's discarded by the retry below. rxBuffer.length()==0 here
+        // means zero bytes arrived this whole window (category A -
+        // receive-path/wiring problem); a non-empty but never-matching
+        // rxBuffer means bytes arrived but never contained a recognized
+        // "OK" (category B/C - framing/baud mismatch, or a parser gap if
+        // the text is clearly a valid AT response).
+        if (debugManager.shouldPrintDebug(DebugCategory::GSM))
+        {
+            Serial.print("[GSM-UART] AT timeout | rxBytes=");
+            Serial.print(rxBuffer.length());
+            Serial.print(" rxBuffer=\"");
+            Serial.print(sanitizeForLog(rxBuffer, 64));
+            Serial.println("\"");
+        }
+
         // No "OK" within this window - retry. Unbounded overall (never
         // gives up, matching this state's existing "the module may just be
         // slow to power up" policy), but each individual wait is bounded
         // and update() never blocks while doing it.
         stageStartedAt = now;
         sendCommand("AT");
+        logAtProbeAttempt();
     }
 }
 

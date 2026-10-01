@@ -526,7 +526,11 @@ void NotificationManager::startSmsFanOutIfIdle()
 
         if (event.smsStatus == SmsDeliveryStatus::DEFERRED)
         {
-            if (!gsmManager.isReady()) continue; // still not registered; try a later tick
+            if (!gsmManager.isReady())
+            {
+                logGsmWait(event); // still not registered; try a later tick
+                continue;
+            }
 
             unsigned long freshnessMs = (event.type == NotificationEventType::HARVEST_DUE)
                     ? HARVEST_DUE_SMS_FRESHNESS_MS : GENERAL_SMS_FRESHNESS_MS;
@@ -557,9 +561,19 @@ void NotificationManager::startSmsFanOutIfIdle()
             // going to happen soon; the alert itself isn't lost, it still
             // reached /alerts and Firestore through the normal online path
             // - this only concerns the redundant SMS channel.
+            //
+            // GSM send-path audit: this branch previously printed nothing
+            // at all while waiting, so a real "[SMS] Sending..." that never
+            // showed up was indistinguishable from this legitimate
+            // not-ready-yet wait in the log - see logGsmWait()'s own
+            // comment.
+            logGsmWait(event);
+
             if (millis() - event.enqueuedAtMillis >= SMS_START_TIMEOUT_MS)
             {
                 event.smsStatus = SmsDeliveryStatus::FAILED;
+                Serial.print("[SMS] Gave up waiting for GSM, marking FAILED: ");
+                Serial.println(event.eventId);
                 persistQueue();
             }
             continue;
@@ -572,6 +586,36 @@ void NotificationManager::startSmsFanOutIfIdle()
         attemptCurrentRecipient();
         return; // only start one event's fan-out per idle check
     }
+}
+
+// GSM send-path audit: a queued SMS-eligible event that cannot start
+// because gsmManager.isReady()==false used to be completely silent in the
+// log - "[NOTIFY] Queued ..." with no follow-up at all until either GSM
+// became ready or SMS_START_TIMEOUT_MS gave up, making a genuine send that
+// silently failed to start indistinguishable from this ordinary,
+// legitimate wait (e.g. the module still booting/registering after a
+// device power-up). Prints gsmManager's actual state so the next physical
+// test can tell WHICH wait state it's stuck in - never spams (throttled to
+// GSM_WAIT_LOG_INTERVAL_MS, and fires immediately on a genuine state
+// change even within that window) and never prints a phone number.
+void NotificationManager::logGsmWait(const NotificationEvent& event)
+{
+    const uint8_t state = (uint8_t)gsmManager.getState();
+    const unsigned long now = millis();
+
+    if (state == lastLoggedGsmWaitState &&
+        now - lastGsmWaitLogAt < GSM_WAIT_LOG_INTERVAL_MS)
+    {
+        return;
+    }
+
+    lastLoggedGsmWaitState = state;
+    lastGsmWaitLogAt = now;
+
+    Serial.print("[SMS] Waiting for GSM | event=");
+    Serial.print(event.eventId);
+    Serial.print(" gsmState=");
+    Serial.println(gsmManager.stateName());
 }
 
 void NotificationManager::attemptCurrentRecipient()

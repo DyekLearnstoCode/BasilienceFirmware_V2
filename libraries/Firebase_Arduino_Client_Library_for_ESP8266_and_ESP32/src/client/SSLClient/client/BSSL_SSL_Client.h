@@ -46,7 +46,11 @@
 // setHandshakeTimeout() (FirebaseConfig::timeout.sslHandshake exists but is
 // never read in 4.4.17). Also a marker, like the TCP one in WiFiClientImpl.h.
 #ifndef BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS
-#define BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS 3000
+// REVISED 2026-10-01: 5000 (was 3000; upstream is 60000). About 1 s of
+// handshake work and round trips, plus one segment lost and retransmitted at the
+// 3000 ms base timeout that still applies when the SYN itself had to be
+// retransmitted. See BASILIENCE_PATCH.md.
+#define BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS 5000
 #endif
 
 #if defined(USE_EMBED_SSL_ENGINE) && !defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_NANO_RP2040_CONNECT)

@@ -96,6 +96,11 @@ constexpr unsigned long MOCK_BOOT_PAYLOAD_TIMEOUT = 120000UL; // 2 minutes
 // MOCK_BOOT_PAYLOAD_TIMEOUT since this covers an already-live session going
 // silent, not fresh-boot startup latency. See
 // SensorManager::applyEffectiveSensors().
+//
+// DIAGNOSTIC ONLY (sticky mock). Reaching this age does NOT change the sensor
+// source: a live mock session keeps using its last valid payload through a
+// Firebase outage and is only labelled "[MOCK] STALE". The source changes to
+// PHYSICAL only when mock is explicitly disabled.
 constexpr unsigned long MOCK_PAYLOAD_STALE_TIMEOUT_MS = 15000UL;
 
 // Throttle for the periodic "[MOCK] Active"/"[MOCK] STALE" diagnostic in
@@ -599,7 +604,7 @@ constexpr float LOW_WATER_LEVEL = 20.0f;
 // why a full field/key rename was judged too risky for an un-compiled
 // change), not the maximum - that role now belongs solely to
 // systemState.maxWaterTemp/TARGET_MAX_WATER_TEMP (28.0C), also the separate
-// upper safety ceiling SafetyManager::canFog() suspends fogging above.
+// upper safety ceiling for the waterTempOutOfRange alert only (it does not gate fogging).
 // COOLER_OFF_TEMP is the cooling release threshold, independently set
 // rather than derived - the resulting gap (26.5 - 25.5 = 1.0C) is smaller
 // than the previous derived 2.5C, an intentional consequence of moving the
@@ -1051,6 +1056,21 @@ constexpr unsigned long MANUAL_MODE_INACTIVITY_TIMEOUT_MS = 15UL * 60UL * 1000UL
 // Measured value for the current reservoir (see the water-depth-model task
 // report): 28.67cm.
 constexpr float WATER_LEVEL_EMPTY_DISTANCE_CM = 28.67f;
+
+// How far beyond the calibrated sensor-to-bottom distance (sensorToBottomCm)
+// a raw HC-SR04 echo may land and still count as "empty" rather than
+// physically impossible. An empty reservoir legitimately reads at about
+// sensorToBottomCm, so the bound must absorb the sensor's own ~0.3cm
+// accuracy, the ~1cm sample-to-sample jitter seen on this hardware (see
+// SensorManager's median-of-5 comment) and a little calibration/mounting
+// slack - and nothing more. Anything farther (e.g. the observed 103.48cm
+// against 28.67cm) is not water and must never be clamped into a valid 0cm
+// reading. Deliberately NOT WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM (6.0cm): that
+// bounds how far the level may move between two reads, a different question
+// from how far past the floor an echo can be. Recalibrate sensorToBottomCm
+// (/settings) rather than widening this if an installation reads empty
+// beyond it.
+constexpr float WATER_LEVEL_BOTTOM_OVERSHOOT_TOLERANCE_CM = 2.0f;
 
 // LEGACY - no longer consumed by readWaterLevel()'s depth/percent/liters
 // formula (see "Water Reservoir Geometry" below, which uses the fixed

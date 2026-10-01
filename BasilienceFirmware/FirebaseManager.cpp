@@ -61,29 +61,24 @@ constexpr uint8_t TRANSPORT_FAILURE_COOLDOWN_THRESHOLD = 3;
 constexpr unsigned long COOLDOWN_INITIAL_MS = 15000UL;
 constexpr unsigned long COOLDOWN_MAX_MS = 60000UL;
 
-// First-connection retry cadence. A failed PREFLIGHT costs the main loop
-// nothing (it runs in a background task), so it may retry sooner than a failed
-// authentication attempt, which does call into the Firebase library. Both
-// escalate on the same doubling schedule and share COOLDOWN_MAX_MS as the cap,
-// and an attempt that reached the library never retries faster than
-// COOLDOWN_INITIAL_MS.
+// First-connection retry cadence: an authentication attempt that reached the
+// library and failed waits at least COOLDOWN_INITIAL_MS, doubling up to
+// COOLDOWN_MAX_MS. Nothing else gates the retry.
 constexpr unsigned long CLOUD_STARTUP_RETRY_INITIAL_MS = 5000UL;
-// The background preflight bounds its own TCP/TLS work (two handshakes of at
-// most 5s each, see below) but its DNS lookups are bounded only by lwIP's
-// resolver retries, so this is generous. The main task only stops waiting for it
-// at this point (the task itself is then left to finish and is reclaimed before
-// another one starts), and waiting costs the main loop nothing.
-constexpr unsigned long PREFLIGHT_DEADLINE_MS = 30000UL;
-// How recent a passing preflight must be to vouch for an operation that opens
-// a NEW connection at a moment of the library's choosing: a token refresh, or a
-// cooldown recovery. Ordinary RTDB traffic does not need this - it rides on
-// cloudPathVerified, which the first transport failure withdraws.
-constexpr unsigned long CLOUD_PATH_FRESH_MS = 30000UL;
-// The preflight probe uses EXACTLY the timeouts the patched Firebase library
-// applies to its own connections (FirebaseManager.h checks the macros exist).
-// A probe that was more patient than the library would pass on a slow link the
-// library then gives up on, and the device would sit in a revoke/re-verify loop
-// with a path that "looks fine". setHandshakeTimeout() takes whole seconds.
+// The background DNS/TCP/TLS diagnostics bound their own TCP/TLS work (the same
+// timeouts the library uses, see below) but their DNS lookups are bounded only
+// by lwIP's resolver retries, so this is generous. The main task only stops
+// waiting for a result at this point (the task itself is then left to finish and
+// is reclaimed before another one starts), and waiting costs the main loop
+// nothing. Sized as 30s of DNS slack plus one connect plus one handshake.
+constexpr unsigned long PREFLIGHT_DEADLINE_MS =
+    30000UL + BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS +
+    BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS;
+// The diagnostic probe uses the same timeouts the Firebase library applies to
+// its own connections (FirebaseManager.h checks the macros exist), so the
+// durations it logs are directly comparable with what the library experiences.
+// It is evidence only and gates nothing. setHandshakeTimeout() takes whole
+// seconds.
 constexpr uint32_t PREFLIGHT_TLS_CONNECT_TIMEOUT_MS = BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS;
 constexpr uint32_t PREFLIGHT_TLS_HANDSHAKE_TIMEOUT_S =
     (BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS + 999UL) / 1000UL;
@@ -423,12 +418,15 @@ void FirebaseManager::begin()
     //    FirebaseCore::reconnect() compares millis() against it on every
     //    wait-for-response loop, for both the RTDB client and the auth client.
     //    A silent server ends a request ~4s after the last byte.
-    //  - TCP connect: BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS, set in the
+    //  - TCP connect: BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS, in the
     //    vendored library's WiFiClientImpl.h (patch 1/3, see BASILIENCE_PATCH.md
-    //    in the library folder). Upstream is 30000ms and no setting reaches it.
-    //  - TLS handshake: BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS, set in the
-    //    vendored library's BSSL_SSL_Client.h (patches 2/3 and 3/3). Upstream is
-    //    60000ms and the library never applies config.timeout.sslHandshake.
+    //    in the library folder). No setting reaches it. Currently 4000ms: the
+    //    installed lwIP retransmits a lost SYN after 3000ms, so the previous
+    //    2000ms could never survive one and was the cause of the repeated
+    //    Firebase cutoff.
+    //  - TLS handshake: BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS, in the
+    //    vendored library's BSSL_SSL_Client.h (patches 2/3 and 3/3). Currently
+    //    5000ms; the library never applies config.timeout.sslHandshake.
     //  - DNS: lwIP's own resolver retries (about 7s per configured DNS server).
     //    Nothing in the library or this firmware bounds it.
     //
@@ -487,16 +485,13 @@ void FirebaseManager::begin()
 
     // Arm the non-blocking first connection and return. Nothing below this
     // point in the boot sequence waits on the network any more: update()
-    // drives PREFLIGHT -> AUTHENTICATING -> INIT_STEPS -> COMPLETE one bounded
+    // drives WAITING -> AUTHENTICATING -> INIT_STEPS -> COMPLETE one bounded
     // step per loop() iteration (see the CloudStartupPhase comment), so local
     // sensing, safety, automation and actuator control keep their normal
     // cadence for as long as the cloud stays unreachable. Cloud readiness is
     // declared in completeCloudStartup(), never here.
     systemState.firebaseConnected = false;
-    cloudPathVerified = false;
-    cloudSessionValidated = false;
-    cloudPathVerifiedAt = 0;
-    cloudStartupPhase = CloudStartupPhase::PREFLIGHT;
+    cloudStartupPhase = CloudStartupPhase::WAITING;
     cloudInitStep = CloudInitStep::RESOLVE_DEVICE_ID;
     cloudStartupNextAttemptAt = 0;
     cloudStartupBackoffMs = 0;
@@ -576,9 +571,9 @@ void FirebaseManager::logSystemTimeDiagnostics()
     Serial.println(rtcManager.hasValidTime() ? "VALID" : "INVALID");
 }
 
-// Escalating gate on when the next preflight may start: 5s, 10s, 20s, 40s, then
-// 60s. A failure that never reached the Firebase library (a failed preflight)
-// may retry from CLOUD_STARTUP_RETRY_INITIAL_MS. One that did (authentication,
+// Escalating gate on when the next startup attempt may start: 5s, 10s, 20s, 40s,
+// then 60s. A failure that never reached the Firebase library may retry from
+// CLOUD_STARTUP_RETRY_INITIAL_MS. One that did (authentication,
 // a failed token refresh) waits at least COOLDOWN_INITIAL_MS, since each
 // library attempt can occupy the main loop for a full transport timeout. The
 // level is reset by any successful Firebase call and by Wi-Fi loss.
@@ -609,71 +604,27 @@ void FirebaseManager::bumpCloudRetryBackoff(bool libraryContacted, const char* r
 // Startup only: the authentication attempt reached the library and failed.
 void FirebaseManager::scheduleCloudStartupRetry(bool libraryContacted, const char* reason)
 {
-    cloudPathVerified = false;
     bumpCloudRetryBackoff(libraryContacted, reason);
 
-    // Whatever this attempt left behind is discarded: the next one starts from
-    // a fresh preflight, and startAuthAttempt() re-reads the persisted
-    // credentials. NVS credentials are never touched here.
-    cloudStartupPhase = CloudStartupPhase::PREFLIGHT;
-    preflightRunning = false;
+    // Whatever this attempt left behind is discarded: the next one goes
+    // straight back to the Firebase library once the backoff has elapsed, and
+    // startAuthAttempt() re-reads the persisted credentials. NVS credentials
+    // are never touched here.
+    cloudStartupPhase = CloudStartupPhase::WAITING;
     authPhase = FirebaseAuthPhase::IDLE;
 }
 
-// Withdraws permission to call the Firebase library until a fresh preflight
-// passes. Idempotent within one outage: only the call that actually flips
-// cloudPathVerified counts against the backoff, so several failures inside one
-// update() tick are one event.
-//
-// The FIRST revoke after a healthy period lets the next preflight start at
-// once (a preflight costs the main loop nothing, and a single dropped request
-// should not park the cloud for seconds). A revoke that follows a preflight
-// which passed but was then contradicted by the very next library call is the
-// "path looks fine, calls keep failing" pattern, and each repeat waits longer.
-void FirebaseManager::revokeCloudPath(const char* reason, bool libraryContacted)
-{
-    if (!cloudPathVerified) return;
-    cloudPathVerified = false;
 
-    unsigned long delayMs = cloudStartupBackoffMs;
-    if (libraryContacted && delayMs < COOLDOWN_INITIAL_MS)
-    {
-        delayMs = COOLDOWN_INITIAL_MS;
-    }
-
-    const unsigned long now = millis();
-    cloudStartupNextAttemptAt = (delayMs == 0) ? 0 : now + delayMs;
-    if (delayMs != 0 && cloudStartupNextAttemptAt == 0) cloudStartupNextAttemptAt = 1;
-    cloudStartupBackoffMs = (cloudStartupBackoffMs == 0)
-        ? CLOUD_STARTUP_RETRY_INITIAL_MS
-        : min(cloudStartupBackoffMs * 2, COOLDOWN_MAX_MS);
-
-    if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-    {
-        debugManager.printLogPrefix("NET");
-        Serial.print("Firebase path unverified | ");
-        Serial.print(reason);
-        Serial.print(" | next check in ");
-        Serial.print(delayMs / 1000UL);
-        Serial.println("s");
-    }
-}
-
-bool FirebaseManager::cloudPathFresh() const
-{
-    return cloudPathVerified && (millis() - cloudPathVerifiedAt) <= CLOUD_PATH_FRESH_MS;
-}
-
-// Wi-Fi was lost (or the setup AP took the radio). Nothing learned about the
-// path so far is trusted once the link comes back, and the outage was the
-// network's, not the cloud's, so there is no backoff penalty: the next
-// preflight starts as soon as the link is up. An unfinished first connection
-// goes back to PREFLIGHT. A post-auth INIT_STEPS attempt keeps its progress
-// (its steps resume), but is held off by cloudPathVerified like everything else.
+// Wi-Fi was lost (or the setup AP took the radio). The outage was the
+// network's, not the cloud's, so there is no backoff penalty: an unfinished
+// first connection restarts from WAITING and tries again as soon as the link is
+// up. A post-auth INIT_STEPS attempt keeps its progress (its steps resume).
 void FirebaseManager::noteNetworkLost()
 {
     noteCloudUnavailable();
-    cloudPathVerified = false;
+    // Whatever the last diagnostics said about the link belongs to the link
+    // that just went away.
+    diagDnsFailed = false;
     preflightRunning = false;
     cloudStartupNextAttemptAt = 0;
     cloudStartupBackoffMs = 0;
@@ -682,15 +633,14 @@ void FirebaseManager::noteNetworkLost()
 
 void FirebaseManager::abortCloudStartupAttempt()
 {
-    if (cloudStartupPhase != CloudStartupPhase::PREFLIGHT &&
+    if (cloudStartupPhase != CloudStartupPhase::WAITING &&
         cloudStartupPhase != CloudStartupPhase::AUTHENTICATING)
     {
         return;
     }
 
-    cloudStartupPhase = CloudStartupPhase::PREFLIGHT;
+    cloudStartupPhase = CloudStartupPhase::WAITING;
     preflightRunning = false;
-    cloudPathVerified = false;
     cloudStartupNextAttemptAt = 0;
     cloudStartupBackoffMs = 0;
     authPhase = FirebaseAuthPhase::IDLE;
@@ -704,178 +654,84 @@ void FirebaseManager::noteProvisioningActive()
     noteNetworkLost();
 }
 
-// One step of the background preflight, used by both the first connection and
-// every later re-verification. Returns PASSED only after the task has finished
-// and released its TLS clients, so nothing that follows can overlap it.
-FirebaseManager::PreflightPoll FirebaseManager::pollPreflight()
+// Background DNS/TCP/TLS diagnostics. EVIDENCE ONLY: nothing here grants or
+// withholds permission to call the Firebase library, and no retry waits for it.
+// They are started when the library itself has just failed (cooldown entered, a
+// startup authentication attempt failed), print what a separate probe sees, and
+// record whether DNS worked so checkStaRecovery() can tell a dead link from a
+// Firebase-side problem.
+void FirebaseManager::launchDiagnostics(const char* reason)
 {
-    const unsigned long now = millis();
+    if (preflightRunning) return;
+    // Never reclaim an authentication attempt that is still in flight.
+    if (authPhase == FirebaseAuthPhase::WAIT_BOOTSTRAP_HTTP) return;
 
-    if (!preflightRunning)
+    logSystemTimeDiagnostics();
+    if (!startPreflight())
     {
-        if (cloudStartupNextAttemptAt != 0 &&
-            (long)(now - cloudStartupNextAttemptAt) < 0)
+        if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
-            return PreflightPoll::PENDING;
+            debugManager.printLogPrefix("NET");
+            Serial.println("Diagnostics skipped | previous probe or auth task still finishing, or out of memory");
         }
-
-        cloudStartupAttempt++;
-        logSystemTimeDiagnostics();
-
-        if (!startPreflight())
-        {
-            if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-            {
-                debugManager.printLogPrefix("NET");
-                Serial.println("Firebase connection deferred | preflight unavailable (previous check still finishing, or out of memory)");
-            }
-            bumpCloudRetryBackoff(false, "preflight could not start");
-            return PreflightPoll::FAILED;
-        }
-        return PreflightPoll::PENDING;
+        return;
     }
+
+    if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+    {
+        debugManager.printLogPrefix("NET");
+        Serial.print("Diagnostics started | ");
+        Serial.println(reason);
+    }
+}
+
+// Collects a finished diagnostics run (prints it, updates diagDnsFailed). Never
+// blocks, never touches the Firebase library, never changes any Firebase state.
+void FirebaseManager::pollDiagnostics()
+{
+    if (!preflightRunning) return;
 
     if (xSemaphoreTake(preflightDoneSemaphore, 0) == pdTRUE)
     {
         preflightTaskActive = false;
         preflightRunning = false;
-
-        if (!evaluatePreflightResult())
-        {
-            bumpCloudRetryBackoff(false, "network not usable yet");
-            return PreflightPoll::FAILED;
-        }
-        return PreflightPoll::PASSED;
+        evaluatePreflightResult();
+        return;
     }
 
     // Stop waiting, but leave the task flagged active: startPreflight()
     // refuses to launch another until this one has signalled, so two never
     // write the shared result fields at once.
-    if (now - preflightStartedAt >= PREFLIGHT_DEADLINE_MS)
+    if (millis() - preflightStartedAt >= PREFLIGHT_DEADLINE_MS)
     {
         preflightRunning = false;
         if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
             debugManager.printLogPrefix("NET");
-            Serial.println("Firebase connection deferred | preflight timed out (DNS/TLS not answering)");
+            Serial.println("Diagnostics timed out | DNS/TLS probe not answering");
         }
-        bumpCloudRetryBackoff(false, "preflight timed out");
-        return PreflightPoll::FAILED;
-    }
-    return PreflightPoll::PENDING;
-}
-
-// While cloudPathVerified is false, this is the ONLY thing update() does about
-// the cloud. It makes no Firebase library call.
-void FirebaseManager::advanceRuntimePreflight()
-{
-    if (pollPreflight() != PreflightPoll::PASSED)
-    {
-        return;
-    }
-
-    cloudPathVerified = true;
-    cloudPathVerifiedAt = millis();
-
-    // A passing preflight proves the NETWORK path only. The library's own
-    // session has not been shown to work yet: update() runs
-    // validateCloudSession() before anything else is called or reported.
-    cloudSessionValidated = false;
-
-    // Any session that predates the failure or outage is dead or stale. Close
-    // it now, so the first call afterwards opens a fresh connection on the path
-    // that was just proven instead of writing into a half-open socket.
-    fbdo.stopWiFiClient();
-    fbdo.clear();
-
-    if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-    {
-        debugManager.printLogPrefix("NET");
-        Serial.println("Firebase path verified | validating Firebase session");
     }
 }
 
-// Runs once per update() tick (never with any other Firebase call in the same
-// tick) while the network path is verified but the library session is not yet
-// proven. The operation is a single tiny read of /commands/mockSensors/enabled:
-//  - Read only: it writes nothing, consumes no command, changes no setting and
-//    starts no actuator. The value that comes back is deliberately discarded.
-//  - It is a path this firmware already reads every few seconds
-//    (readMockSensors()), so the database rules are known to allow it.
-//  - It is a fresh library request on the session that advanceRuntimePreflight()
-//    just closed, so it exercises exactly what has been failing: opening the
-//    library's own TCP/TLS connection and completing an HTTP round trip.
-// A missing node ("path not exist") or a value of another type is an answer
-// from the server and proves the session just as well as a bool would. Anything
-// else (timeouts, SSL errors, permission or authentication errors) does not.
-void FirebaseManager::validateCloudSession()
-{
-    const unsigned long startedAt = millis();
-    const bool read = Firebase.RTDB.getBool(
-        &fbdo, deviceRoot() + "/commands/mockSensors/enabled");
-    const unsigned long durationMs = millis() - startedAt;
-    logFirebaseDuration("Session validation", durationMs);
 
-    bool answered = read;
-    String reason;
-    if (!read)
-    {
-        reason = fbdo.errorReason();
-        String lower = reason;
-        lower.toLowerCase();
-        answered = lower.indexOf("path not exist") >= 0 ||
-                   lower.indexOf("data type mismatch") >= 0;
-    }
-
-    if (answered)
-    {
-        // The first real success of this recovery: this is where the health
-        // streak clears (DEGRADED -> HEALTHY) and the retry backoff resets.
-        recordFirebaseResult(true);
-        cloudSessionValidated = true;
-
-        if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-        {
-            debugManager.printLogPrefix("NET");
-            Serial.print("Firebase session validated | ");
-            Serial.print(durationMs);
-            Serial.println("ms");
-        }
-        return;
-    }
-
-    if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
-    {
-        debugManager.printLogPrefix("NET");
-        Serial.print("Firebase session validation failed | ");
-        Serial.println(reason.isEmpty() ? String("no reason reported") : reason);
-    }
-
-    // The preflight passed and the library then contradicted it, at the cost
-    // of a real (possibly multi-second) library call: withdraw the path first
-    // with the library-contacted delay (at least COOLDOWN_INITIAL_MS, doubling
-    // while it keeps happening), then do the health accounting. Its own revoke
-    // is then a no-op, and the three-strikes COOLDOWN/recovery still applies.
-    revokeCloudPath("session validation failed", true);
-    recordFirebaseResult(false);
-}
-
-// Drives PREFLIGHT and AUTHENTICATING. Called once per update() tick while
-// either is active; every call does a bounded amount of work on the main loop
-// task and returns. The Firebase library is not touched at all until the
-// preflight has passed.
+// Drives WAITING and AUTHENTICATING. Called once per update() tick while either
+// is active; every call does a bounded amount of work on the main loop task and
+// returns. WAITING is only the retry backoff: once it has elapsed the Firebase
+// library does its own DNS/TCP/TLS and authentication, exactly as it did before
+// the cloud-startup refactor. Nothing else has to pass first.
 void FirebaseManager::advanceCloudStartupConnect()
 {
-    if (cloudStartupPhase == CloudStartupPhase::PREFLIGHT)
+    if (cloudStartupPhase == CloudStartupPhase::WAITING)
     {
-        if (pollPreflight() != PreflightPoll::PASSED)
+        const unsigned long now = millis();
+        if (cloudStartupNextAttemptAt != 0 &&
+            (long)(now - cloudStartupNextAttemptAt) < 0)
         {
             return;
         }
 
-        cloudPathVerified = true;
-        cloudPathVerifiedAt = millis();
-        cloudSessionValidated = false;
+        cloudStartupAttempt++;
+        logSystemTimeDiagnostics();
 
         if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
@@ -921,8 +777,7 @@ void FirebaseManager::advanceCloudStartupConnect()
         return;
     }
 
-    // FAILED. The preflight passed, so this is not simply "no network": say
-    // what was actually observed instead of guessing.
+    // FAILED. Say what was actually observed instead of guessing.
     if (SECURE_DEVICE_AUTH_REQUIRED)
     {
         Serial.println("[FIREBASE-AUTH] Secure auth unavailable this attempt (no device secret provisioned, or bootstrap failed)");
@@ -936,7 +791,7 @@ void FirebaseManager::advanceCloudStartupConnect()
     if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
     {
         debugManager.printLogPrefix("NET");
-        Serial.print("Firebase auth failed | preflight passed, sign-in did not complete");
+        Serial.print("Firebase auth failed | sign-in did not complete");
         if (bootstrapHttpResultCode != 0)
         {
             Serial.print(" | bootstrap HTTP=");
@@ -951,6 +806,9 @@ void FirebaseManager::advanceCloudStartupConnect()
     fbdo.clear();
 
     scheduleCloudStartupRetry(true, "authentication failed");
+
+    // Evidence for the log only; the retry above does not wait for it.
+    launchDiagnostics("authentication failed");
 }
 
 // Launches the background preflight. Main task only. Returns false when a
@@ -985,9 +843,9 @@ bool FirebaseManager::startPreflight()
     // by an outage) can still be inside its handshake, and a preflight
     // handshake needs tens of KB of its own. Reclaim it exactly the way
     // pollAuthStateMachine()'s drain does, and only once it has really
-    // signalled. Nothing polls the auth state machine while a preflight is
-    // being (re)started - update() is either in PREFLIGHT or holding for one -
-    // so a leftover WAIT_BOOTSTRAP_HTTP is an attempt that was interrupted:
+    // signalled. launchDiagnostics() only starts a probe once an attempt has
+    // ended (startup authentication failed, or a cooldown began), so a leftover
+    // WAIT_BOOTSTRAP_HTTP here is an attempt that was interrupted:
     // drop it to IDLE (a recovery in that state then reports "failed" and goes
     // back to cooldown) so the drain rule below can apply.
     if (bootstrapHttpTaskActive)
@@ -1238,12 +1096,17 @@ bool FirebaseManager::evaluatePreflightResult()
         }
     }
 
+    // A resolver that does not answer over the Wi-Fi link is the one piece of
+    // evidence that justifies checkStaRecovery() bouncing the radio; a resolver
+    // that answers means the outage is on the Firebase/TCP side.
+    diagDnsFailed = !gatingDnsOk;
+
     if (!gatingDnsOk)
     {
         if (verbose)
         {
             debugManager.printLogPrefix("NET");
-            Serial.print("Firebase connection deferred | DNS failure (");
+            Serial.print("Diagnostic | DNS failure (");
             Serial.print(failedHost);
             Serial.print(") | WiFi=UP gateway=");
             Serial.print(WiFi.gatewayIP());
@@ -1318,7 +1181,7 @@ bool FirebaseManager::evaluatePreflightResult()
     if (verbose)
     {
         debugManager.printLogPrefix("NET");
-        Serial.print("Firebase connection deferred | TLS/connect error=");
+        Serial.print("Diagnostic | TLS/connect error=");
         Serial.print(firstTlsError);
         if (firstTlsHost != nullptr)
         {
@@ -1524,14 +1387,6 @@ void FirebaseManager::completeCloudStartup()
         return;
     }
 
-    // A transport failure in the last step withdraws the path without failing
-    // the step. Never declare ready over a withdrawn path: wait here (the next
-    // tick's hold runs the preflight, then this runs again).
-    if (!cloudPathVerified)
-    {
-        return;
-    }
-
     syncRTC();
 
     systemState.settingsLoaded = true;
@@ -1540,11 +1395,6 @@ void FirebaseManager::completeCloudStartup()
 
     cloudStartupPhase = CloudStartupPhase::COMPLETE;
     cloudStartupBackoffMs = 0;
-    // The initialization steps that just finished (settings read, seeding,
-    // command baselines) were real library operations on this verified path,
-    // so the session is already proven: no separate validation read is needed
-    // for the first READY of a boot.
-    cloudSessionValidated = true;
     // The normal update() path would otherwise announce this same transition
     // a second time as "Firebase RESTORED".
     wasFirebaseConnected = true;
@@ -1584,9 +1434,21 @@ void FirebaseManager::clearDevCommandsAtBoot()
         "/commands/mockSensors/enabled"
     };
 
+    // A live mock session (mock selected AND at least one valid payload held)
+    // must survive a reconnect: writing enabled=false here would hand the
+    // source back to PHYSICAL the moment the cloud returns after an outage of
+    // COMMAND_REBASELINE_OUTAGE_MS or more. The flag is only ever cleared for a
+    // stale enabled=true that THIS device is not already acting on (a boot, or
+    // a flag written while it was offline and mock was not running).
+    const bool keepLiveMockFlag = sensorManager.isMockSessionLive();
+
     bool allCleared = true;
     for (const char* path : clearPaths)
     {
+        if (keepLiveMockFlag && strcmp(path, "/commands/mockSensors/enabled") == 0)
+        {
+            continue;
+        }
         const bool ok = Firebase.RTDB.setBool(&fbdo, deviceRoot() + path, false);
         recordFirebaseResult(ok);
         if (!ok)
@@ -1703,21 +1565,24 @@ void FirebaseManager::resetStaRecoveryStage()
     staRecoverySuppressedLogged = false;
 }
 
-// Called once per update() tick, only after the Wi-Fi-connected gate (so Wi-Fi
-// is associated) and only once the cloud startup has been armed. Reads the
-// READY flag as last computed (systemState.firebaseConnected - authenticated,
-// initialized AND session-validated); it makes no Firebase call itself and
-// changes nothing about how preflight/validation/READY work. If the cloud has
-// stayed not-READY continuously for STA_RECOVERY_OUTAGE_MS while associated,
-// and the previous forced reconnect was at least STA_RECOVERY_COOLDOWN_MS ago,
-// it asks WiFiManager for one ordinary saved-network reconnect. Everything
-// after that - link drop, reassociation, fresh preflight, session validation,
-// READY - is the existing path, unchanged. Returns true only on the tick a
-// reconnect was actually requested.
+// Called once per update() tick, only after the Wi-Fi-connected gate and only
+// once the cloud startup has been armed. Reads the READY flag as last computed
+// (systemState.firebaseConnected); it makes no Firebase call itself.
+//
+// A Firebase outage with Wi-Fi associated is NOT, by itself, a reason to bounce
+// the radio: observed in the field, forced reconnects dropped a working link and
+// never cured the Firebase failures. The ordinary saved-network reconnect is
+// requested only when the cloud has stayed not-READY for STA_RECOVERY_OUTAGE_MS
+// AND the latest diagnostics of this outage found DNS not answering over the
+// link (diagDnsFailed), at least STA_RECOVERY_COOLDOWN_MS after the previous
+// forced reconnect. Without that evidence the stage clock simply restarts and the
+// question is asked again with fresh evidence. No timer is added: both are the
+// existing ones. Returns true only on the tick a reconnect was requested.
 bool FirebaseManager::checkStaRecovery()
 {
     if (systemState.firebaseConnected)
     {
+        diagDnsFailed = false;
         resetStaRecoveryStage();
         return false;
     }
@@ -1731,6 +1596,12 @@ bool FirebaseManager::checkStaRecovery()
     }
 
     if (now - staRecoveryOutageSince < STA_RECOVERY_OUTAGE_MS) return false;
+
+    if (!diagDnsFailed)
+    {
+        resetStaRecoveryStage();
+        return false;
+    }
 
     if (lastStaRecoveryAt != 0 && now - lastStaRecoveryAt < STA_RECOVERY_COOLDOWN_MS)
     {
@@ -1748,7 +1619,7 @@ bool FirebaseManager::checkStaRecovery()
     if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
     {
         debugManager.printLogPrefix("NET");
-        Serial.println("Cloud outage >=30s while WiFi associated -> forcing STA reconnect");
+        Serial.println("Cloud outage >=30s and DNS not answering while WiFi associated -> forcing STA reconnect");
     }
 
     lastStaRecoveryAt = now;
@@ -1756,6 +1627,7 @@ bool FirebaseManager::checkStaRecovery()
     resetStaRecoveryStage();
     return true;
 }
+
 
 // The database seeding that used to be one initializeDatabase() call is split
 // into four independent steps so runCloudInitStep() can run one per update()
@@ -2148,7 +2020,7 @@ void FirebaseManager::update()
 
     // First-connection gate. Until the cloud has authenticated, the Firebase
     // library must not be touched from here: Firebase.ready() alone can start
-    // a token refresh over TLS on this task. PREFLIGHT and AUTHENTICATING are
+    // a token refresh over TLS on this task. WAITING and AUTHENTICATING are
     // advanced one bounded step per tick by advanceCloudStartupConnect(), and
     // this function returns immediately afterwards, so loop() keeps servicing
     // sensors, automation, safety, actuators and diagnostics at full rate.
@@ -2157,15 +2029,25 @@ void FirebaseManager::update()
         return;
     }
 
-    // Wi-Fi is associated and the cloud startup is armed: escalate to one
-    // ordinary STA reconnect if the cloud has stayed not-READY for 30s. On the
-    // tick it fires, make no further cloud call on the link it just dropped.
+    // Wi-Fi is associated and the cloud startup is armed. checkStaRecovery()
+    // asks WiFiManager for one ordinary STA reconnect only on diagnostic
+    // evidence that the link itself is not answering (see its comment); a
+    // Firebase outage alone never bounces the radio. On the tick it fires, make
+    // no further cloud call on the link it just dropped.
     if (checkStaRecovery())
     {
         return;
     }
 
-    if (cloudStartupPhase == CloudStartupPhase::PREFLIGHT ||
+    // Background DNS/TCP/TLS diagnostics are evidence for the log and for
+    // checkStaRecovery(), never permission for anything. Collect a finished
+    // run here, on every tick the radio is up.
+    pollDiagnostics();
+
+    // First connection: wait out the retry backoff, then let the Firebase
+    // library itself connect and authenticate (the existing auth state
+    // machine). No separate probe has to pass first.
+    if (cloudStartupPhase == CloudStartupPhase::WAITING ||
         cloudStartupPhase == CloudStartupPhase::AUTHENTICATING)
     {
         systemState.firebaseConnected = false;
@@ -2175,71 +2057,48 @@ void FirebaseManager::update()
         return;
     }
 
-    // Path gate for everything after authentication (INIT_STEPS and COMPLETE).
-    // While cloudPathVerified is false the library is not called at all: no
-    // Firebase.ready() (which can start a token refresh over a brand-new TLS
-    // connection), no RTDB call, no recovery attempt. The only work is the
-    // background preflight, which never touches the library, so this tick
-    // returns at once and loop() keeps its full rate. This is what makes a
-    // dead WAN, a dead resolver or a blocked host cost the main loop at most
-    // the ONE library call that first noticed it - not one call per tick, and
-    // not the 3-strikes-then-cooldown-then-recovery cycle.
-    if (!cloudPathVerified)
+    // Transport health decides what happens after a real Firebase failure.
+    // COOLDOWN and RECOVERING make no library call at all (not even
+    // Firebase.ready(), which can start a token refresh over a new TLS
+    // connection): the cooldown timer runs, then recovery re-authenticates
+    // through the library and a successful recovery returns to HEALTHY. Local
+    // automation, safety, actuators, GSM and the NVS notification queue never
+    // wait on this.
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN ||
+        firebaseHealth == FirebaseHealthState::RECOVERING)
     {
         if (wasFirebaseConnected && debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
             debugManager.printLogPrefix("NET");
-            Serial.println("Firebase UNAVAILABLE | WiFi=UP, checking path before any cloud call");
+            Serial.println("Firebase UNAVAILABLE | WiFi=UP");
         }
         systemState.firebaseConnected = false;
         wasFirebaseConnected = false;
         if (hasPublishedHeartbeat) heartbeatResumePending = true;
         noteCloudUnavailable();
-        advanceRuntimePreflight();
+
+        if (firebaseHealth == FirebaseHealthState::COOLDOWN)
+        {
+            if (millis() - cooldownStartedAt >= cooldownDurationMs)
+            {
+                beginFirebaseRecovery();
+            }
+        }
+        else
+        {
+            pollFirebaseRecovery();
+        }
         return;
     }
 
-    // A token refresh opens a brand-new TLS connection at a moment the library
-    // picks, from inside Firebase.ready(). Never let that happen on the strength
-    // of a path check that is old: ask for a fresh one first. (isTokenExpired()
-    // is a pure time comparison, no network.)
-    const bool tokenRefreshDue = Firebase.isTokenExpired();
-    if (tokenRefreshDue && !cloudPathFresh())
-    {
-        revokeCloudPath("token refresh due, path check is stale", false);
-        return;
-    }
-
-    // Network path verified, Firebase library session NOT yet proven (see
-    // cloudSessionValidated). Until validateCloudSession() succeeds this is not
-    // READY, no presence is asserted, and nothing but that one validation read
-    // is called: no provisioning write, no command read, no upload.
-    const bool sessionUnproven =
-        cloudStartupPhase == CloudStartupPhase::COMPLETE && !cloudSessionValidated;
-    if (sessionUnproven)
-    {
-        systemState.firebaseConnected = false;
-        wasFirebaseConnected = false;
-        if (hasPublishedHeartbeat) heartbeatResumePending = true;
-        noteCloudUnavailable();
-    }
-
-    if (suspendedForProvisioning && !sessionUnproven)
+    if (suspendedForProvisioning)
     {
         // Confirmed live bug this fixes: /status/provisioning was set true
-        // when entering provisioning (see the startProvisioning command
-        // handler below) but was never cleared back to false anywhere in
-        // this firmware. DeviceConnectionManager.resolveState() on the app
-        // side treats provisioning==true as an unconditional "always show
-        // Reconnecting," with no time bound of its own - so any device
-        // that had EVER gone through Wi-Fi Configuration/AP mode once
-        // would show Reconnecting in the app permanently, even while
-        // fully online. Written here (not unconditionally alongside the
-        // in-memory flag below) so a failed write leaves
-        // suspendedForProvisioning true and this retries on the very next
-        // tick, mirroring the existing retry-by-not-advancing-state
-        // pattern the startProvisioning command handler already uses for
-        // its own "set true" write.
+        // when entering provisioning but was never cleared back to false
+        // anywhere in this firmware, so the app showed Reconnecting forever
+        // after any Wi-Fi Configuration. Written here (not alongside the
+        // in-memory flag) so a failed write leaves suspendedForProvisioning
+        // true and this retries on the very next tick.
         const unsigned long provisioningClearStartedAt = millis();
         const bool provisioningCleared = Firebase.RTDB.setBool(
             &fbdo, deviceRoot() + "/status/provisioning", false);
@@ -2256,18 +2115,15 @@ void FirebaseManager::update()
 
     // "Connected" for the rest of the firmware (notification routing, STATUS,
     // heartbeat state) means the cloud is READY: authenticated AND every
-    // INIT_STEPS step done. A valid token alone, mid-initialization, is not.
+    // INIT_STEPS step done, and the library's own token is usable.
+    const bool libraryReady = Firebase.ready();
     systemState.firebaseConnected =
-        Firebase.ready() && cloudStartupPhase == CloudStartupPhase::COMPLETE &&
-        cloudSessionValidated;
+        libraryReady && cloudStartupPhase == CloudStartupPhase::COMPLETE;
     if (systemState.firebaseConnected && !wasFirebaseConnected)
     {
-        // Section 5: reformatted to the standard [NET] line, with the outage
-        // duration - computed from cloudUnavailableSince BEFORE
-        // noteCloudAvailable() (called further below, once reached) clears
-        // it, so this always has a real duration to report, short or long.
-        // Replaces the previous plain "[FIREBASE] Reconnected" line rather
-        // than adding a second one for the same edge.
+        // Section 5: the standard [NET] line, with the outage duration -
+        // computed from cloudUnavailableSince BEFORE noteCloudAvailable()
+        // (called further below, once reached) clears it.
         if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
             debugManager.printLogPrefix("NET");
@@ -2289,81 +2145,18 @@ void FirebaseManager::update()
     }
     wasFirebaseConnected = systemState.firebaseConnected;
 
-    if(!Firebase.ready())
+    if (!libraryReady)
     {
+        // The library tried to refresh its token inside Firebase.ready() and
+        // did not get one: a real Firebase failure, counted as one. Straight to
+        // the existing cooldown and re-authentication instead of polling the
+        // library again every tick.
         if (hasPublishedHeartbeat) heartbeatResumePending = true;
         noteCloudUnavailable();
-        // Not ready with a verified path means the library itself just failed
-        // (a token refresh that did not complete, or one it declined to retry
-        // yet). Do not poll it again every tick: re-verify first, and wait at
-        // least COOLDOWN_INITIAL_MS before the next attempt.
-        revokeCloudPath("Firebase.ready() is false", true);
+        noteLibraryNotReady();
         return;
     }
 
-    //--------------------------------------------------
-    // Firebase transport health
-    //--------------------------------------------------
-
-    // COOLDOWN means repeated transport failures already confirmed the
-    // connection is broken - retrying heartbeat/actuator/command calls
-    // here would just block for the same timeout again for nothing. No
-    // Firebase network call happens this cycle except, once the backoff
-    // window has elapsed, exactly one controlled recovery attempt. Local
-    // automation, safety, actuators, GSM, and the NVS notification queue
-    // are entirely unaffected - they already ran before this function was
-    // ever called (see loop()).
-    //
-    // Critical verification report, Priority 1: recovery itself is now
-    // non-blocking. beginFirebaseRecovery() only kicks off the auth state
-    // machine and returns immediately; RECOVERING is a real, possibly
-    // multi-tick state now (it used to be set and resolved within one
-    // synchronous call), polled one bounded step at a time by
-    // pollFirebaseRecovery() below on every subsequent update() call until
-    // it concludes into HEALTHY or back into COOLDOWN.
-    if (firebaseHealth == FirebaseHealthState::COOLDOWN)
-    {
-        noteCloudUnavailable();
-        if (millis() - cooldownStartedAt >= cooldownDurationMs)
-        {
-            // Recovery re-authenticates, i.e. opens new TLS connections to the
-            // auth host. It runs only on the back of a path check that passed
-            // moments ago: if the last one has aged out while the cooldown
-            // waited, withdraw the permission and let the (free) background
-            // preflight redo it first. The cooldown timer has already elapsed,
-            // so recovery starts on the first tick after that check passes.
-            if (cloudPathFresh())
-            {
-                beginFirebaseRecovery();
-            }
-            else
-            {
-                revokeCloudPath("cooldown over, path check is stale", false);
-            }
-        }
-        return;
-    }
-
-    if (firebaseHealth == FirebaseHealthState::RECOVERING)
-    {
-        noteCloudUnavailable();
-        pollFirebaseRecovery();
-        return;
-    }
-
-    // Session validation. After COOLDOWN/RECOVERING (handled above, so no
-    // library call is made during a cooldown wait) and before anything that
-    // treats the cloud as usable. Exactly one library operation this tick: if
-    // a token refresh was due, Firebase.ready() above already spent this
-    // tick's blocking budget on it, so validation starts on the next tick.
-    if (sessionUnproven)
-    {
-        if (!tokenRefreshDue)
-        {
-            validateCloudSession();
-        }
-        return;
-    }
 
     // Reaching here means the cloud is usable again. If it was gone long
     // enough, re-baseline both command channels before either is read below.
@@ -2414,10 +2207,9 @@ void FirebaseManager::update()
 
     if (isSensorUploadDue())
     {
-        // ONE library transaction this tick. If it failed, that also withdrew
-        // cloudPathVerified, so the tick which discovers a dead path spends
-        // its time on that one failed call and nothing else. The actuator
-        // publication that used to follow it here runs on the next tick.
+        // ONE library transaction this tick (see cloudTickBudgetSpent()). The
+        // actuator publication that used to follow it here runs on the next
+        // tick.
         writeSensors();
         return;
     }
@@ -4124,14 +3916,10 @@ void FirebaseManager::recordFirebaseResult(bool success)
     Serial.print("/");
     Serial.println(ESP.getMaxAllocHeap());
 
-    // The FIRST transport failure is enough to stop calling the library: it
-    // has just told us the path is not usable, so the calls that would follow
-    // are exactly the "repeated calls into a connection already known to be
-    // down" this must avoid. update() now holds every library call until a
-    // background preflight proves the path again. (The 3-failure COOLDOWN
-    // below still applies once calls do resume and keep failing.)
-    revokeCloudPath("transport failure", false);
-
+    // A real Firebase failure: DEGRADED now, COOLDOWN after
+    // TRANSPORT_FAILURE_COOLDOWN_THRESHOLD in a row. The library closes its own
+    // connection after a failed call, so the next attempt starts fresh. Retries
+    // go straight back through the library; nothing else has to pass first.
     if (firebaseHealth == FirebaseHealthState::HEALTHY)
     {
         firebaseHealth = FirebaseHealthState::DEGRADED;
@@ -4168,6 +3956,34 @@ void FirebaseManager::enterFirebaseCooldown()
     // update() otherwise returns silently on every pass while COOLDOWN
     // holds, which could be many times per second.
     Serial.println("[FIREBASE-HEALTH] Skipping low-priority sync during cooldown");
+
+    // Evidence for the log (and for checkStaRecovery()). Started here because no
+    // library call is made for the whole cooldown, so the probe never overlaps
+    // one. The retry that follows the cooldown does not wait for it.
+    launchDiagnostics("cooldown entered");
+}
+
+// Firebase.ready() returned false while the cloud was supposed to be usable:
+// the library's own token refresh just failed. One such failure is already a
+// full attempt (connect, handshake and request were all spent inside that call),
+// so it counts as the threshold failure and goes straight to COOLDOWN, after
+// which recovery re-authenticates through the library.
+void FirebaseManager::noteLibraryNotReady()
+{
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN ||
+        firebaseHealth == FirebaseHealthState::RECOVERING)
+    {
+        return;
+    }
+
+    transportFailureStreak = TRANSPORT_FAILURE_COOLDOWN_THRESHOLD;
+    Serial.println("[FIREBASE-HEALTH] Firebase.ready() is false | library token refresh did not complete");
+    if (firebaseHealth == FirebaseHealthState::HEALTHY)
+    {
+        firebaseHealth = FirebaseHealthState::DEGRADED;
+        Serial.println("[FIREBASE-HEALTH] HEALTHY -> DEGRADED");
+    }
+    enterFirebaseCooldown();
 }
 
 // Critical verification report, Priority 1. Called exactly once, from
@@ -4836,15 +4652,19 @@ void FirebaseManager::consumeActuatorCommandSnapshot(FirebaseJson& snapshot, boo
         const Actuator actuator = static_cast<Actuator>(i);
         const String commandPath = deviceRoot() + "/commands/" + getActuatorName(actuator);
         const uint64_t previousTimestamp = lastActuatorCommandTimestamps[i];
-        // "Not the one already handled", not "newer than the last one". The
-        // timestamp is the sender's own wall clock, so an ordering
-        // comparison let one phone with a fast clock push the persisted
-        // watermark ahead and silently drop every later command from a
-        // correctly-timed phone (each also being deleted below). Replay
-        // protection is unchanged: a command re-read after a failed
-        // delete carries the identical timestamp, still matching the
-        // persisted watermark.
-        const bool isNew = timestamps[i] != previousTimestamp;
+        // Strictly NEWER than the persisted per-actuator watermark. Equal is a
+        // replay of the command already handled (e.g. re-read after a failed
+        // delete); OLDER is a stale/queued command (e.g. an app-side offline
+        // write flushed after a reconnect, or a leftover node) and must never
+        // act - in particular it must not take manual ownership of an
+        // actuator the automation is driving. The previous "!= watermark"
+        // test accepted any different timestamp, including older ones.
+        // Trade-off: the timestamp is the sender's own clock, so a sender
+        // whose clock runs far ahead can advance the watermark and make
+        // correctly-timed later commands look stale until the clock catches up.
+        // A stale command is still consumed (deleted) below and never
+        // lowers the watermark.
+        const bool isNew = timestamps[i] > previousTimestamp;
 
         if (dispatchCommands && sources[i] == "manual")
         {
@@ -6381,11 +6201,11 @@ bool FirebaseManager::writeJson(
     const String& path,
     FirebaseJson& json)
 {
-    // A failure earlier in this same tick withdrew permission to call the
-    // library. Report "not written" without calling it: every caller already
-    // retries a false return later, and none of this path's writes is worth a
-    // second blocking call into a connection that was just found dead.
-    if (!cloudPathVerified) return false;
+    // COOLDOWN/RECOVERING confirmed the transport broken: report "not written"
+    // without calling the library. Every caller already retries a false return
+    // later.
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN ||
+        firebaseHealth == FirebaseHealthState::RECOVERING) return false;
 
     bool success =
         Firebase.RTDB.setJSON(
@@ -6410,7 +6230,8 @@ bool FirebaseManager::updateJson(
     FirebaseJson& json)
 {
     // See writeJson(): same reasoning.
-    if (!cloudPathVerified) return false;
+    if (firebaseHealth == FirebaseHealthState::COOLDOWN ||
+        firebaseHealth == FirebaseHealthState::RECOVERING) return false;
 
     bool success =
         Firebase.RTDB.updateNode(
@@ -6592,7 +6413,11 @@ void FirebaseManager::readMockSensors()
     json.get(data, "enabled");
     // enabled=true is honoured only once this boot's stale-flag clear has been
     // confirmed - see devCommandsCleared.
-    const bool nextEnabled = data.success && data.boolValue && devCommandsCleared;
+    // A live mock session keeps honouring enabled=true even while the
+    // post-outage dev-flag clear is pending or retrying: that clear exists to
+    // distrust a flag this device never acted on, and this one it has.
+    const bool nextEnabled = data.success && data.boolValue &&
+        (devCommandsCleared || sensorManager.isMockSessionLive());
 
     // Backward compatible: every existing/static payload omits this field
     // and therefore remains deterministic static mock data.
@@ -7153,6 +6978,24 @@ void FirebaseManager::writeDiagnosticSensors()
         Serial.println("[DEV TEST] WaterLevelDistanceCm=INVALID");
     }
 
+    // Raw single HC-SR04 echo + validity label. Diagnostic only: published
+    // here and nowhere else (never /sensors), and independent of whether the
+    // reservoir logic accepted the reading, so a rejected/impossible echo is
+    // still visible. Water Level/Depth above stay absent unless accepted.
+    const float rawWaterDistanceCm = sensorManager.getWaterLevelRawDistanceCm();
+    const char* waterLevelStatus = sensorManager.getWaterLevelDiagStatus();
+    if (isfinite(rawWaterDistanceCm))
+    {
+        json.set("waterLevelRawDistanceCm", rawWaterDistanceCm);
+        Serial.print("[DEV TEST] WaterLevelRawDistanceCm="); Serial.println(rawWaterDistanceCm, 2);
+    }
+    else
+    {
+        Serial.println("[DEV TEST] WaterLevelRawDistanceCm=NO_ECHO");
+    }
+    json.set("waterLevelStatus", waterLevelStatus);
+    Serial.print("[DEV TEST] WaterLevelStatus="); Serial.println(waterLevelStatus);
+
     // Water Depth / Volume (water-depth model)
     if (isfinite(physicalSensors.waterLevelCm))
     {
@@ -7191,6 +7034,21 @@ void FirebaseManager::writeDiagnosticSensors()
 
     lastDiagnosticUploadAttempt = now;
     json.set("timestamp", now);
+    // setJSON below REPLACES the node: a field that is invalid this cycle is
+    // simply absent from it (Android then shows it unavailable), it is never
+    // left holding a stale previous value.
+    Serial.print("[DEV-PHYS] publish waterLevel=");
+    Serial.print(physicalSensors.waterLevel, 1);
+    Serial.print(" waterLevelCm=");
+    Serial.print(physicalSensors.waterLevelCm, 2);
+    Serial.print(" distance=");
+    Serial.print(physicalSensors.waterLevelDistanceCm, 2);
+    Serial.print(" rawDistance=");
+    Serial.print(rawWaterDistanceCm, 2);
+    Serial.print(" status=");
+    Serial.println(waterLevelStatus);
+    Serial.print("[DEV-PHYS] path=");
+    Serial.println(deviceRoot() + "/debug/physicalSensors");
     if (writeJson(deviceRoot() + "/debug/physicalSensors", json))
     {
         diagnosticBackoffActive = false;

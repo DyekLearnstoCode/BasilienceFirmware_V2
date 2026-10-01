@@ -1,5 +1,30 @@
 # Basilience patch to Firebase Arduino Client Library 4.4.17
 
+> **REVISION 2026-10-01 - values changed again.** The defaults are now
+> **4000 ms (TCP connect)** and **5000 ms (TLS handshake)**. The table and diff
+> further down describe the earlier 2000/3000 ms values and are kept as history.
+> Upstream 4.4.17 is 30000 / 60000.
+>
+> Why not 2000: with a 2000 ms TCP-connect bound the library (and the diagnostic
+> probe) failed at 2002-2005 ms on the securetoken host while DNS kept working.
+> The installed lwIP (esp32-arduino-libs idf-release_v5.1, sdkconfig) has
+> CONFIG_LWIP_TCP_RTO_TIME=3000 and CONFIG_LWIP_TCP_SYNMAXRTX=6, so a lost SYN
+> is retransmitted after 3 s and a 2 s bound can never survive even one.
+> The core's connect is a non-blocking connect() plus select() on this timeout
+> (NetworkClientSecure ssl_client.cpp), which is exactly the 2000 ms seen.
+>
+> Why 4000: it covers one lost SYN (about 3.3 s including the 250 ms lwIP timer
+> tick, plus the round trip) and stops there. Two lost SYNs would need about
+> 6.5 s and are deliberately not covered. Why 5000 for the handshake: about 1 s
+> of crypto and round trips plus one lost segment retransmitted at the 3 s base
+> timeout. There is no runtime measurement behind either figure yet: the
+> [NET] "TLS <host> OK (Nms)" diagnostic lines give connect plus handshake time
+> and are the evidence to tune them with.
+>
+> The firmware no longer holds Firebase calls behind a separate probe; see
+> FirebaseManager.h. The macros and the #error guard remain, the 5000 ms
+> static_assert is gone.
+
 This folder is a vendored copy of "Firebase Arduino Client Library for ESP8266
 and ESP32" version 4.4.17 with **three one-line default changes** so that one
 Firebase connection attempt can never hold the Basilience main loop for more

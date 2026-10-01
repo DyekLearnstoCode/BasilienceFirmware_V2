@@ -93,6 +93,14 @@ private:
     // fix). See applyEffectiveSensors()'s MOCK PAYLOAD FRESHNESS block.
     unsigned long lastMockPayloadAt = 0;
 
+    // True once a complete, validated mock payload has been received during
+    // the CURRENT mock session (set by notifyMockPayloadReceived(), cleared on
+    // every tick mock is not enabled). This - not payload age - decides whether
+    // mock is authoritative: a held payload keeps driving the effective
+    // dataset through a Firebase outage, and only an explicit source change
+    // ends the session. Payload age (lastMockPayloadAt) is diagnostics only.
+    bool mockSessionHasPayload = false;
+
     // Whether the EFFECTIVE dataset (`sensors`) was actually sourced from
     // mock last tick - distinct from lastReportedMockSource above, which
     // tracks the raw enabled/disabled developer intent for the
@@ -341,6 +349,21 @@ private:
     unsigned long lastWaterLevelReadTime = 0;
     uint8_t waterLevelFailureStreak = 0;
 
+    // Consecutive reads whose raw echo was beyond the reservoir bottom
+    // (readWaterLevel()'s geometry gate). Separate from
+    // waterLevelFailureStreak (no echo at all) and waterLevelJumpFaultStreak
+    // (in-range but implausible jump) - an echo WAS received here, it just
+    // cannot be water. Reset by any in-range echo or a no-echo read.
+    uint8_t waterLevelFarEchoStreak = 0;
+
+    // DIAGNOSTIC ONLY (Developer Sensor Test, debug/physicalSensors): the
+    // latest single un-filtered HC-SR04 echo in cm, NaN when the last
+    // attempted read got no echo. Written by readWaterLevel() before any
+    // plausibility/median/step filtering and never read by automation,
+    // alerts, or the effective /sensors dataset - those keep using the
+    // filtered/accepted physicalSensors.waterLevel* fields only.
+    float waterLevelRawDistanceCm = NAN;
+
     // Median-of-5 filter over the raw distance samples (widened from
     // median-of-3 - real-hardware pre-integration Part E: ~1cm of
     // sample-to-sample HC-SR04 jitter was still passing through a 3-sample
@@ -514,7 +537,8 @@ public:
     // Effective-mock-source consistency fix (targeted): the single
     // authoritative answer to "is mock actually the CURRENT effective
     // sensor source this tick" - true only when
-    // systemState.mockSensorsEnabled AND the payload is fresh AND
+    // systemState.mockSensorsEnabled AND this session holds a valid payload
+    // (age is irrelevant: a stale payload is still held) AND
     // applyEffectiveSensors() actually selected mock this tick (see
     // lastEffectiveSourceWasMock's own comment). Deliberately NOT the same
     // as systemState.mockSensorsEnabled, which only reflects the
@@ -528,6 +552,17 @@ public:
     // keep using systemState.mockSensorsEnabled directly - not a
     // replacement for that, only for automation-behavior consumers.
     bool isUsingEffectiveMockSensors() const { return lastEffectiveSourceWasMock; }
+
+    // A mock session is live: mock is the selected source AND at least one
+    // valid payload has been received in it, so there are last-valid values to
+    // hold. Independent of payload age and of Firebase connectivity. False for
+    // a boot-restored mock source that has not yet received its first payload.
+    bool isMockSessionLive() const;
+
+    // Diagnostics/status only: the live mock session's payload has not been
+    // refreshed for MOCK_PAYLOAD_STALE_TIMEOUT_MS (typically a Firebase
+    // outage). The held values are still the effective dataset.
+    bool isMockPayloadStale() const;
 
     // True only while sensors are being held explicitly invalid because
     // isolated Automation Test Mode's mock payload went stale
@@ -603,6 +638,13 @@ public:
     bool isWaterTempStateKnown() const;
     bool isWaterLevelStateKnown() const;
     bool isEcStateKnown() const;
+
+    // DIAGNOSTIC ONLY - see waterLevelRawDistanceCm's declaration. Consumed
+    // solely by FirebaseManager::writeDiagnosticSensors().
+    float getWaterLevelRawDistanceCm() const { return waterLevelRawDistanceCm; }
+    // One of NO_ECHO / OUT_OF_RANGE / SENSOR_FAULT / CONFIRMING / VALID,
+    // derived read-only from the existing readWaterLevel() state.
+    const char* getWaterLevelDiagStatus() const;
 
     // Stage 2 (sensor architecture redesign, incident-style alerts):
     // per-parameter sample-sequence counters, each incremented ONLY at the

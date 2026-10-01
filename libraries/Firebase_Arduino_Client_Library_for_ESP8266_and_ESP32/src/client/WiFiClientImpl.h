@@ -40,7 +40,12 @@
 // 30000. Also serves as the marker that lets Basilience's FirebaseManager.h
 // refuse to build against an unpatched copy of the library.
 #ifndef BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS
-#define BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS 2000
+// REVISED 2026-10-01: 4000 (was 2000; upstream is 30000). The installed lwIP
+// retransmits a lost SYN after LWIP_TCP_RTO_TIME = 3000 ms, so 2000 could never
+// survive a single lost SYN and every such connect failed at exactly 2000 ms.
+// 4000 covers one lost SYN (about 3.3 s plus the round trip) and is still a
+// bounded wait. See BASILIENCE_PATCH.md.
+#define BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS 4000
 #endif
 
 #include <lwip/sockets.h>

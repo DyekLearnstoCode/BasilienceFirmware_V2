@@ -971,7 +971,7 @@ bool ActuatorManager::validateCommand(Actuator actuator, bool targetState, Strin
             // the automation resilience pass report and
             // SafetyManager::canFog()'s matching comment. Root fogging's
             // hard requirements (now shared by automatic and manual) are
-            // water/temperature/pH/EC/ownership only.
+            // water-level/pH/EC/ownership only; water temperature is not a fogging gate.
             break;
         case BLOWER:
             // Automatic blower demand is the delivery half of an automatic fog

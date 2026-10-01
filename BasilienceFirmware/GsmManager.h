@@ -2,12 +2,16 @@
 #define GSM_MANAGER_H
 
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 
 // Foundation driver for a SIMCom SIM800L GSM/GPRS module. Owns the dedicated
 // GSM UART and a millis()-driven state machine so cultivation control
 // (sensors/automation/safety/actuators) is never blocked while the module
-// boots, registers, or sends an SMS - update() never calls delay() or spins
-// in a wait loop. GsmManager knows nothing about Firebase, user roles, or
+// boots or registers - update() never calls delay() or spins in a wait loop
+// for those phases. SENDING AN SMS IS THE ONE EXCEPTION: see `serial`'s own
+// declaration-site comment below - actually writing the AT+CMGS body is a
+// bounded but genuinely blocking call, not non-blocking like everything
+// else here. GsmManager knows nothing about Firebase, user roles, or
 // alert/delivery policy: it only sends text a caller supplies to a number a
 // caller supplies, one at a time, and reports why if it couldn't.
 //
@@ -70,6 +74,12 @@ public:
     State getState() const;
     SendResult getLastResult() const;
 
+    // Human-readable form of the current state - diagnostic only (e.g.
+    // NotificationManager's "[SMS] Waiting for GSM" log when a queued SMS
+    // can't start yet), mirrors WiFiManager::stateName()'s own precedent.
+    // Never read by anything that affects control flow.
+    const char* stateName() const;
+
     // Structural-only validation of the canonical +639XXXXXXXXX form (13
     // chars: '+', "63", "9", then 9 more digits). No carrier-prefix table -
     // matches the Android-side PhoneNumberUtils normalization contract.
@@ -89,7 +99,25 @@ private:
         AWAIT_SEND_RESULT
     };
 
-    HardwareSerial serial{1};
+    // UART investigation (GSM send-path audit): switched from
+    // HardwareSerial{1} (UART1 via the ESP32 GPIO matrix) to
+    // EspSoftwareSerial - a proven-working standalone reference sketch
+    // (GsmSimTest.ino, repo root) using SoftwareSerial on these same
+    // GSM_RX_PIN/GSM_TX_PIN communicated with this module correctly, while
+    // [GSM-UART] diagnostics confirmed HardwareSerial received zero bytes
+    // ever on GPIO36 (a no-internal-pull-up, input-only ESP32 pin) despite
+    // identical wiring/baud. Stream-compatible (extends Stream, same as
+    // HardwareSerial) - every existing available()/read()/print()/
+    // println() call below is unaffected; only this declaration and
+    // beginSerial()'s begin() call change.
+    //
+    // One real behavioral difference: unlike HardwareSerial (FIFO +
+    // interrupt-driven, non-blocking on write), SoftwareSerial's write()
+    // bit-bangs each byte with busy-wait timing and briefly disables
+    // interrupts for the whole call - see beginSerial()'s and the class
+    // comment's own notes. RX stays interrupt-driven/non-blocking exactly
+    // like before.
+    SoftwareSerial serial;
 
     State state = State::WAITING_FOR_MODULE;
     SendResult lastResult = SendResult::NONE;
@@ -136,6 +164,26 @@ private:
     void finishSend(SendResult result);
     void beginSerial();
     void logSendError(const String& response) const;
+
+    // GSM send-path audit (UART investigation): counts every "AT" module
+    // probe sent from begin()/updateWaitingForModule()'s retry/
+    // checkForModemRestart()'s reinit - NOT the AT+CPIN?/AT+CREG? queries
+    // in later states, which have no diagnostic gap to fill. Monotonic for
+    // the whole session (not reset on a successful transition out of
+    // WAITING_FOR_MODULE) so "attempt=N" in the log directly says how many
+    // probes preceded whatever happened next, across any later restart
+    // episode too.
+    uint16_t atProbeAttempts = 0;
+    void logAtProbeAttempt();
+
+    // Bounded, printable-only rendering of a raw UART buffer for the
+    // [GSM-UART] diagnostics - replaces any byte outside printable ASCII
+    // (CR/LF included) with '.' and truncates to maxLen, so a garbled/
+    // binary response is still safely loggable and never floods the
+    // Serial Monitor. Contains only modem protocol text (AT responses),
+    // never phone numbers or message bodies - nothing here needs masking
+    // for that reason, only for length/printability.
+    static String sanitizeForLog(const String& raw, size_t maxLen);
 
     // Detects an unsolicited "RDY" anywhere in rxBuffer - SIM800L's own
     // signal that it just (re)booted - from any state other than

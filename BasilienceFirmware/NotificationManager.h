@@ -79,6 +79,15 @@ private:
     // normal power-on/network-registration delay.
     static constexpr unsigned long SMS_START_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
+    // Throttle for the "[SMS] Waiting for GSM" diagnostic (GSM send-path
+    // audit) - startSmsFanOutIfIdle() runs every loop() tick, so without
+    // this a stalled send would otherwise print every single tick. Prints
+    // on a genuine GSM state change OR at most once per this interval,
+    // whichever comes first, so a long stall in the SAME state still gets
+    // an occasional reminder rather than going silent for the whole
+    // SMS_START_TIMEOUT_MS wait.
+    static constexpr unsigned long GSM_WAIT_LOG_INTERVAL_MS = 30UL * 1000UL;
+
     Preferences preferences;
     NotificationEvent queue[NOTIFICATION_QUEUE_CAPACITY];
 
@@ -135,6 +144,14 @@ private:
     char cloudReplayInFlightEventId[40] = {0};
     unsigned long cloudReplaySubmittedAtMillis = 0;
 
+    // Edge/throttle state for the "[SMS] Waiting for GSM" diagnostic - see
+    // GSM_WAIT_LOG_INTERVAL_MS's own comment. 255 is a sentinel for "never
+    // logged yet this boot" (real GsmManager::State values are 0-4); stored
+    // as a plain uint8_t rather than GsmManager::State so this header does
+    // not need to depend on GsmManager.h just for a diagnostic.
+    uint8_t lastLoggedGsmWaitState = 255;
+    unsigned long lastGsmWaitLogAt = 0;
+
     void observeAlertTransitions();
     void observeConnectivity();
     void observeHarvestSchedule();
@@ -148,6 +165,7 @@ private:
     void startSmsFanOutIfIdle();
     void attemptCurrentRecipient();
     void finishSmsFanOut();
+    void logGsmWait(const NotificationEvent& event);
 
     String buildSmsBody(const NotificationEvent& event) const;
 

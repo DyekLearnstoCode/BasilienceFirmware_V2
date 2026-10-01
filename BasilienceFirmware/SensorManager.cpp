@@ -210,6 +210,7 @@ void SensorManager::notifyMockPayloadReceived()
     // fix). Must run before the early return below, which only concerns the
     // separate one-time boot-wait confirmation.
     lastMockPayloadAt = millis();
+    mockSessionHasPayload = true;
 
     if (!mockBootWaitingForPayload) return;
 
@@ -220,6 +221,17 @@ void SensorManager::notifyMockPayloadReceived()
 void SensorManager::cancelMockBootWait()
 {
     mockBootWaitingForPayload = false;
+}
+
+bool SensorManager::isMockSessionLive() const
+{
+    return systemState.mockSensorsEnabled && mockSessionHasPayload;
+}
+
+bool SensorManager::isMockPayloadStale() const
+{
+    return isMockSessionLive() &&
+        (millis() - lastMockPayloadAt >= MOCK_PAYLOAD_STALE_TIMEOUT_MS);
 }
 
 // sensorState.ready refinement - see the declarations' own comment in
@@ -239,12 +251,50 @@ bool SensorManager::isWaterTempStateKnown() const
 
 bool SensorManager::isWaterLevelStateKnown() const
 {
-    return isfinite(physicalSensors.waterLevelCm) || waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD;
+    // A confirmed far-echo fault (echo beyond the reservoir bottom) is, like
+    // a confirmed no-echo outage, a settled "unavailable" state rather than
+    // one still being acquired.
+    return isfinite(physicalSensors.waterLevelCm) ||
+        waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD ||
+        waterLevelFarEchoStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD;
 }
 
 bool SensorManager::isEcStateKnown() const
 {
     return isfinite(physicalSensors.ec) || isPhEcAnalogSettling();
+}
+
+// Developer Sensor Test label only - derived from state readWaterLevel()
+// already maintains, never fed back into it. Priority order matters: the
+// most recent raw read result first, then the raw echo's own plausibility,
+// then the filter's fault/baseline state.
+//
+// OUT_OF_RANGE is judged on the raw echo against the configured geometry,
+// with the same rule readWaterLevel() enforces: an echo farther than the
+// reservoir floor (sensorToBottomCm + WATER_LEVEL_BOTTOM_OVERSHOOT_
+// TOLERANCE_CM), or one implying water deeper than MAX_WORKING_WATER_CM.
+const char* SensorManager::getWaterLevelDiagStatus() const
+{
+    // The latest attempted read got no echo (a failure streak is only ever
+    // non-zero while the most recent read failed).
+    if (waterLevelFailureStreak > 0) return "NO_ECHO";
+    // Not sampled yet since boot.
+    if (!isfinite(waterLevelRawDistanceCm)) return "CONFIRMING";
+
+    const float rawDepthCm = systemState.sensorToBottomCm - waterLevelRawDistanceCm;
+    if (rawDepthCm > MAX_WORKING_WATER_CM || rawDepthCm < -WATER_LEVEL_BOTTOM_OVERSHOOT_TOLERANCE_CM)
+    {
+        return "OUT_OF_RANGE";
+    }
+    if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+    {
+        return "SENSOR_FAULT";
+    }
+    if (isnan(lastAcceptedWaterDepthCm))
+    {
+        return "CONFIRMING";
+    }
+    return "VALID";
 }
 
 // Feeds one new already-filtered pH/EC candidate (physicalSensors.ph/.ec)
@@ -416,6 +466,11 @@ float SensorManager::boundedMockWalk(float current, float base,
 void SensorManager::updateDynamicMockSensors()
 {
     if (!systemState.mockSensorsEnabled || !systemState.mockSensorsDynamic) return;
+    // Frozen while the payload is stale (Firebase outage): the held values are
+    // the last ones the app actually supplied, so the simulated walk must not
+    // keep drifting on its own. It resumes, from where it stopped, on the next
+    // valid payload.
+    if (isMockPayloadStale()) return;
     if (millis() - systemState.mockDynamicUpdatedAt < MOCK_DYNAMIC_UPDATE_INTERVAL_MS) return;
     systemState.mockDynamicUpdatedAt = millis();
 
@@ -470,6 +525,14 @@ void SensorManager::applyEffectiveSensors()
     // Evaluated before the source is selected below, so the tick that times
     // out already publishes physical readings rather than waiting one more.
     updateMockBootWait();
+
+    // The mock session (and with it the right to hold its last payload) ends
+    // the moment mock stops being the selected source, so a later re-enable
+    // can never reuse values from this one before its own first payload.
+    if (!systemState.mockSensorsEnabled)
+    {
+        mockSessionHasPayload = false;
+    }
 
     // Mock mode's enabled/disabled state lives only in Firebase and is not
     // restored locally at boot (systemState.mockSensorsEnabled defaults to
@@ -552,19 +615,31 @@ void SensorManager::applyEffectiveSensors()
     // confirmed by lastMockPayloadAt never being consulted anywhere before
     // this block existed.
     //
-    // mockDataFresh is deliberately LOCAL, non-persisted state - it never
-    // touches systemState.mockSensorsEnabled, NVS, or the
-    // devCommandsCleared/F2 reconnect-revalidation gate readMockSensors()
-    // already applies to enabling mock in the first place. A stale
-    // fallback here is purely "don't trust this tick's mock data"; the
-    // moment a fresh payload is confirmed again (still requires the
-    // existing F2 clear on reconnect, unchanged), this reverts
-    // automatically.
-    const bool mockDataFresh = systemState.mockSensorsEnabled &&
-        (millis() - lastMockPayloadAt < MOCK_PAYLOAD_STALE_TIMEOUT_MS);
+    // REVISED - MOCK IS STICKY. Payload age no longer decides which source is
+    // authoritative; it is a diagnostic only. Once ONE valid payload has been
+    // received in this mock session (mockSessionHasPayload), mock stays the
+    // effective source until it is explicitly disabled, and the last valid
+    // values keep driving automation through any Firebase outage. Falling
+    // back to PHYSICAL on a silent link is what used to reset the pH/EC
+    // settle window and the sensor snapshot baseline, and could pull NORMAL
+    // automation back into stabilization, purely because the cloud went
+    // quiet. A never-received payload is still never invented (boot-wait
+    // guard above), a malformed payload still never reaches this point
+    // (readMockSensors() only notifies after a complete parse), and an
+    // explicit disable still switches to PHYSICAL and clears the mock
+    // session (top of this function, plus the falling-edge resets below).
+    //
+    // mockPayloadStale is therefore only the "[MOCK] STALE" label: the held
+    // payload has not been refreshed for MOCK_PAYLOAD_STALE_TIMEOUT_MS.
+    const bool mockAuthoritative = systemState.mockSensorsEnabled && mockSessionHasPayload;
+    const bool mockPayloadStale = mockAuthoritative &&
+        (millis() - lastMockPayloadAt >= MOCK_PAYLOAD_STALE_TIMEOUT_MS);
 
-    if (systemState.mockSensorsEnabled && !mockDataFresh)
+    if (systemState.mockSensorsEnabled && !mockAuthoritative)
     {
+        // Mock is selected but this session has no valid payload to hold
+        // (not reachable through the normal enable path, which always
+        // notifies first; kept as the safe fallback).
         if (systemState.automationTestSubsystem != AutomationTestSubsystem::NONE)
         {
             // Isolated Automation Test Mode: silently falling back to
@@ -582,7 +657,7 @@ void SensorManager::applyEffectiveSensors()
             if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
             {
                 lastMockStatusLogAt = millis();
-                Serial.println("[MOCK] STALE | test automation held");
+                Serial.println("[MOCK] NO PAYLOAD | test automation held");
             }
             mockStaleLogged = true;
 
@@ -597,9 +672,7 @@ void SensorManager::applyEffectiveSensors()
         if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
         {
             lastMockStatusLogAt = millis();
-            Serial.print("[MOCK] STALE | age=");
-            Serial.print((millis() - lastMockPayloadAt) / 1000);
-            Serial.println("s");
+            Serial.println("[MOCK] NO PAYLOAD | no valid payload this session");
         }
 
         if (!mockStaleLogged)
@@ -608,8 +681,20 @@ void SensorManager::applyEffectiveSensors()
             mockStaleLogged = true;
         }
         // Falls through to the PHYSICAL branch below - mockSensorsEnabled
-        // stays true throughout (see this block's own comment); mockDataFresh
-        // being false is what actually routes execution there.
+        // stays true throughout; mockAuthoritative being false is what
+        // actually routes execution there.
+    }
+    else if (mockPayloadStale)
+    {
+        // Diagnostic only. The source stays MOCK and the held values stay the
+        // effective dataset; the periodic status line below says STALE.
+        if (!mockStaleLogged)
+        {
+            Serial.print("[MOCK] STALE | holding last valid payload, source stays MOCK | age=");
+            Serial.print((millis() - lastMockPayloadAt) / 1000);
+            Serial.println("s");
+            mockStaleLogged = true;
+        }
     }
     else if (mockStaleLogged)
     {
@@ -625,7 +710,7 @@ void SensorManager::applyEffectiveSensors()
     // environment - a field the mock payload didn't include stays invalid
     // (NaN) rather than silently reverting to a real, possibly noisy
     // physical reading.
-    if (mockDataFresh)
+    if (mockAuthoritative)
     {
         // Mirrors the mock->physical transition reset below: a stability
         // window carrying samples accumulated while sourcing PHYSICAL data
@@ -647,7 +732,8 @@ void SensorManager::applyEffectiveSensors()
         if (millis() - lastMockStatusLogAt >= MOCK_STATUS_LOG_INTERVAL_MS)
         {
             lastMockStatusLogAt = millis();
-            Serial.print("[MOCK] Active | payload age=");
+            Serial.print(mockPayloadStale ? "[MOCK] STALE | holding last valid payload | age="
+                                          : "[MOCK] Active | payload age=");
             Serial.print((millis() - lastMockPayloadAt) / 1000);
             Serial.println("s");
         }
@@ -1740,8 +1826,24 @@ void SensorManager::readWaterLevel()
     float distance =
         measureDistanceCM();
 
+    // Diagnostic-only raw echo (see waterLevelRawDistanceCm's declaration):
+    // captured before every filter below so Developer Sensor Test can show
+    // what the HC-SR04 actually produced even when it is then rejected.
+    waterLevelRawDistanceCm = (distance < 0 || !isfinite(distance)) ? NAN : distance;
+
     if (distance < 0 || !isfinite(distance))
     {
+        if (systemState.sensorTestEnabled)
+        {
+            Serial.print("[DEV-PHYS] WL rawDistance=NO_ECHO failureStreak=");
+            Serial.print(waterLevelFailureStreak);
+            Serial.print("/");
+            Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+        }
+
+        // A no-echo read breaks any run of consecutive far echoes.
+        waterLevelFarEchoStreak = 0;
+
         if (waterLevelFailureStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
         {
             waterLevelFailureStreak++;
@@ -1792,24 +1894,94 @@ void SensorManager::readWaterLevel()
         return;
     }
 
+    // Geometry gate on the RAW echo, applied before it can reach the median
+    // history, the depth conversion, or the negative-depth clamp below. An
+    // echo farther than the calibrated reservoir bottom (plus the small
+    // WATER_LEVEL_BOTTOM_OVERSHOOT_TOLERANCE_CM) cannot be water: left to
+    // the conversion it would give a negative depth that the clamp turns into
+    // a "valid" 0cm / 0% empty reservoir (observed: 103.48cm echo against
+    // sensorToBottomCm=28.67cm), which could start an automatic refill.
+    const bool echoBeyondBottom =
+        distance > systemState.sensorToBottomCm + WATER_LEVEL_BOTTOM_OVERSHOOT_TOLERANCE_CM;
+
+    // An echo (any echo, valid or not) ending a no-echo outage only means the
+    // HC-SR04 is producing pulses again - NOT that a valid reservoir level
+    // was accepted. The level itself is reported valid separately, once a
+    // baseline is established ("WaterLevel VALID" below).
     if (waterLevelFailureStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
     {
         if (dbgWater)
         {
-            Serial.println("[SENSOR] Water level recovered");
+            Serial.print("[SENSOR] Water level ECHO returned after no-echo outage (");
+            Serial.print(echoBeyondBottom ? "OUT OF RANGE" : "in range");
+            Serial.println(", level not yet accepted)");
         }
         if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
         {
-            // No depth value here deliberately: this function's step/median
-            // confirmation logic accepts a trusted depth through several
-            // different paths further below, so the freshly-recovered value
-            // is not yet final at this point - printing one here risks
-            // showing a not-yet-confirmed number.
             debugManager.printLogPrefix("SENS");
-            Serial.println("WaterLevel RECOVERED");
+            Serial.println(echoBeyondBottom
+                ? "WaterLevel ECHO RECOVERED (out of range - level still INVALID)"
+                : "WaterLevel ECHO RECOVERED (level not yet accepted)");
         }
     }
     waterLevelFailureStreak = 0;
+
+    if (echoBeyondBottom)
+    {
+        if (systemState.sensorTestEnabled)
+        {
+            Serial.print("[DEV-PHYS] WL rawDistance=");
+            Serial.print(distance, 2);
+            Serial.println(" status=OUT_OF_RANGE (beyond reservoir bottom; rejected, diagnostic only)");
+        }
+
+        // Never eligible to establish/replace a baseline, set waterLevelCm/
+        // waterLevel to 0, advance the refill confirmation counters, or
+        // update the accepted distance - and not added to the median history.
+        // Persisting for SENSOR_TRANSIENT_FAILURE_THRESHOLD consecutive reads
+        // invalidates the published level (same outcome and same reset as a
+        // confirmed no-echo outage); before that, the previous accepted
+        // values are simply held.
+        if (waterLevelFarEchoStreak < SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+        {
+            waterLevelFarEchoStreak++;
+
+            if (dbgWater)
+            {
+                Serial.print("[WATER-FILTER] FAR ECHO rejected raw=");
+                Serial.print(distance, 2);
+                Serial.print("cm > sensorToBottom+tol=");
+                Serial.print(systemState.sensorToBottomCm + WATER_LEVEL_BOTTOM_OVERSHOOT_TOLERANCE_CM, 2);
+                Serial.print("cm streak=");
+                Serial.print(waterLevelFarEchoStreak);
+                Serial.print("/");
+                Serial.println(SENSOR_TRANSIENT_FAILURE_THRESHOLD);
+            }
+
+            if (waterLevelFarEchoStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
+            {
+                if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+                {
+                    debugManager.printLogPrefix("SENS");
+                    Serial.println("WaterLevel INVALID (echo beyond reservoir bottom)");
+                }
+                physicalSensors.waterLevel = NAN;
+                physicalSensors.waterLevelCm = NAN;
+                physicalSensors.waterVolumeLiters = NAN;
+                physicalSensors.waterLevelDistanceCm = NAN;
+                physicalSensors.refillStartConfirmed = false;
+                physicalSensors.refillStopConfirmed = false;
+                waterLevelHistoryCount = 0;
+                lastAcceptedWaterDepthCm = NAN;
+                waterLevelStepCandidateCm = NAN;
+                waterLevelStepCandidateCount = 0;
+                refillStartConfirmCount = 0;
+                refillStopConfirmCount = 0;
+            }
+        }
+        return;
+    }
+    waterLevelFarEchoStreak = 0;
 
     waterLevelDistanceHistory[waterLevelHistoryIndex] = distance;
     waterLevelHistoryIndex = (waterLevelHistoryIndex + 1) % 5;
@@ -1866,6 +2038,22 @@ void SensorManager::readWaterLevel()
     if (candidateDepthCm < 0.0f)
     {
         candidateDepthCm = 0.0f;
+    }
+
+    // Developer Sensor Test only: shows that the REAL HC-SR04 is being
+    // sampled (independent of mock mode) and why physicalSensors.waterLevel
+    // may still be NaN (percent is the value from BEFORE this tick's
+    // acceptance logic below; baseline=no means still reacquiring).
+    if (systemState.sensorTestEnabled)
+    {
+        Serial.print("[DEV-PHYS] WL rawDistance=");
+        Serial.print(distance, 2);
+        Serial.print(" baseline=");
+        Serial.print(isnan(lastAcceptedWaterDepthCm) ? "no" : "yes");
+        Serial.print(" depth=");
+        Serial.print(candidateDepthCm, 2);
+        Serial.print(" percent=");
+        Serial.println(physicalSensors.waterLevel, 1);
     }
 
     // Temporal plausibility filter (see Config.h's WATER_LEVEL_STEP_*). The
@@ -1997,6 +2185,14 @@ void SensorManager::readWaterLevel()
             // (SensorManager.h).
             waterLevelSampleVersion++;
 
+            // Distinct from "WaterLevel ECHO RECOVERED" above: this is the
+            // point a VALID, accepted reservoir level exists again.
+            if (debugManager.atLeast(LogLevel::LEVEL_NORMAL))
+            {
+                debugManager.printLogPrefix("SENS");
+                Serial.println("WaterLevel VALID");
+            }
+
             if (dbgWater)
             {
                 Serial.print("[WATER-FILTER] baseline established depth=");
@@ -2072,30 +2268,52 @@ void SensorManager::readWaterLevel()
                 // Persisted long enough to treat like the existing
                 // raw-read-failure fault path above (same outward outcome:
                 // publish unavailable rather than holding a now-
-                // untrustworthy value forever) - but deliberately DOES NOT
-                // clear lastAcceptedWaterDepthCm the way that path does.
-                // Clearing it would drop straight into the reacquisition
-                // branch above (isnan(lastAcceptedWaterDepthCm)), whose own
-                // confirmation check has no magnitude/range gate at all -
-                // the same repeated false echo that triggered this fault
-                // could then satisfy THAT weaker check next and become the
-                // new baseline, the failure mode this correction closes.
-                // The trusted depth is kept so every subsequent reading -
-                // including more of the same bad echo - keeps being
-                // evaluated against a real baseline by the checks above.
-                // waterLevelJumpFaultStreak is also deliberately NOT reset
-                // here (stays pinned at SENSOR_TRANSIENT_FAILURE_THRESHOLD)
-                // - resetting it would let the very next implausible
-                // reading fall through to the "not yet confirmed" branch
-                // below and briefly republish the held value as live again
-                // before re-confirming, flapping available/unavailable
-                // every few ticks instead of staying sticky for as long as
-                // the implausible readings continue. Only a genuinely
-                // plausible reading (jumpPlausible/small-change branches)
-                // ever clears it.
+                // untrustworthy value forever) - and, as of this fix, ALSO
+                // clears lastAcceptedWaterDepthCm the same way that path
+                // does, forcing recovery through the same reacquisition
+                // branch above (isnan(lastAcceptedWaterDepthCm)) rather than
+                // continuing to gate every future candidate against a
+                // baseline already proven wrong.
+                //
+                // This used to be deliberately NOT done, on the reasoning
+                // that reacquisition's confirmation check had "no magnitude/
+                // range gate at all" and could let the same repeated false
+                // echo satisfy it just as easily. That reasoning is now
+                // stale: reacquisition (see its own "Absolute physical
+                // plausibility gate" comment above) already checks every
+                // candidate against MAX_WORKING_WATER_CM before it can even
+                // start a confirmation streak, closing the gap that
+                // justified keeping the stale baseline pinned here. Leaving
+                // it pinned instead demonstrably deadlocks: a genuinely new,
+                // repeated, in-range reading (e.g. the reservoir actually
+                // draining to empty) can never be promoted while it differs
+                // from the stale baseline by more than
+                // WATER_LEVEL_JUMP_PLAUSIBLE_MAX_CM - that candidate is
+                // permanently classified "implausible" regardless of how
+                // many times it repeats or how well those repeats agree
+                // with each other (see the branch above) - while a SINGLE
+                // sample that happens to land back within
+                // WATER_LEVEL_STEP_ACCEPT_CM of the stale baseline (e.g. the
+                // same false echo that caused the fault, recurring) is
+                // instantly re-accepted with no confirmation at all via the
+                // ordinary small-change path once this function is called
+                // again. Clearing the baseline here makes recovery
+                // symmetric: ANY value - the true level or a recurring
+                // false echo - must now independently re-earn trust through
+                // the same WATER_LEVEL_STEP_CONFIRM_COUNT multi-read
+                // agreement reacquisition already requires at boot.
+                //
+                // waterLevelJumpFaultStreak is still deliberately NOT reset
+                // here, unchanged from before - resetting it would let the
+                // very next implausible reading fall through to the "not
+                // yet confirmed" branch below and briefly republish a value
+                // as live again before re-confirming. It is still only ever
+                // cleared by an actual accepted/promoted reading - now via
+                // reacquisition's own baseline-established branch above,
+                // which already resets it, rather than via this branch.
                 if (dbgWater)
                 {
-                    Serial.println("[SENSOR] Water level confirmed unavailable (implausible jump persisted); trusted depth preserved");
+                    Serial.println("[SENSOR] Water level confirmed unavailable (implausible jump persisted); baseline cleared, forcing reacquisition");
                 }
                 physicalSensors.waterLevel = NAN;
                 physicalSensors.waterLevelCm = NAN;
@@ -2104,6 +2322,9 @@ void SensorManager::readWaterLevel()
                 physicalSensors.refillStartConfirmed = false;
                 physicalSensors.refillStopConfirmed = false;
                 waterLevelHistoryCount = 0;
+                lastAcceptedWaterDepthCm = NAN;
+                waterLevelStepCandidateCm = NAN;
+                waterLevelStepCandidateCount = 0;
                 refillStartConfirmCount = 0;
                 refillStopConfirmCount = 0;
                 return;
@@ -2179,18 +2400,27 @@ void SensorManager::readWaterLevel()
 
                 if (waterLevelJumpFaultStreak >= SENSOR_TRANSIENT_FAILURE_THRESHOLD)
                 {
-                    // Already in a CONFIRMED jump-fault state and this
-                    // candidate, though within physical range, hasn't yet
-                    // been promoted - keep publishing unavailable (same as
-                    // the implausible-jump confirmed-fault branch above)
-                    // rather than resuming display of the held trusted
-                    // value while the fault is still active. Doesn't touch
-                    // lastAcceptedWaterDepthCm (baseline preserved) or
-                    // waterLevelJumpFaultStreak itself (stays pinned - only
-                    // the ACCEPT branch above clears it). Skips the shared
-                    // publish tail/waterLevelSampleVersion increment below,
-                    // matching every other "still confirmed unavailable"
-                    // return in this function.
+                    // Defensive only, not expected to actually run since the
+                    // false-baseline-trap fix above: reaching this branch
+                    // requires BOTH a trusted lastAcceptedWaterDepthCm (the
+                    // "have baseline" code path this is nested in) AND
+                    // waterLevelJumpFaultStreak already pinned at
+                    // SENSOR_TRANSIENT_FAILURE_THRESHOLD - but the only site
+                    // that ever pins the streak there now also clears
+                    // lastAcceptedWaterDepthCm to NaN in the same step,
+                    // which routes every later tick to the reacquisition
+                    // branch above instead of here. Left in place as a
+                    // fail-safe rather than removed, in case some future
+                    // change reintroduces a way to reach CONFIRMED
+                    // jump-fault with a baseline still intact. Keep
+                    // publishing unavailable (same as the implausible-jump
+                    // confirmed-fault branch above) rather than resuming
+                    // display of the held trusted value while the fault is
+                    // still active. Doesn't touch lastAcceptedWaterDepthCm
+                    // or waterLevelJumpFaultStreak itself here. Skips the
+                    // shared publish tail/waterLevelSampleVersion increment
+                    // below, matching every other "still confirmed
+                    // unavailable" return in this function.
                     physicalSensors.waterLevel = NAN;
                     physicalSensors.waterLevelCm = NAN;
                     physicalSensors.waterVolumeLiters = NAN;
@@ -2369,6 +2599,26 @@ void SensorManager::readEC()
 
             if (ecRailFault)
             {
+                // DIAGNOSTIC (EC fault recovery investigation): a stable,
+                // plausible resting reading (confirmed on real hardware -
+                // tap water at ~0.11 mS/cm) still failed to clear ecFault
+                // after 20+ minutes. Logs every check that resets recovery
+                // progress while already faulted, so a physical test can
+                // show whether recovery is blocked by a genuinely-still-
+                // railed reading or by occasional noise (e.g. from nearby
+                // Peltier/pump/relay switching) briefly re-triggering
+                // ecRailFault just often enough that 8 consecutive clean
+                // checks (EC_FAULT_RECOVERY_COUNT) never completes. No
+                // behavior change - this only logs.
+                if (physicalSensors.ecFault && debugManager.shouldPrintDebug(DebugCategory::EC))
+                {
+                    Serial.print("[EC-FAULT] recovery streak reset - medianMv=");
+                    Serial.print(medianMv);
+                    Serial.print(" rawMedian=");
+                    Serial.print(rawMedianCount);
+                    Serial.print(" recoveryStreakWas=");
+                    Serial.println(ecFaultRecoveryStreak);
+                }
                 ecFaultRecoveryStreak = 0;
                 if (ecFaultStreak < EC_FAULT_CONFIRM_COUNT) ecFaultStreak++;
 
@@ -2394,6 +2644,20 @@ void SensorManager::readEC()
                 if (physicalSensors.ecFault)
                 {
                     if (ecFaultRecoveryStreak < EC_FAULT_RECOVERY_COUNT) ecFaultRecoveryStreak++;
+
+                    // DIAGNOSTIC (EC fault recovery investigation) - see the
+                    // matching comment on the reset side above. Shows
+                    // progress building tick by tick, so a physical test
+                    // can tell "it keeps resetting before 8" apart from "it
+                    // never even starts counting".
+                    if (ecFaultRecoveryStreak < EC_FAULT_RECOVERY_COUNT &&
+                        debugManager.shouldPrintDebug(DebugCategory::EC))
+                    {
+                        Serial.print("[EC-FAULT] recovery streak=");
+                        Serial.print(ecFaultRecoveryStreak);
+                        Serial.print("/");
+                        Serial.println((int)EC_FAULT_RECOVERY_COUNT);
+                    }
 
                     if (ecFaultRecoveryStreak >= EC_FAULT_RECOVERY_COUNT)
                     {

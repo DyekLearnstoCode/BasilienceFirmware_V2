@@ -24,12 +24,11 @@
 #error "Unpatched Firebase Arduino Client Library. Build with the copy in <repo>/libraries (see BASILIENCE_PATCH.md), or apply that patch to the library you are building against."
 #endif
 
-// Acceptance limit for one Firebase connection attempt (TCP connect + TLS
-// handshake, excluding DNS and the response wait). Raising either patched value
-// past this must be a deliberate decision, so it is enforced at build time.
-static_assert(BASILIENCE_FIREBASE_TCP_CONNECT_TIMEOUT_MS +
-                  BASILIENCE_FIREBASE_TLS_HANDSHAKE_TIMEOUT_MS <= 5000,
-              "Firebase TCP connect + TLS handshake timeouts must total 5000 ms or less");
+// REVISED 2026-10-01: the former build-time ceiling (connect + handshake <=
+// 5000 ms) is gone. It forced a 2000 ms TCP connect, which fails every time
+// the first SYN is lost (lwIP retransmits it after 3000 ms), and that - not the
+// cloud - was what kept Firebase down. Current values: connect 4000 ms,
+// handshake 5000 ms; see BASILIENCE_PATCH.md for the derivation.
 
 class FirebaseManager
 {
@@ -268,6 +267,13 @@ private:
     bool checkStaRecovery();
     void resetStaRecoveryStage();
 
+    // True when the latest background diagnostics of the current outage found
+    // DNS not answering over the Wi-Fi link. It is the only evidence that lets
+    // checkStaRecovery() bounce the radio; cleared when the cloud is READY or
+    // Wi-Fi is lost. Diagnostics never gate any Firebase library call.
+    bool diagDnsFailed = false;
+
+
     // Developer/test command nodes (commands/automationTestMode,
     // commands/ignoreWaterLevelAutomation, commands/mockSensors) are level
     // flags that stay in RTDB. They must never survive a device reboot, so
@@ -300,26 +306,23 @@ private:
     // Non-blocking cloud startup (first Firebase connection)
     //==================================================
 
-    // PREFLIGHT       - a background task proves DNS + a TLS handshake work
-    //                   BEFORE any Firebase library HTTPS call is made from the
-    //                   main loop task. The library's connect and handshake are
-    //                   now bounded (patched to 2s + 3s), but its DNS lookup is
-    //                   not, and a path that has not been proven reachable is
-    //                   still not worth even a few seconds of the main loop.
+    // WAITING         - the first connection (or a retry) is waiting only for
+    //                   its backoff to elapse. Nothing has to pass first: the
+    //                   Firebase library does its own DNS/TCP/TLS.
     // AUTHENTICATING  - the existing auth state machine (startAuthAttempt() /
     //                   pollAuthStateMachine()), one bounded step per update().
     // INIT_STEPS      - post-auth database initialization, one small step per
     //                   update() (see CloudInitStep).
     // COMPLETE        - normal cloud sync (the rest of update()).
     //
-    // From INIT_STEPS onward every Firebase library call is also gated by
-    // cloudPathVerified (below): a passing preflight is what permits library
-    // calls, and Wi-Fi loss or the first transport failure takes that
-    // permission away until a fresh preflight passes again.
+    // A separate DNS/TCP/TLS probe exists (see "Network diagnostics" below) but
+    // it only produces log evidence after a real Firebase failure; it never
+    // allows or blocks a library call.
+
     enum class CloudStartupPhase : uint8_t
     {
         NOT_STARTED,
-        PREFLIGHT,
+        WAITING,
         AUTHENTICATING,
         INIT_STEPS,
         COMPLETE
@@ -346,7 +349,7 @@ private:
     CloudInitStep cloudInitStep = CloudInitStep::RESOLVE_DEVICE_ID;
 
     // 0 means "attempt as soon as possible". millis() of the earliest moment
-    // the next preflight may start.
+    // the next startup attempt may start.
     unsigned long cloudStartupNextAttemptAt = 0;
     unsigned long cloudStartupBackoffMs = 0;
     uint16_t cloudStartupAttempt = 0;
@@ -357,83 +360,52 @@ private:
     // without changing readSettings()' many early returns.
     bool lastSettingsReadOk = false;
 
-    // "The network path to Firebase was proven usable by a preflight that has
-    // not since been invalidated." While false, update() makes NO Firebase
-    // library call at all (no Firebase.ready(), no RTDB read or write, no
-    // token refresh, no recovery). It is set by a passing preflight, cleared by
-    // Wi-Fi loss, provisioning, the first transport failure of any library
-    // call, a failed Firebase.ready(), and a token refresh that is due while
-    // the last preflight is stale (see CLOUD_PATH_FRESH_MS in the .cpp).
-    bool cloudPathVerified = false;
-    unsigned long cloudPathVerifiedAt = 0;
-
-    // "The Firebase LIBRARY has completed a real RTDB operation on the current
-    // path verification." cloudPathVerified only says the network looked usable
-    // (an independent DNS + TLS probe); it says nothing about the library's own
-    // TLS session, which can still fail on the very first call. So after every
-    // fresh preflight this goes false, and only validateCloudSession() - one
-    // small read - or a completed startup sets it true again. Firebase READY,
-    // "Firebase RESTORED", the heartbeat, DEGRADED -> HEALTHY and every normal
-    // cloud call wait for it. Only meaningful in the COMPLETE phase: earlier
-    // phases prove the session with their own (real) authentication and
-    // initialization calls.
-    bool cloudSessionValidated = false;
-    void validateCloudSession();
 
     // One blocking library transaction per update() tick in normal operation.
     // Every RTDB call reports its result to recordFirebaseResult(), which counts
     // it here; update() stops handing out further cloud work once one has run
-    // (or the path was withdrawn). Before this, a single healthy tick could run
+    // (or the transport went into cooldown). Before this, a single healthy tick could run
     // command reads, an actuator write, an alert write, a heartbeat and an
     // optional job back to back, so on a slow link their waits stacked into one
     // multi-second stall. Nothing is dropped: whatever did not run is still due
     // on the next tick, and every function keeps its own cadence gate.
     uint8_t cloudCallsThisTick = 0;
-    bool cloudTickBudgetSpent() const { return !cloudPathVerified || cloudCallsThisTick >= 1; }
+    bool cloudTickBudgetSpent() const { return cloudCallsThisTick >= 1; }
     // An alert transition writes /alerts and then owes /sensors one forced
     // refresh. That second call now runs at the head of the next tick instead
     // of in the same one.
     bool alertHeartbeatPending = false;
 
-    enum class PreflightPoll : uint8_t
-    {
-        PENDING,
-        PASSED,
-        FAILED
-    };
-
     void advanceCloudStartupConnect();
     void advanceCloudInit();
     bool runCloudInitStep();
-    // Startup only: an authentication attempt failed. Returns to PREFLIGHT.
+    // Startup only: an authentication attempt failed. Returns to WAITING.
     void scheduleCloudStartupRetry(bool libraryContacted, const char* reason);
-    // Escalating gate on when the next preflight may start. Changes no phase.
+    // Escalating gate on when the next startup attempt may start. Changes no phase.
     void bumpCloudRetryBackoff(bool libraryContacted, const char* reason);
     void abortCloudStartupAttempt();
     void completeCloudStartup();
 
-    // Wi-Fi is gone (or the setup AP owns the radio): drop the path
-    // verification, forget any backoff (the outage was the network's) and
-    // restart an unfinished first connection from a fresh preflight.
+    // Wi-Fi is gone (or the setup AP owns the radio): forget any backoff (the
+    // outage was the network's) and restart an unfinished first connection.
     void noteNetworkLost();
-    // Withdraws permission to call the library. libraryContacted=true means
-    // the library itself just failed (so the retry waits at least
-    // COOLDOWN_INITIAL_MS), false means the trigger was cheap to detect.
-    void revokeCloudPath(const char* reason, bool libraryContacted);
-    bool cloudPathFresh() const;
-    // One background-preflight step. Shared by the first connection and by
-    // every later re-verification, so there is exactly one implementation.
-    PreflightPoll pollPreflight();
-    // Post-READY hold: while cloudPathVerified is false, update() calls only
-    // this.
-    void advanceRuntimePreflight();
+    // Firebase.ready() was false while the cloud should have been usable (the
+    // library's token refresh failed): counts as a full failed attempt and goes
+    // straight to COOLDOWN.
+    void noteLibraryNotReady();
+    // Starts a background DNS/TCP/TLS probe for the log. Gates nothing.
+    void launchDiagnostics(const char* reason);
+    // Collects a finished probe. Gates nothing.
+    void pollDiagnostics();
+
 
     // Connectivity diagnostics ([NET] lines). Each prints once per event, never
     // per loop tick.
     void logWifiConnectedDiagnostics();
     void logSystemTimeDiagnostics();
 
-    // Network preflight (background task). Same thread-safety shape as the
+    // Network diagnostics (background task; the "preflight" names are kept from
+    // when this gated Firebase, it is evidence-only now). Same thread-safety shape as the
     // bootstrap HTTP task below: the task touches ONLY its own local network
     // objects and the plain result fields here - never the Firebase library,
     // never SystemState or any other manager - writes them once, then gives
@@ -444,7 +416,7 @@ private:
     // semaphore give. Guards against ever starting a second preflight task
     // while an abandoned one could still be writing the result fields.
     bool preflightTaskActive = false;
-    // True while the PREFLIGHT phase is waiting on a result.
+    // True while a diagnostics run is waiting on a result.
     bool preflightRunning = false;
     unsigned long preflightStartedAt = 0;
     uint8_t preflightHostCount = 0;

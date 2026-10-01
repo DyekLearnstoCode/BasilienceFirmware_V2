@@ -681,10 +681,9 @@ struct SystemState
     // True only while handleStabilizingPH()/handleStabilizingEC() are past
     // their initial silent settle window (PH_STABILIZATION_TIME/
     // EC_STABILIZATION_TIME) and purely watching, not actively dosing and
-    // not waiting for a fresh dose to mix in yet. Lets
-    // SafetyManager::canFog() allow fogging to resume during that window -
-    // this only says the just-dosed solution has finished mixing (canFog()
-    // no longer checks whether the pH/EC reading itself is in range). Set
+    // not waiting for a fresh dose to mix in yet. Published to the app only
+    // (settled-and-watching indicator); it does NOT affect fogging - canFog()
+    // blocks for the whole DOSING/STABILIZING episode. Set
     // fresh every tick (true inside the watch block, false via changeState()
     // on entering DOSING_PH/STABILIZING_PH) rather than relying on
     // scattered resets, so it can never linger stale.

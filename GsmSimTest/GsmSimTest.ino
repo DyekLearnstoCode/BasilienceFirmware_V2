@@ -1,116 +1,137 @@
 #include <SoftwareSerial.h>
 
 // ============================================================
-// ESP8266 ↔ SIM800L
-// ------------------------------------------------------------
-// ESP8266 D2 / GPIO4 = RX <- SIM800L TX
-// ESP8266 D1 / GPIO5 = TX -> SIM800L RX
+// ESP8266 ↔ SIM800L V2
+//
+// Converted from the ESP32/HardwareSerial(UART1) version - ESP8266 has no
+// full-duplex spare hardware UART available alongside USB debug Serial
+// (UART0 is shared with USB; UART1 is TX-only, no RX), so this uses the
+// same EspSoftwareSerial library already vendored in this repo (see
+// BasilienceFirmware_V2/libraries/EspSoftwareSerial) instead.
+//
+// ESP8266 D2 / GPIO4 = RX <- SIM800L TXD
+// ESP8266 D1 / GPIO5 = TX -> SIM800L RXD
+// (Same D2/D1 pins this sketch's original ESP8266 version used, before it
+// was adapted to the ESP32's GPIO36/GPIO23 for the Basilience pin audit.)
 // ============================================================
-SoftwareSerial sim800(D2, D1);
 
-// ============================================================
-// SETTINGS
-// ============================================================
-const unsigned long STATUS_INTERVAL = 15000; // 15 seconds
+constexpr uint8_t SIM800_RX = D2;
+constexpr uint8_t SIM800_TX = D1;
 
-unsigned long lastStatusCheck = 0;
+SoftwareSerial sim800l(SIM800_RX, SIM800_TX);
 
-unsigned long testStart = 0;
+constexpr unsigned long PC_BAUD  = 115200;
+constexpr unsigned long GSM_BAUD = 9600;
 
-unsigned int rdyCount = 0;
-unsigned int callReadyCount = 0;
-unsigned int smsReadyCount = 0;
+// Change this only if you want another recipient.
+const char TARGET_NUMBER[] = "+639658904777";
 
-// ============================================================
-// PRINT ELAPSED TIME
-// ============================================================
-void printTime() {
-  unsigned long seconds = (millis() - testStart) / 1000;
-
-  unsigned long minutes = seconds / 60;
-  seconds = seconds % 60;
-
-  Serial.print("[");
-  Serial.print(minutes);
-  Serial.print("m ");
-  Serial.print(seconds);
-  Serial.print("s] ");
-}
+const char TEST_MESSAGE[] =
+    "Hello from ESP8266 Basilience GSM test";
 
 // ============================================================
-// WATCH FOR IMPORTANT UNSOLICITED MESSAGES
+// AT RESPONSE
 // ============================================================
-void inspectResponse(const String &response) {
 
-  if (response.indexOf("RDY") >= 0) {
-    rdyCount++;
-
-    Serial.println();
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    Serial.println("WARNING: MODEM RDY DETECTED");
-    Serial.println("Possible SIM800L restart");
-    Serial.print("RDY count: ");
-    Serial.println(rdyCount);
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  }
-
-  if (response.indexOf("Call Ready") >= 0) {
-    callReadyCount++;
-  }
-
-  if (response.indexOf("SMS Ready") >= 0) {
-    smsReadyCount++;
-  }
-}
+struct ATResponse {
+  String text;
+  bool ok;
+  bool error;
+  bool timeout;
+};
 
 // ============================================================
-// READ MODEM RESPONSE
+// READ UART
 // ============================================================
-String readSIM(unsigned long timeout) {
 
-  String response = "";
+ATResponse readResponse(
+    unsigned long timeout,
+    bool stopAtPrompt = false) {
 
-  unsigned long start = millis();
+  ATResponse result;
 
-  while (millis() - start < timeout) {
+  result.text = "";
+  result.ok = false;
+  result.error = false;
+  result.timeout = false;
 
-    while (sim800.available()) {
+  unsigned long started = millis();
 
-      char c = sim800.read();
+  while (millis() - started < timeout) {
 
-      response += c;
+    while (sim800l.available()) {
+
+      char c = sim800l.read();
+
+      result.text += c;
       Serial.write(c);
+
+      // SMS message-entry prompt
+      if (stopAtPrompt && c == '>') {
+        return result;
+      }
+
+      if (
+        result.text.indexOf("\r\nOK\r\n") >= 0 ||
+        result.text.endsWith("OK\r\n")
+      ) {
+        result.ok = true;
+        return result;
+      }
+
+      if (
+        result.text.indexOf("+CMS ERROR:") >= 0 ||
+        result.text.indexOf("+CME ERROR:") >= 0 ||
+        result.text.indexOf("\r\nERROR\r\n") >= 0
+      ) {
+        result.error = true;
+        return result;
+      }
     }
 
-    yield();
+    delay(1);
   }
 
-  inspectResponse(response);
+  result.timeout = true;
 
-  return response;
+  return result;
+}
+
+// ============================================================
+// CLEAR OLD UART DATA
+// ============================================================
+
+void clearInput() {
+
+  while (sim800l.available()) {
+    Serial.write(sim800l.read());
+  }
 }
 
 // ============================================================
 // SEND AT COMMAND
 // ============================================================
-String sendAT(const char *command, unsigned long timeout = 2500) {
+
+ATResponse sendAT(
+    const String &command,
+    unsigned long timeout = 5000) {
+
+  clearInput();
 
   Serial.println();
-
-  printTime();
-
   Serial.print(">>> ");
   Serial.println(command);
 
-  sim800.println(command);
+  sim800l.println(command);
 
-  return readSIM(timeout);
+  return readResponse(timeout);
 }
 
 // ============================================================
-// SYNCHRONIZE WITH SIM800L
+// SYNCHRONIZE SIM800L
 // ============================================================
-bool syncSIM800() {
+
+bool syncModem() {
 
   Serial.println();
   Serial.println("================================");
@@ -119,85 +140,49 @@ bool syncSIM800() {
 
   for (int attempt = 1; attempt <= 15; attempt++) {
 
-    Serial.print("AT attempt ");
-    Serial.println(attempt);
+    Serial.print("Attempt ");
+    Serial.print(attempt);
+    Serial.println("/15");
 
-    sim800.println("AT");
+    clearInput();
 
-    String response = readSIM(2000);
+    sim800l.println("AT");
 
-    if (response.indexOf("OK") >= 0) {
+    ATResponse response =
+        readResponse(2500);
+
+    if (response.ok) {
 
       Serial.println();
-      Serial.println("SIM800L SYNCED");
-
+      Serial.println("SIM800L CONNECTED");
       return true;
     }
 
     delay(1000);
   }
 
+  Serial.println();
+  Serial.println("SIM800L CONNECTION FAILED");
+
   return false;
 }
 
 // ============================================================
-// PRINT STATUS INTERPRETATION
+// PARSE CREG STATE
 // ============================================================
-void explainCSQ(const String &response) {
 
-  int pos = response.indexOf("+CSQ:");
+int parseCREG(const String &response) {
 
-  if (pos < 0) {
-    return;
+  int tag = response.indexOf("+CREG:");
+
+  if (tag < 0) {
+    return -1;
   }
 
-  int comma = response.indexOf(',', pos);
+  int comma = response.indexOf(',', tag);
 
   if (comma < 0) {
-    return;
-  }
-
-  String valueString =
-    response.substring(pos + 5, comma);
-
-  valueString.trim();
-
-  int rssi = valueString.toInt();
-
-  Serial.print("Signal interpretation: ");
-
-  if (rssi == 99) {
-    Serial.println("UNKNOWN");
-  }
-  else if (rssi <= 9) {
-    Serial.println("VERY WEAK");
-  }
-  else if (rssi <= 14) {
-    Serial.println("USABLE");
-  }
-  else if (rssi <= 19) {
-    Serial.println("GOOD");
-  }
-  else {
-    Serial.println("VERY GOOD");
-  }
-}
-
-// ============================================================
-// EXPLAIN NETWORK REGISTRATION
-// ============================================================
-void explainCREG(const String &response) {
-
-  int pos = response.indexOf("+CREG:");
-
-  if (pos < 0) {
-    return;
-  }
-
-  int comma = response.indexOf(',', pos);
-
-  if (comma < 0) {
-    return;
+    return -1;
   }
 
   int end = response.indexOf('\r', comma);
@@ -206,14 +191,85 @@ void explainCREG(const String &response) {
     end = response.length();
   }
 
-  String stateString =
-    response.substring(comma + 1, end);
+  String value =
+      response.substring(comma + 1, end);
 
-  stateString.trim();
+  value.trim();
 
-  int state = stateString.toInt();
+  return value.toInt();
+}
 
-  Serial.print("Network interpretation: ");
+// ============================================================
+// CHECK SIM
+// ============================================================
+
+bool simReady() {
+
+  ATResponse response =
+      sendAT("AT+CPIN?", 5000);
+
+  return
+      response.text.indexOf("+CPIN: READY") >= 0;
+}
+
+// ============================================================
+// CHECK NETWORK
+// ============================================================
+
+bool networkRegistered() {
+
+  ATResponse response =
+      sendAT("AT+CREG?", 5000);
+
+  int state = parseCREG(response.text);
+
+  return state == 1 || state == 5;
+}
+
+// ============================================================
+// STATUS
+// ============================================================
+
+void showStatus() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP8266 + SIM800L STATUS");
+  Serial.println("================================");
+
+  sendAT("ATI");
+
+  sendAT("AT+CFUN?");
+
+  sendAT("AT+CSMINS?");
+
+  ATResponse pin =
+      sendAT("AT+CPIN?");
+
+  Serial.println();
+
+  if (pin.text.indexOf("+CPIN: READY") >= 0) {
+    Serial.println("SIM: READY");
+  } else {
+    Serial.println("SIM: NOT READY");
+  }
+
+  sendAT("AT+CCID");
+
+  sendAT("AT+CIMI");
+
+  sendAT("AT+CBC");
+
+  sendAT("AT+CSQ");
+
+  ATResponse creg =
+      sendAT("AT+CREG?");
+
+  int state =
+      parseCREG(creg.text);
+
+  Serial.println();
+  Serial.print("NETWORK: ");
 
   switch (state) {
 
@@ -222,19 +278,19 @@ void explainCREG(const String &response) {
       break;
 
     case 1:
-      Serial.println("REGISTERED - HOME NETWORK");
+      Serial.println("REGISTERED - HOME");
       break;
 
     case 2:
-      Serial.println("SEARCHING FOR NETWORK");
+      Serial.println("SEARCHING");
       break;
 
     case 3:
-      Serial.println("REGISTRATION DENIED");
+      Serial.println("DENIED");
       break;
 
     case 4:
-      Serial.println("REGISTRATION UNKNOWN");
+      Serial.println("UNKNOWN");
       break;
 
     case 5:
@@ -242,172 +298,379 @@ void explainCREG(const String &response) {
       break;
 
     default:
-      Serial.println("UNKNOWN STATE");
+      Serial.println("NO VALID RESPONSE");
       break;
   }
-}
 
-// ============================================================
-// RUN ONE COMPLETE STATUS CHECK
-// ============================================================
-void runStatusCheck() {
+  sendAT("AT+COPS?", 8000);
 
   Serial.println();
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("STATUS CHECK");
-  Serial.println("================================");
-
-  // ----------------------------------------------------------
-  // 1. INTERNAL VOLTAGE
-  // ----------------------------------------------------------
-  String cbc = sendAT("AT+CBC", 2500);
-
-  // ----------------------------------------------------------
-  // 2. SIGNAL
-  // ----------------------------------------------------------
-  String csq = sendAT("AT+CSQ", 2500);
-
-  explainCSQ(csq);
-
-  // ----------------------------------------------------------
-  // 3. NETWORK REGISTRATION
-  // ----------------------------------------------------------
-  String creg = sendAT("AT+CREG?", 2500);
-
-  explainCREG(creg);
-
-  // ----------------------------------------------------------
-  // COUNTERS
-  // ----------------------------------------------------------
-  Serial.println();
-  Serial.println("--- EVENT COUNTERS ---");
-
-  Serial.print("RDY: ");
-  Serial.println(rdyCount);
-
-  Serial.print("Call Ready: ");
-  Serial.println(callReadyCount);
-
-  Serial.print("SMS Ready: ");
-  Serial.println(smsReadyCount);
-
   Serial.println("================================");
 }
 
 // ============================================================
-// PROCESS UNSOLICITED MODEM OUTPUT
+// NETWORK REGISTRATION
 // ============================================================
-void processUnsolicitedOutput() {
 
-  if (!sim800.available()) {
+void connectNetwork() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("NETWORK REGISTRATION");
+  Serial.println("================================");
+
+  if (!simReady()) {
+
+    Serial.println();
+    Serial.println("SIM IS NOT READY.");
     return;
   }
 
-  String unsolicited = "";
+  Serial.println();
+  Serial.println("Selecting operator automatically...");
 
-  unsigned long start = millis();
+  sendAT("AT+COPS=0", 30000);
 
-  while (millis() - start < 1000) {
+  Serial.println();
+  Serial.println("Waiting for registration...");
 
-    while (sim800.available()) {
+  unsigned long started = millis();
 
-      char c = sim800.read();
+  while (millis() - started < 90000) {
 
-      unsolicited += c;
+    ATResponse response =
+        sendAT("AT+CREG?", 5000);
+
+    int state =
+        parseCREG(response.text);
+
+    if (state == 1) {
+
+      Serial.println();
+      Serial.println("NETWORK REGISTERED - HOME");
+
+      sendAT("AT+COPS?", 8000);
+      sendAT("AT+CSQ");
+
+      return;
+    }
+
+    if (state == 5) {
+
+      Serial.println();
+      Serial.println("NETWORK REGISTERED - ROAMING");
+
+      sendAT("AT+COPS?", 8000);
+      sendAT("AT+CSQ");
+
+      return;
+    }
+
+    Serial.print("Waiting. CREG state = ");
+    Serial.println(state);
+
+    delay(5000);
+  }
+
+  Serial.println();
+  Serial.println("NETWORK REGISTRATION TIMEOUT");
+}
+
+// ============================================================
+// SEND SMS
+// ============================================================
+
+void sendSMS() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP8266 SMS TEST");
+  Serial.println("================================");
+
+  // ----------------------------------------------------------
+  // SIM must be ready
+  // ----------------------------------------------------------
+
+  if (!simReady()) {
+
+    Serial.println();
+    Serial.println("SMS CANCELLED: SIM NOT READY");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Must already be registered
+  // ----------------------------------------------------------
+
+  if (!networkRegistered()) {
+
+    Serial.println();
+    Serial.println("SMS CANCELLED: NETWORK NOT REGISTERED");
+    Serial.println("Run NETWORK first.");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Diagnostic signal
+  // ----------------------------------------------------------
+
+  sendAT("AT+CSQ");
+
+  // ----------------------------------------------------------
+  // Enable detailed errors
+  // ----------------------------------------------------------
+
+  sendAT("AT+CMEE=2");
+
+  // ----------------------------------------------------------
+  // Text SMS mode
+  // ----------------------------------------------------------
+
+  ATResponse textMode =
+      sendAT("AT+CMGF=1");
+
+  if (!textMode.ok) {
+
+    Serial.println();
+    Serial.println("SMS FAILED: TEXT MODE REJECTED");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Read existing SMSC.
+  // DO NOT overwrite it.
+  // ----------------------------------------------------------
+
+  sendAT("AT+CSCA?");
+
+  // ----------------------------------------------------------
+  // Enter recipient
+  // ----------------------------------------------------------
+
+  clearInput();
+
+  Serial.println();
+  Serial.print(">>> AT+CMGS=\"");
+  Serial.print(TARGET_NUMBER);
+  Serial.println("\"");
+
+  sim800l.print("AT+CMGS=\"");
+  sim800l.print(TARGET_NUMBER);
+  sim800l.println("\"");
+
+  // ----------------------------------------------------------
+  // Wait for >
+  // ----------------------------------------------------------
+
+  ATResponse prompt =
+      readResponse(15000, true);
+
+  if (prompt.text.indexOf('>') < 0) {
+
+    Serial.println();
+    Serial.println("SMS FAILED: NO > PROMPT");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Message body
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.print("Sending: ");
+  Serial.println(TEST_MESSAGE);
+
+  sim800l.print(TEST_MESSAGE);
+
+  delay(500);
+
+  // Ctrl+Z
+  sim800l.write(26);
+
+  Serial.println();
+  Serial.println("CTRL+Z sent.");
+  Serial.println("Waiting for +CMGS...");
+
+  // ----------------------------------------------------------
+  // Wait for network SMS result
+  // ----------------------------------------------------------
+
+  String response = "";
+
+  unsigned long started = millis();
+
+  while (millis() - started < 60000) {
+
+    while (sim800l.available()) {
+
+      char c = sim800l.read();
+
+      response += c;
       Serial.write(c);
     }
 
-    yield();
+    if (
+      response.indexOf("+CMGS:") >= 0 &&
+      response.indexOf("OK") >= 0
+    ) {
+
+      Serial.println();
+      Serial.println();
+      Serial.println("================================");
+      Serial.println("SMS SENT SUCCESSFULLY");
+      Serial.println("================================");
+
+      return;
+    }
+
+    if (
+      response.indexOf("+CMS ERROR:") >= 0 ||
+      response.indexOf("+CME ERROR:") >= 0 ||
+      response.indexOf("\r\nERROR\r\n") >= 0
+    ) {
+
+      Serial.println();
+      Serial.println();
+      Serial.println("================================");
+      Serial.println("SMS SEND FAILED");
+      Serial.println("================================");
+
+      return;
+    }
+
+    delay(1);
   }
 
-  inspectResponse(unsolicited);
+  Serial.println();
+  Serial.println("SMS SEND TIMEOUT");
+}
+
+// ============================================================
+// HELP
+// ============================================================
+
+void showHelp() {
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP8266 + SIM800L TEST CONSOLE");
+  Serial.println("================================");
+
+  Serial.println("STATUS  - modem/SIM/network status");
+  Serial.println("NETWORK - automatic GSM registration");
+  Serial.println("SEND    - send test SMS");
+  Serial.println("HELP    - display this menu");
+  Serial.println();
+  Serial.println("Raw AT commands also work.");
+  Serial.println("================================");
+}
+
+// ============================================================
+// USER COMMAND
+// ============================================================
+
+void processCommand(String command) {
+
+  command.trim();
+
+  if (command.length() == 0) {
+    return;
+  }
+
+  if (command.equalsIgnoreCase("STATUS")) {
+    showStatus();
+    return;
+  }
+
+  if (command.equalsIgnoreCase("NETWORK")) {
+    connectNetwork();
+    return;
+  }
+
+  if (command.equalsIgnoreCase("SEND")) {
+    sendSMS();
+    return;
+  }
+
+  if (command.equalsIgnoreCase("HELP")) {
+    showHelp();
+    return;
+  }
+
+  String upper = command;
+  upper.toUpperCase();
+
+  if (upper.startsWith("AT")) {
+    sendAT(command, 15000);
+    return;
+  }
+
+  Serial.println("UNKNOWN COMMAND");
+  Serial.println("Type HELP.");
 }
 
 // ============================================================
 // SETUP
 // ============================================================
+
 void setup() {
 
-  Serial.begin(115200);
+  Serial.begin(PC_BAUD);
 
-  sim800.begin(9600);
-
-  testStart = millis();
+  // SoftwareSerial on the ESP8266's D2(RX)/D1(TX) - see this file's top
+  // comment for why a software link is used here instead of a hardware
+  // UART (ESP8266 has no spare full-duplex hardware UART alongside USB
+  // debug Serial).
+  sim800l.begin(GSM_BAUD);
 
   Serial.println();
   Serial.println();
   Serial.println("================================");
-  Serial.println("SIM800L POWER / NETWORK LOGGER");
+  Serial.println("BASILIENCE ESP8266 GSM VALIDATION");
   Serial.println("================================");
+  Serial.println("UART RX: D2 (GPIO4)");
+  Serial.println("UART TX: D1 (GPIO5)");
+  Serial.println("SIM800L: 9600 baud");
 
-  Serial.println();
-  Serial.println("Monitoring:");
-  Serial.println("- AT+CBC");
-  Serial.println("- AT+CSQ");
-  Serial.println("- AT+CREG?");
-  Serial.println("- RDY");
-  Serial.println("- Call Ready");
-  Serial.println("- SMS Ready");
-
-  Serial.println();
-  Serial.println("Waiting 5 seconds...");
   delay(5000);
 
-  // ==========================================================
-  // 1. SYNC MODEM
-  // ==========================================================
-  if (!syncSIM800()) {
+  if (!syncModem()) {
 
     Serial.println();
-    Serial.println("ERROR: FAILED TO SYNC WITH SIM800L");
+    Serial.println("STOPPED: SIM800L NOT RESPONDING");
 
     return;
   }
 
-  // ==========================================================
-  // 2. BASIC INFORMATION
-  // ==========================================================
-  sendAT("ATI", 3000);
+  // Cleaner responses
+  sendAT("ATE0");
 
-  sendAT("AT+CFUN?", 3000);
-
-  sendAT("AT+CSMINS?", 3000);
-
-  sendAT("AT+CPIN?", 3000);
-
-  // ==========================================================
-  // 3. INITIAL STATUS
-  // ==========================================================
-  runStatusCheck();
-
-  lastStatusCheck = millis();
-
-  Serial.println();
-  Serial.println();
-  Serial.println("CONTINUOUS MONITOR STARTED");
-  Serial.println("Status check every 15 seconds.");
+  showHelp();
 }
 
 // ============================================================
 // LOOP
 // ============================================================
+
 void loop() {
 
-  // ----------------------------------------------------------
-  // Always listen for unsolicited modem messages
-  // ----------------------------------------------------------
-  processUnsolicitedOutput();
-
-  // ----------------------------------------------------------
-  // Periodic CBC / CSQ / CREG test
-  // ----------------------------------------------------------
-  if (millis() - lastStatusCheck >= STATUS_INTERVAL) {
-
-    lastStatusCheck = millis();
-
-    runStatusCheck();
+  // Unsolicited modem messages
+  while (sim800l.available()) {
+    Serial.write(sim800l.read());
   }
 
-  yield();
+  // PC command input
+  if (Serial.available()) {
+
+    String command =
+        Serial.readStringUntil('\n');
+
+    processCommand(command);
+  }
+
+  delay(1);
 }
